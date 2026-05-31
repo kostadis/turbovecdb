@@ -1,0 +1,67 @@
+"""Database — a directory of collections.
+
+A ``Database`` is a lightweight handle over a directory; each collection is a
+subdirectory. Construction does no I/O — work is deferred to
+:meth:`Database.collection`.
+"""
+
+import os
+import threading
+
+from .collection import Collection
+from .errors import CollectionNotFoundError
+from .index import DEFAULT_BIT_WIDTH
+
+
+class Database:
+    def __init__(self, path):
+        self._path = path
+        self._collections = {}
+        self._lock = threading.Lock()
+
+    @property
+    def path(self):
+        return self._path
+
+    def collection(self, name, *, dim=None, bit_width=DEFAULT_BIT_WIDTH,
+                   metric="cosine", embedder=None, create=True):
+        """Open (or create) a collection by name.
+
+        With ``create=False`` a missing collection raises
+        :class:`CollectionNotFoundError`. Handles are cached per name; the first
+        call's options win for a cached handle.
+        """
+        with self._lock:
+            cached = self._collections.get(name)
+            if cached is not None:
+                return cached
+            coll_dir = os.path.join(self._path, name)
+            if not create and not os.path.isdir(coll_dir):
+                raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
+            col = Collection(coll_dir, dim=dim, bit_width=bit_width,
+                             metric=metric, embedder=embedder)
+            self._collections[name] = col
+            return col
+
+    def list_collections(self):
+        if not os.path.isdir(self._path):
+            return []
+        return sorted(
+            d for d in os.listdir(self._path)
+            if os.path.isdir(os.path.join(self._path, d, ""))
+            and os.path.exists(os.path.join(self._path, d, "store.sqlite3"))
+        )
+
+    def close(self):
+        with self._lock:
+            for col in self._collections.values():
+                try:
+                    col.close()
+                except Exception:
+                    pass
+            self._collections.clear()
+
+
+def connect(path):
+    """Open a turbovecdb database rooted at ``path`` (a directory of collections)."""
+    return Database(path)

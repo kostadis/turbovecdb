@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "turbovecdb"
+version = "0.1.0"
+description = "An embedded vector database: turbovec 4-bit ANN + a durable SQLite store, with metadata filters, persistence, exact-cosine re-rank, and multi-process safety."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Kostadis Rousoss", email = "kostadis@gmail.com" }]
+keywords = ["vector-database", "embeddings", "ann", "turbovec", "quantization"]
+dependencies = [
+    "turbovec>=0.7",
+    "numpy>=1.21",
+    "filelock>=3.12",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4.0"]
+
+[project.urls]
+Homepage = "https://github.com/kostadis/turbovecdb"
+Repository = "https://github.com/kostadis/turbovecdb"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/turbovecdb"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
