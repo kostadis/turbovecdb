@@ -80,6 +80,15 @@ bit_width=4, metric="cosine", embedder=None, create=True) -> Collection`
 `delete`, `count`, `flush`, `close`. Results are `QueryResult` / `GetResult`
 dataclasses with flat lists.
 
+## Documentation
+
+- [docs/core/architecture.md](docs/core/architecture.md) — how it's built (two-tier
+  store, read/write paths, exact re-rank)
+- [docs/core/data-model.md](docs/core/data-model.md) — on-disk layout, SQLite
+  schema, the `.tvim` cache, generation counters
+- [docs/core/concurrency.md](docs/core/concurrency.md) — the multi-process model
+- [docs/performance/](docs/performance/) — benchmark harness + measured results
+
 ## License
 
 MIT.
