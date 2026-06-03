@@ -34,6 +34,31 @@ pip install turbovecdb        # pulls turbovec, numpy, filelock
 Requires Python ≥ 3.9. The vector dimension must be a positive multiple of 8
 (e.g. 384, 768) — a turbovec requirement.
 
+## Publishing To PyPI
+
+Build and publish with `twine`:
+
+```bash
+python -m pip install --upgrade build twine hatchling
+python -m build --no-isolation
+python -m twine check dist/*
+python -m twine upload --repository pypi dist/*
+```
+
+Authentication:
+
+- Create a PyPI API token at `https://pypi.org/manage/account/token/`.
+- Use `__token__` as the username.
+- Store the token in `~/.pypirc` (recommended) or provide it interactively.
+
+Example `~/.pypirc`:
+
+```ini
+[pypi]
+username = __token__
+password = pypi-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
 ## Usage
 
 ```python
