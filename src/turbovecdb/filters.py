@@ -34,6 +34,10 @@ def _field_clause(field, value):
         if op in ("$in", "$nin"):
             if not isinstance(operand, (list, tuple)) or not operand:
                 raise UnsupportedFilterError(f"{op} on {field!r} requires a non-empty list")
+            if len(operand) > 900:
+                raise UnsupportedFilterError(
+                    f"{op} on {field!r}: list length {len(operand)} exceeds maximum of 900"
+                )
             placeholders = ",".join("?" for _ in operand)
             negate = "NOT " if op == "$nin" else ""
             return (f"json_extract(metadata, ?) {negate}IN ({placeholders})", [path, *operand])
@@ -44,8 +48,10 @@ def _field_clause(field, value):
     return ("json_extract(metadata, ?) = ?", [path, value])
 
 
-def where_to_sql(where):
+def where_to_sql(where, _depth=0):
     """Return ``(sql, params)`` for a ``where`` dict; ``("", [])`` when empty."""
+    if _depth > 10:
+        raise UnsupportedFilterError("filter nesting depth exceeds maximum of 10")
     if not where:
         return ("", [])
     if "$and" in where or "$or" in where:
@@ -57,7 +63,7 @@ def where_to_sql(where):
         joiner = " AND " if op == "$and" else " OR "
         frags, params = [], []
         for sub in subs:
-            f, p = where_to_sql(sub)
+            f, p = where_to_sql(sub, _depth + 1)
             if f:
                 frags.append(f"({f})")
                 params.extend(p)

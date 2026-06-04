@@ -6,11 +6,14 @@ subdirectory. Construction does no I/O — work is deferred to
 """
 
 import os
+import re
 import threading
 
 from .collection import Collection
 from .errors import CollectionNotFoundError
 from .index import DEFAULT_BIT_WIDTH
+
+_SAFE_NAME = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 
 
 class Database:
@@ -30,12 +33,21 @@ class Database:
         With ``create=False`` a missing collection raises
         :class:`CollectionNotFoundError`. Handles are cached per name; the first
         call's options win for a cached handle.
+
+        ``name`` must match ``[A-Za-z0-9_-]{1,128}``.
         """
+        if not _SAFE_NAME.fullmatch(name):
+            raise ValueError(
+                f"invalid collection name {name!r}: must match [A-Za-z0-9_-]{{1,128}}"
+            )
         with self._lock:
             cached = self._collections.get(name)
             if cached is not None:
                 return cached
             coll_dir = os.path.join(self._path, name)
+            base = os.path.abspath(self._path) + os.sep
+            if not os.path.abspath(coll_dir).startswith(base):
+                raise ValueError(f"collection name {name!r} escapes database root")
             if not create and not os.path.isdir(coll_dir):
                 raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
             col = Collection(coll_dir, dim=dim, bit_width=bit_width,
