@@ -34,6 +34,16 @@ pip install turbovecdb        # pulls turbovec, numpy, filelock
 Requires Python ≥ 3.9. The vector dimension must be a positive multiple of 8
 (e.g. 384, 768) — a turbovec requirement.
 
+## Integrate with Mempalace
+
+Mempalace doesn't really support drop-in replacement of ChromaDB. 
+
+What to do
+1. Try out my personal branch (kostadis-dev)
+2. Ask your favorite AI system to patch mempalce. To make that easier, I have asked Cursor to provide instructions that can be used by a human or an LLM to do the patch. 
+
+
+[docs/MEMPALACE_TURBOVEC_MIGRATION_HANDOFF.md](docs/MEMPALACE_TURBOVEC_MIGRATION_HANDOFF.md) is a document that is human readable and appopriate for a coding agent to use to patch an instance of mempalace to use turbovecdb. 
 
 
 ## Usage
