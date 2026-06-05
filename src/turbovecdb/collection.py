@@ -36,11 +36,15 @@ unnormalized scores never reach the caller.
 """
 
 import json
+import logging
 import os
 import sqlite3
 import threading
 from dataclasses import dataclass
 from typing import Optional
+
+_log = logging.getLogger(__name__)
+_SQL_CHUNK = 900  # stay under SQLITE_MAX_VARIABLE_NUMBER on all SQLite builds
 
 import numpy as np
 from filelock import FileLock
@@ -289,26 +293,35 @@ class Collection:
                 try:
                     self._index.remove(np.uint64(uid))
                 except Exception:
-                    pass
-            qmarks = ",".join("?" for _ in uids)
-            self._conn.execute(f"DELETE FROM docs WHERE uid IN ({qmarks})", uids)
+                    _log.warning("ANN index remove failed for uid %d; ghost entry will clear on next reload", uid)
+            for i in range(0, len(uids), _SQL_CHUNK):
+                chunk = uids[i:i + _SQL_CHUNK]
+                qmarks = ",".join("?" for _ in chunk)
+                self._conn.execute(f"DELETE FROM docs WHERE uid IN ({qmarks})", chunk)
             self._meta_set("store_gen", self._store_gen() + 1)
             self._conn.commit()
             self._seen_gen = self._store_gen()
             self._dirty = True
 
     def _select_uids(self, *, ids=None, where=None):
-        frags, params = [], []
-        if ids is not None:
-            qmarks = ",".join("?" for _ in ids)
-            frags.append(f"str_id IN ({qmarks})")
-            params.extend(ids)
         wsql, wparams = where_to_sql(where)
-        if wsql:
-            frags.append(wsql)
-            params.extend(wparams)
-        clause = (" WHERE " + " AND ".join(frags)) if frags else ""
-        rows = self._conn.execute(f"SELECT uid FROM docs{clause}", params).fetchall()
+        if ids is not None:
+            # Chunk str_id lookups to stay under SQLITE_MAX_VARIABLE_NUMBER.
+            uid_rows = []
+            for i in range(0, max(len(ids), 1), _SQL_CHUNK):
+                chunk = ids[i:i + _SQL_CHUNK]
+                qmarks = ",".join("?" for _ in chunk)
+                clause = f"WHERE str_id IN ({qmarks})"
+                if wsql:
+                    clause += f" AND ({wsql})"
+                uid_rows.extend(
+                    self._conn.execute(
+                        f"SELECT uid FROM docs {clause}", list(chunk) + wparams
+                    ).fetchall()
+                )
+            return [int(r[0]) for r in uid_rows]
+        clause = (f" WHERE {wsql}") if wsql else ""
+        rows = self._conn.execute(f"SELECT uid FROM docs{clause}", wparams).fetchall()
         return [int(r[0]) for r in rows]
 
     # -- reads ----------------------------------------------------------------
