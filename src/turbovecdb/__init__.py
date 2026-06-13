@@ -14,11 +14,12 @@ multi-process safety are built in. Bring your own embeddings, or pass an
     print(hits.ids, hits.distances)
 """
 
-from .collection import Collection, GetResult, QueryResult
+from .collection import Collection, GetResult, QueryResult, ReembedReport
 from .database import Database, connect
 from .errors import (
     CollectionNotFoundError,
     DimensionMismatchError,
+    EmbedderIdentityMismatchError,
     EmbedderRequiredError,
     TurboVecError,
     UnsupportedFilterError,
@@ -32,9 +33,11 @@ __all__ = [
     "Collection",
     "QueryResult",
     "GetResult",
+    "ReembedReport",
     "TurboVecError",
     "CollectionNotFoundError",
     "UnsupportedFilterError",
     "DimensionMismatchError",
     "EmbedderRequiredError",
+    "EmbedderIdentityMismatchError",
 ]
