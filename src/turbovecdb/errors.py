@@ -30,3 +30,11 @@ class DimensionMismatchError(TurboVecError):
 
 class EmbedderRequiredError(TurboVecError):
     """Raised when text is given (to add/query) but the collection has no embedder."""
+
+
+class EmbedderIdentityMismatchError(TurboVecError):
+    """Raised when re-embed is called with an embedder that doesn't match stored identity.
+
+    This is the GAP-1 guard in action — it prevents accidental embedder swaps that
+    would corrupt the index without the user's explicit awareness.
+    """

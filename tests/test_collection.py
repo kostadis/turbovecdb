@@ -162,3 +162,282 @@ def test_rebuilds_when_tvim_missing(tmp_path):
     assert c2.count() == 4
     assert c2.query(vector=VECS["a"], k=2).ids == ["a", "d"]  # rebuilt from SQLite
     db2.close()
+
+
+# ── reembed tests ───────────────────────────────────────────────────────────
+
+
+def test_reembed_same_dimension(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("reembed_test", dim=8, create=True)
+
+    def embed1(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    def embed2(texts):
+        import numpy as np
+        return np.array([[float(len(t) * 2) for _ in range(8)] for t in texts])
+
+    # Add with vectors directly
+    c.add(ids=["a", "b"], documents=["hello", "world"], vectors=embed1(["hello", "world"]))
+
+    report = c.reembed(embed2, batch_size=2)
+    assert report.total_docs == 2
+    assert report.old_dim == 8
+    assert report.new_dim == 8
+    assert report.skipped == 0
+    assert report.elapsed_seconds >= 0
+
+    db.close()
+
+
+def test_reembed_dimension_change(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("dim_change", dim=8, create=True)
+
+    def embed8(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    def embed16(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(16)] for t in texts])
+
+    c.add(ids=["a"], documents=["hello"], vectors=embed8(["hello"]))
+
+    report = c.reembed(embed16, dim=16, batch_size=2)
+    assert report.total_docs == 1
+    assert report.old_dim == 8
+    assert report.new_dim == 16
+    assert c.dim == 16
+
+    db.close()
+
+
+def test_reembed_skip_empty_keep(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("skip_empty", dim=8, create=True)
+
+    def embed(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    # Add with vectors directly (no embedder)
+    vecs = embed(["hello", "", "world"])
+    c.add(ids=["a", "b", "c"], documents=["hello", "", "world"], vectors=vecs)
+
+    report = c.reembed(embed, skip_empty="keep", batch_size=2)
+    assert report.total_docs == 3
+    assert report.skipped == 1  # empty doc kept with normalized old vector
+
+    db.close()
+
+
+def test_reembed_skip_empty_drop(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("skip_empty", dim=8, create=True)
+
+    def embed(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    # Add with vectors directly (no embedder)
+    vecs = embed(["hello", "", "world"])
+    c.add(ids=["a", "b", "c"], documents=["hello", "", "world"], vectors=vecs)
+
+    report = c.reembed(embed, skip_empty="drop", batch_size=2)
+    assert report.total_docs == 3
+    assert report.skipped == 1  # empty doc dropped
+
+    db.close()
+
+
+def test_reembed_skip_empty_error(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("skip_empty", dim=8, create=True)
+
+    def embed(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    # Add with vectors directly (no embedder)
+    vecs = embed(["hello", ""])
+    c.add(ids=["a", "b"], documents=["hello", ""], vectors=vecs)
+
+    with pytest.raises(ValueError, match="Cannot re-embed empty document"):
+        c.reembed(embed, skip_empty="error", batch_size=2)
+
+    db.close()
+
+
+def test_reembed_invalid_skip_empty(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("invalid", dim=8, create=True)
+
+    def embed(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    with pytest.raises(ValueError, match="skip_empty must be"):
+        c.reembed(embed, skip_empty="invalid")
+
+    db.close()
+
+
+def test_reembed_invalid_bit_width(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("invalid", dim=8, create=True)
+
+    def embed(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    with pytest.raises(ValueError, match="bit_width must be"):
+        c.reembed(embed, bit_width=5)
+
+    db.close()
+
+
+def test_reembed_non_callable_raises(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("invalid", dim=8, create=True)
+
+    with pytest.raises(ValueError, match="embedder must be a callable"):
+        c.reembed("not a callable")
+
+    db.close()
+
+
+def test_reembed_dimension_mismatch_raises(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("mismatch", dim=8, create=True)
+
+    def embed8(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    def embed16(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(16)] for t in texts])
+
+    # Add with 8-dim vectors first
+    c.add(ids=["a"], documents=["hello"], vectors=embed8(["hello"]))
+
+    # Now try to reembed with 16-dim embedder but dim=8 specified
+    with pytest.raises(DimensionMismatchError):
+        c.reembed(embed16, dim=8, batch_size=2)
+
+    db.close()
+
+
+def test_reembed_empty_collection(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("empty", dim=8, create=True)
+
+    def embed(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    report = c.reembed(embed)
+    assert report.total_docs == 0
+    assert report.old_dim == 8
+    assert report.new_dim == 8
+
+    db.close()
+
+
+# ── delete_collection tests ──────────────────────────────────────────────────
+
+
+def test_delete_collection(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("to_delete", dim=8, create=True)
+    import numpy as np
+    c.add(ids=["a"], documents=["hello"], vectors=[np.ones(8, dtype=np.float32)])
+    db.close()
+
+    db2 = turbovecdb.connect(str(tmp_path / "db"))
+    assert "to_delete" in db2.list_collections()
+    db2.delete_collection("to_delete")
+    assert "to_delete" not in db2.list_collections()
+    db2.close()
+
+
+def test_delete_collection_not_found(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+
+    with pytest.raises(CollectionNotFoundError):
+        db.delete_collection("nonexistent")
+
+    db.close()
+
+
+def test_delete_collection_closes_handle(tmp_path):
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("to_close", dim=8, create=True)
+    import numpy as np
+    c.add(ids=["a"], documents=["hello"], vectors=[np.ones(8, dtype=np.float32)])
+    db.close()
+
+    db2 = turbovecdb.connect(str(tmp_path / "db"))
+    handle = db2.collection("to_close", create=False)
+    assert handle.count() == 1
+    db2.delete_collection("to_close")
+    # Handle should be closed
+    assert "to_close" not in db2.list_collections()
+    db2.close()
+
+
+# ── integration: end-to-end migration ────────────────────────────────────────
+
+
+def test_reembed_with_bit_width_change(tmp_path):
+    """Test that bit_width can be changed during reembed."""
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("bitwidth_test", dim=8, bit_width=4, create=True)
+
+    def embed(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    c.add(ids=["a"], documents=["hello"], vectors=embed(["hello"]))
+
+    # Reembed with different bit_width
+    report = c.reembed(embed, bit_width=2, batch_size=2)
+    assert report.total_docs == 1
+    assert report.old_dim == 8
+    assert c.dim == 8
+    # bit_width should be updated
+    assert c._bit_width == 2
+
+    db.close()
+
+
+def test_reembed_updates_embedder_identity(tmp_path):
+    """Test that reembed updates the stored embedder identity."""
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    c = db.collection("identity_test", dim=8, create=True)
+
+    def embed1(texts):
+        import numpy as np
+        return np.array([[float(len(t)) for _ in range(8)] for t in texts])
+
+    c.add(ids=["a"], documents=["hello"], vectors=embed1(["hello"]))
+
+    # Get initial embedder identity
+    initial_identity = c._meta_get("embedder_identity")
+    assert initial_identity is None or "add" in initial_identity.lower()
+
+    # Reembed with new embedder
+    def embed2(texts):
+        import numpy as np
+        return np.array([[float(len(t) * 2) for _ in range(8)] for t in texts])
+
+    c.reembed(embed2, batch_size=2)
+
+    # Check embedder identity was updated
+    new_identity = c._meta_get("embedder_identity")
+    assert new_identity == "embed2"
+
+    db.close()

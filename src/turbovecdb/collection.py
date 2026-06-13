@@ -50,7 +50,7 @@ import numpy as np
 from filelock import FileLock
 
 from . import index as _idx
-from .errors import DimensionMismatchError, EmbedderRequiredError
+from .errors import DimensionMismatchError, EmbedderIdentityMismatchError, EmbedderRequiredError
 from .filters import combined_sql, where_to_sql
 
 _RERANK_FLOOR = 50
@@ -75,6 +75,24 @@ class GetResult:
     documents: list
     metadatas: list
     vectors: Optional[list] = None
+
+
+@dataclass
+class ReembedReport:
+    """Result of a ``Collection.reembed()`` operation.
+
+    Attributes:
+        total_docs: Total number of documents processed
+        old_dim: Dimension before re-embedding
+        new_dim: Dimension after re-embedding
+        skipped: Number of documents skipped (due to empty content or drop policy)
+        elapsed_seconds: Total time taken in seconds
+    """
+    total_docs: int
+    old_dim: int
+    new_dim: int
+    skipped: int
+    elapsed_seconds: float
 
 
 def _resolve_include(include, *, default_distances):
@@ -434,6 +452,228 @@ class Collection:
     def count(self):
         with self._tlock:
             return int(self._conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
+
+    def _get_embedder_identity(self, embedder):
+        """Extract a stable identifier for the embedder function."""
+        if hasattr(embedder, "__name__"):
+            return embedder.__name__
+        elif hasattr(embedder, "__class__"):
+            return f"{embedder.__class__.__module__}.{embedder.__class__.__name__}"
+        else:
+            return "unknown_embedder"
+
+    def _recommit_dim(self, new_dim, bit_width=None):
+        """Update collection dimension and rebuild index.
+
+        Args:
+            new_dim: The new dimension (must be positive multiple of 8)
+            bit_width: Optional new bit_width (2/3/4). If None, keeps current.
+        """
+        if new_dim <= 0 or new_dim % 8 != 0:
+            raise DimensionMismatchError(
+                f"turbovec requires dim to be a positive multiple of 8, got {new_dim}"
+            )
+        if bit_width is not None and bit_width not in (2, 3, 4):
+            raise ValueError(f"bit_width must be 2, 3, or 4, got {bit_width!r}")
+
+        with self._tlock, self._flock:
+            self._ensure_current()
+            self._dim = new_dim
+            if bit_width is not None:
+                self._bit_width = bit_width
+            self._meta_set("dim", self._dim)
+            self._meta_set("bit_width", self._bit_width)
+            self._conn.commit()
+            self._reload_index()
+            self.flush()
+
+    def reembed(self, embedder, *, dim=None, bit_width=None, batch_size=256, on_progress=None, skip_empty="error"):
+        """Recompute every vector in place from stored documents using a new embedder.
+
+        Args:
+            embedder: Callable that takes list of texts and returns list of vectors
+            dim: Optional new dimension to validate against embedder output
+            bit_width: Optional new bit_width (2/3/4) for quantization
+            batch_size: Number of documents to embed in each batch
+            on_progress: Optional callback function with signature (done, total)
+            skip_empty: Policy for empty documents ("error", "keep", or "drop")
+
+        Returns:
+            ReembedReport: Summary of re-embedding operation
+        """
+        import time
+
+        # Pre-validation (before acquiring locks)
+        if skip_empty not in ("error", "keep", "drop"):
+            raise ValueError(f"skip_empty must be 'error', 'keep', or 'drop', got {skip_empty!r}")
+        if bit_width is not None:
+            if bit_width not in (2, 3, 4):
+                raise ValueError(f"bit_width must be 2, 3, or 4, got {bit_width!r}")
+        if not callable(embedder):
+            raise ValueError("embedder must be a callable")
+        if dim is not None:
+            if dim <= 0 or dim % 8 != 0:
+                raise DimensionMismatchError(
+                    f"turbovec requires dim to be a positive multiple of 8, got {dim}"
+                )
+
+        # Get embedder identity (for GAP-1 integration)
+        embedder_identity = self._get_embedder_identity(embedder)
+
+        # Get total count (before locks)
+        total_docs = self.count()
+        if total_docs == 0:
+            return ReembedReport(0, self._dim, self._dim, 0, 0)
+
+        # Acquire write lock and perform re-embedding
+        with self._tlock, self._flock:
+            self._ensure_current()
+
+            old_dim = self._dim
+            old_bit_width = self._bit_width
+            processed = 0
+            skipped = 0
+            start_time = time.time()
+
+            cursor = self._conn.cursor()
+            cursor.execute("SELECT uid, document FROM docs ORDER BY uid")
+
+            batch = []
+            batch_uids = []
+            updates = []  # (vector_bytes, uid) pairs
+
+            while True:
+                row = cursor.fetchone()
+                if not row:
+                    break
+
+                uid, document = row
+
+                # Handle empty document
+                if not document:
+                    if skip_empty == "error":
+                        raise ValueError(f"Cannot re-embed empty document with uid {uid}")
+                    elif skip_empty == "drop":
+                        skipped += 1
+                        processed += 1
+                        if on_progress:
+                            on_progress(processed, total_docs)
+                        continue
+                    else:  # keep
+                        # Keep old vector - read it from DB and re-normalize
+                        cursor2 = self._conn.cursor()
+                        cursor2.execute("SELECT vector FROM docs WHERE uid=?", (uid,))
+                        vec_row = cursor2.fetchone()
+                        if vec_row:
+                            old_vec = np.frombuffer(vec_row[0], dtype=np.float32)
+                            new_vec = _idx.l2_normalize(old_vec.reshape(1, -1))[0]
+                            updates.append((new_vec.tobytes(), uid))
+                        skipped += 1
+                        processed += 1
+                        if on_progress:
+                            on_progress(processed, total_docs)
+                        continue
+
+                # Add to batch
+                batch.append(document)
+                batch_uids.append(uid)
+
+                # Process batch when full
+                if len(batch) >= batch_size:
+                    # Embed batch
+                    try:
+                        new_vecs = np.asarray(embedder(batch), dtype=np.float32)
+                    except Exception as e:
+                        raise ValueError(f"Embedder failed on batch: {e}")
+
+                    # Validate dimension consistency across batches
+                    batch_dim = new_vecs.shape[1]
+                    if batch_dim != old_dim and dim is not None and batch_dim != dim:
+                        raise DimensionMismatchError(
+                            f"Embedder returned vectors of dimension {batch_dim}, "
+                            f"but dim was explicitly set to {dim}"
+                        )
+
+                    # Normalize vectors
+                    new_vecs = _idx.l2_normalize(new_vecs)
+
+                    # Collect updates
+                    for i, uid in enumerate(batch_uids):
+                        updates.append((new_vecs[i].tobytes(), uid))
+
+                    # Track progress
+                    processed += len(batch)
+                    if on_progress:
+                        on_progress(processed, total_docs)
+
+                    # Reset batch
+                    batch = []
+                    batch_uids = []
+
+            # Process remaining documents
+            if batch:
+                try:
+                    new_vecs = np.asarray(embedder(batch), dtype=np.float32)
+                except Exception as e:
+                    raise ValueError(f"Embedder failed on final batch: {e}")
+
+                # Validate dimension consistency
+                batch_dim = new_vecs.shape[1]
+                if batch_dim != old_dim and dim is not None and batch_dim != dim:
+                    raise DimensionMismatchError(
+                        f"Embedder returned vectors of dimension {batch_dim}, "
+                        f"but dim was explicitly set to {dim}"
+                    )
+
+                # Normalize vectors
+                new_vecs = _idx.l2_normalize(new_vecs)
+
+                # Collect updates
+                for i, uid in enumerate(batch_uids):
+                    updates.append((new_vecs[i].tobytes(), uid))
+
+                processed += len(batch)
+                if on_progress:
+                    on_progress(processed, total_docs)
+
+            # Get new dimension from first update (or keep old if all were skipped)
+            new_dim = old_dim
+            new_bit_width = old_bit_width
+            if updates:
+                new_dim = len(updates[0][0]) // 4  # 4 bytes per float32
+
+            # Update dimension and bit_width if changed
+            if new_dim != old_dim or (bit_width is not None and bit_width != old_bit_width):
+                if dim is not None and new_dim != dim:
+                    raise DimensionMismatchError(
+                        f"Embedder returned vectors of dimension {new_dim}, "
+                        f"but dim was explicitly set to {dim}"
+                    )
+                # Update dim/bit_width in meta but don't rebuild index yet
+                self._dim = new_dim
+                if bit_width is not None:
+                    self._bit_width = bit_width
+                self._meta_set("dim", self._dim)
+                self._meta_set("bit_width", self._bit_width)
+
+            # Batch update vectors
+            if updates:
+                self._conn.executemany(
+                    "UPDATE docs SET vector=? WHERE uid=?",
+                    updates
+                )
+
+            # Update metadata
+            self._meta_set("store_gen", self._store_gen() + 1)
+            self._meta_set("embedder_identity", embedder_identity)
+            self._conn.commit()
+
+            # Rebuild index with new vectors and new dimension
+            self._reload_index()
+            self.flush()
+
+            elapsed = time.time() - start_time
+            return ReembedReport(total_docs, old_dim, new_dim, skipped, elapsed)
 
     @property
     def dim(self):

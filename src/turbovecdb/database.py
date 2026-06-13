@@ -64,6 +64,34 @@ class Database:
             and os.path.exists(os.path.join(self._path, d, "store.sqlite3"))
         )
 
+    def delete_collection(self, name):
+        """Delete a collection and all its data.
+
+        Args:
+            name: Name of the collection to delete
+
+        Raises:
+            CollectionNotFoundError: If the collection does not exist
+        """
+        coll_dir = os.path.join(self._path, name)
+        if not os.path.isdir(coll_dir):
+            raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
+        if not os.path.exists(os.path.join(coll_dir, "store.sqlite3")):
+            raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
+
+        # Close cached handle if present
+        with self._lock:
+            if name in self._collections:
+                try:
+                    self._collections[name].close()
+                except Exception:
+                    pass
+                del self._collections[name]
+
+        # Delete collection directory
+        import shutil
+        shutil.rmtree(coll_dir)
+
     def close(self):
         with self._lock:
             for col in self._collections.values():
