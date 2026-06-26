@@ -56,8 +56,9 @@ from .filters import combined_sql, where_to_sql
 
 _RERANK_FLOOR = 50
 _VALID_INCLUDE = frozenset({"documents", "metadatas", "distances", "vectors"})
-_LOCK_TIMEOUT = 30  # seconds; prevents indefinite blocking if a writer crashes
-_SCHEMA_VERSION = 1  # increment when schema evolves; add _migrate_v<N> steps below
+_LOCK_TIMEOUT = 30
+_SCHEMA_VERSION = 1
+_REBUILD_BATCH_SIZE = 10000
 
 
 @dataclass
@@ -236,7 +237,11 @@ class Collection:
     # -- index lifecycle ------------------------------------------------------
 
     def _reload_index(self):
-        """(Re)build the in-memory index to reflect the current store_gen."""
+        """(Re)build the in-memory index to reflect the current store_gen.
+
+        Vectors are loaded from SQLite in batches of ``_REBUILD_BATCH_SIZE``
+        to keep peak memory bounded on large collections.
+        """
         if self._dim is None:
             self._index = None
             self._seen_gen = self._store_gen()
@@ -249,13 +254,27 @@ class Collection:
                 self._seen_gen = store_gen
                 return
             except Exception:
-                pass  # fall through to rebuild from the source of truth
-        rows = self._conn.execute("SELECT uid, vector FROM docs").fetchall()
-        uids = [r[0] for r in rows]
-        vecs = [np.frombuffer(r[1], dtype=np.float32) for r in rows]
-        self._index = _idx.build_index(self._dim, self._bit_width, uids, vecs)
+                pass
+        self._index = _idx.new_index(self._dim, self._bit_width)
+        last_uid = -1
+        while True:
+            rows = self._conn.execute(
+                "SELECT uid, vector FROM docs WHERE uid > ? ORDER BY uid LIMIT ?",
+                (last_uid, _REBUILD_BATCH_SIZE),
+            ).fetchall()
+            if not rows:
+                break
+            batch_uids = [int(r[0]) for r in rows]
+            batch_vecs = np.stack(
+                [np.frombuffer(r[1], dtype=np.float32) for r in rows]
+            ).astype(np.float32, copy=False)
+            self._index.add_with_ids(
+                np.ascontiguousarray(batch_vecs),
+                np.array(batch_uids, dtype=np.uint64),
+            )
+            last_uid = batch_uids[-1]
         self._seen_gen = store_gen
-        self._dirty = True  # in-memory index now newer than on-disk .tvim
+        self._dirty = True
 
     def _ensure_current(self):
         """Cheap staleness check for readers: reload if another writer advanced
