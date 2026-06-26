@@ -172,6 +172,14 @@ class Collection:
 
         self._migrate_schema()
 
+        # Store embedder identity on first creation so that subsequent
+        # opens with a different embedder are caught by the write-path guard.
+        if self._embedder is not None:
+            stored = self._meta_get("embedder_identity")
+            if stored is None:
+                self._meta_set("embedder_identity", self._get_embedder_identity(self._embedder))
+                self._conn.commit()
+
         self._index = None
         self._seen_gen = -1
         self._reload_index()
@@ -328,6 +336,16 @@ class Collection:
             return _idx.l2_normalize(vectors)
         if documents is None:
             raise ValueError("add/upsert requires either vectors= or documents= (with an embedder)")
+        # GAP-1 guard: prevent accidental embedder swap on write path
+        if self._embedder is not None:
+            stored = self._meta_get("embedder_identity")
+            if stored is not None:
+                current = self._get_embedder_identity(self._embedder)
+                if current != stored:
+                    raise EmbedderIdentityMismatchError(
+                        f"embedder identity mismatch: stored {stored!r} != "
+                        f"current {current!r}; use reembed() to change embedders"
+                    )
         return _idx.l2_normalize(self._embed(documents))
 
     def _write(self, *, ids, documents, metadatas, vectors, replace):
