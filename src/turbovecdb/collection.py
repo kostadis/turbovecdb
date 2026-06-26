@@ -40,6 +40,7 @@ import logging
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
@@ -47,7 +48,7 @@ _log = logging.getLogger(__name__)
 _SQL_CHUNK = 900  # stay under SQLITE_MAX_VARIABLE_NUMBER on all SQLite builds
 
 import numpy as np
-from filelock import FileLock
+from filelock import FileLock, Timeout
 
 from . import index as _idx
 from .errors import DimensionMismatchError, EmbedderIdentityMismatchError, EmbedderRequiredError
@@ -55,6 +56,7 @@ from .filters import combined_sql, where_to_sql
 
 _RERANK_FLOOR = 50
 _VALID_INCLUDE = frozenset({"documents", "metadatas", "distances", "vectors"})
+_LOCK_TIMEOUT = 30  # seconds; prevents indefinite blocking if a writer crashes
 
 
 @dataclass
@@ -112,7 +114,7 @@ def _resolve_include(include, *, default_distances):
 
 class Collection:
     def __init__(self, coll_dir, *, dim=None, bit_width=_idx.DEFAULT_BIT_WIDTH,
-                 metric="cosine", embedder=None):
+                 metric="cosine", embedder=None, lock_timeout=_LOCK_TIMEOUT):
         if metric != "cosine":
             raise ValueError(f"unsupported metric {metric!r} (only 'cosine' for now)")
         self.dir = coll_dir
@@ -122,7 +124,7 @@ class Collection:
         self._metric = metric
         self._embedder = embedder
         self._tlock = threading.RLock()      # in-process structure guard
-        self._flock = FileLock(os.path.join(coll_dir, "write.lock"))  # cross-process write lock
+        self._flock = FileLock(os.path.join(coll_dir, "write.lock"), timeout=lock_timeout)
         self._dirty = False
 
         self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
@@ -149,6 +151,25 @@ class Collection:
         self._index = None
         self._seen_gen = -1
         self._reload_index()
+
+    @contextmanager
+    def _locked(self):
+        """Acquire the in-process lock and cross-process file lock.
+
+        Raises ``TurboVecError`` if the file lock cannot be acquired within
+        the configured timeout (prevents indefinite blocking when a writer
+        crashes while holding the lock).
+        """
+        with self._tlock:
+            try:
+                with self._flock:
+                    yield
+            except Timeout:
+                from .errors import TurboVecError
+                raise TurboVecError(
+                    f"could not acquire write lock on {self.dir!r} within "
+                    f"{self._flock.timeout:.1f}s"
+                )
 
     # -- meta -----------------------------------------------------------------
 
@@ -209,7 +230,7 @@ class Collection:
 
         Takes the cross-process write lock because it writes ``tvim_gen`` to
         SQLite — that write must be serialized with other processes' writers."""
-        with self._tlock, self._flock:
+        with self._locked():
             if self._index is None or not self._dirty:
                 return
             _idx.write_index_atomic(self._index, self._tvim_path)
@@ -254,7 +275,7 @@ class Collection:
         vecs = self._resolve_vectors(documents, vectors, n)
         docs = documents if documents is not None else [""] * n
 
-        with self._tlock, self._flock:
+        with self._locked():
             # Refresh under the lock so concurrent writers see each other's rows.
             self._next_uid = int(self._meta_get("next_uid", 0))
             self._ensure_current()
@@ -302,7 +323,7 @@ class Collection:
             self._dirty = True
 
     def delete(self, *, ids=None, where=None):
-        with self._tlock, self._flock:
+        with self._locked():
             self._ensure_current()
             uids = self._select_uids(ids=ids, where=where)
             if not uids:
@@ -476,7 +497,7 @@ class Collection:
         if bit_width is not None and bit_width not in (2, 3, 4):
             raise ValueError(f"bit_width must be 2, 3, or 4, got {bit_width!r}")
 
-        with self._tlock, self._flock:
+        with self._locked():
             self._ensure_current()
             self._dim = new_dim
             if bit_width is not None:
@@ -526,7 +547,7 @@ class Collection:
             return ReembedReport(0, self._dim, self._dim, 0, 0)
 
         # Acquire write lock and perform re-embedding
-        with self._tlock, self._flock:
+        with self._locked():
             self._ensure_current()
 
             old_dim = self._dim
