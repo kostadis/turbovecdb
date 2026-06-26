@@ -302,6 +302,27 @@ class Collection:
         if self._store_gen() != self._seen_gen:
             self._reload_index()
 
+    def _commit(self):
+        """Commit the current transaction, keeping the cache and store in sync.
+
+        The write paths mirror their changes into the in-memory turbovec index
+        *before* committing. If the commit fails (e.g. ``SQLITE_FULL``, an I/O
+        error) SQLite rolls the transaction back, but the in-memory index has
+        already been mutated. Because ``store_gen`` never advanced and
+        ``_seen_gen`` was not updated, ``_ensure_current`` would never notice
+        the mismatch and the cache would silently diverge from the durable
+        store for the life of this handle.
+
+        On failure we therefore invalidate the index so the next access rebuilds
+        it from the committed SQLite state — the source of truth.
+        """
+        try:
+            self._conn.commit()
+        except Exception:
+            self._index = None
+            self._seen_gen = -1
+            raise
+
     def _checkpoint_wal(self):
         """Truncate the WAL to prevent unbounded growth on busy writers."""
         try:
@@ -419,7 +440,7 @@ class Collection:
             )
             self._meta_set("next_uid", self._next_uid)
             self._meta_set("store_gen", self._store_gen() + 1)
-            self._conn.commit()
+            self._commit()
             self._seen_gen = self._store_gen()
             self._dirty = True
 
@@ -503,7 +524,7 @@ class Collection:
                 qmarks = ",".join("?" for _ in chunk)
                 self._conn.execute(f"DELETE FROM docs WHERE uid IN ({qmarks})", chunk)
             self._meta_set("store_gen", self._store_gen() + 1)
-            self._conn.commit()
+            self._commit()
             self._seen_gen = self._store_gen()
             self._dirty = True
 
