@@ -9,8 +9,10 @@ import os
 import re
 import threading
 
-from .collection import Collection
-from .errors import CollectionNotFoundError
+from filelock import FileLock, Timeout
+
+from .collection import Collection, _LOCK_TIMEOUT
+from .errors import CollectionNotFoundError, TurboVecError
 from .index import DEFAULT_BIT_WIDTH
 
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
@@ -70,11 +72,15 @@ class Database:
     def delete_collection(self, name):
         """Delete a collection and all its data.
 
+        Acquires the collection's write lock before removing the directory
+        to prevent races with concurrent writers in other processes.
+
         Args:
             name: Name of the collection to delete
 
         Raises:
             CollectionNotFoundError: If the collection does not exist
+            TurboVecError: If the write lock cannot be acquired
         """
         coll_dir = os.path.join(self._path, name)
         if not os.path.isdir(coll_dir):
@@ -91,9 +97,21 @@ class Database:
                     pass
                 del self._collections[name]
 
-        # Delete collection directory
-        import shutil
-        shutil.rmtree(coll_dir)
+        # Acquire the write lock to serialize with concurrent writers.
+        lock_path = os.path.join(coll_dir, "write.lock")
+        flock = FileLock(lock_path, timeout=_LOCK_TIMEOUT)
+        try:
+            flock.acquire()
+        except Timeout:
+            raise TurboVecError(
+                f"could not acquire write lock on {coll_dir!r} within "
+                f"{_LOCK_TIMEOUT}s to delete collection"
+            )
+        try:
+            import shutil
+            shutil.rmtree(coll_dir)
+        finally:
+            flock.release()
 
     def __enter__(self):
         return self
