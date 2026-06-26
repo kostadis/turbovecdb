@@ -65,11 +65,12 @@ class Database:
     def list_collections(self):
         if not os.path.isdir(self._path):
             return []
-        return sorted(
-            d for d in os.listdir(self._path)
-            if os.path.isdir(os.path.join(self._path, d, ""))
-            and os.path.exists(os.path.join(self._path, d, "store.sqlite3"))
-        )
+        with self._lock:
+            return sorted(
+                d for d in os.listdir(self._path)
+                if os.path.isdir(os.path.join(self._path, d, ""))
+                and os.path.exists(os.path.join(self._path, d, "store.sqlite3"))
+            )
 
     def delete_collection(self, name):
         """Delete a collection and all its data.
