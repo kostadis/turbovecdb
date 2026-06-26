@@ -57,6 +57,7 @@ from .filters import combined_sql, where_to_sql
 _RERANK_FLOOR = 50
 _VALID_INCLUDE = frozenset({"documents", "metadatas", "distances", "vectors"})
 _LOCK_TIMEOUT = 30  # seconds; prevents indefinite blocking if a writer crashes
+_SCHEMA_VERSION = 1  # increment when schema evolves; add _migrate_v<N> steps below
 
 
 @dataclass
@@ -148,6 +149,8 @@ class Collection:
         self._next_uid = int(self._meta_get("next_uid", 0))
         self._conn.commit()
 
+        self._migrate_schema()
+
         self._index = None
         self._seen_gen = -1
         self._reload_index()
@@ -194,6 +197,21 @@ class Collection:
             )
         self._dim = dim
         self._meta_set("dim", dim)
+
+    # -- schema migration ----------------------------------------------------
+
+    def _migrate_schema(self):
+        """Forward-only schema migration. Runs at most once per collection open."""
+        stored_version = int(self._meta_get("schema_version", 0))
+        if stored_version >= _SCHEMA_VERSION:
+            return
+        # Apply pending migrations sequentially.
+        for version in range(stored_version + 1, _SCHEMA_VERSION + 1):
+            meth = getattr(self, f"_migrate_v{version}", None)
+            if meth is not None:
+                meth()
+        self._meta_set("schema_version", _SCHEMA_VERSION)
+        self._conn.commit()
 
     # -- index lifecycle ------------------------------------------------------
 
