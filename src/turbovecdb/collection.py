@@ -647,11 +647,12 @@ class Collection:
 
                 # Process batch when full
                 if len(batch) >= batch_size:
+                    uid_range = f"uids [{batch_uids[0]}..{batch_uids[-1]}]"
                     # Embed batch
                     try:
                         new_vecs = np.asarray(embedder(batch), dtype=np.float32)
                     except Exception as e:
-                        raise ValueError(f"Embedder failed on batch: {e}")
+                        raise ValueError(f"Embedder failed on batch {uid_range}: {e}")
 
                     # Validate dimension consistency across batches
                     batch_dim = new_vecs.shape[1]
@@ -679,10 +680,11 @@ class Collection:
 
             # Process remaining documents
             if batch:
+                uid_range = f"uids [{batch_uids[0]}..{batch_uids[-1]}]"
                 try:
                     new_vecs = np.asarray(embedder(batch), dtype=np.float32)
                 except Exception as e:
-                    raise ValueError(f"Embedder failed on final batch: {e}")
+                    raise ValueError(f"Embedder failed on final batch {uid_range}: {e}")
 
                 # Validate dimension consistency
                 batch_dim = new_vecs.shape[1]
