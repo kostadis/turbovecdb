@@ -27,7 +27,7 @@ class Database:
         return self._path
 
     def collection(self, name, *, dim=None, bit_width=DEFAULT_BIT_WIDTH,
-                   metric="cosine", embedder=None, create=True):
+                   metric="cosine", embedder=None, create=True, lock_timeout=None):
         """Open (or create) a collection by name.
 
         With ``create=False`` a missing collection raises
@@ -50,8 +50,11 @@ class Database:
                 raise ValueError(f"collection name {name!r} escapes database root")
             if not create and not os.path.isdir(coll_dir):
                 raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
-            col = Collection(coll_dir, dim=dim, bit_width=bit_width,
-                             metric=metric, embedder=embedder)
+            kwargs = dict(dim=dim, bit_width=bit_width,
+                          metric=metric, embedder=embedder)
+            if lock_timeout is not None:
+                kwargs["lock_timeout"] = lock_timeout
+            col = Collection(coll_dir, **kwargs)
             self._collections[name] = col
             return col
 
