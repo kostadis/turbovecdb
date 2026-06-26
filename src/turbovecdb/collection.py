@@ -81,6 +81,26 @@ class GetResult:
 
 
 @dataclass
+class HealthResult:
+    """Result of a ``Collection.health()`` check.
+
+    Attributes:
+        ok: True if both SQLite and the index are healthy and coherent
+        quick_check: Raw result of ``PRAGMA quick_check``
+        store_gen: Current committed-write counter
+        tvim_gen: Counter that the cached index reflects
+        coherent: True if the cache is up-to-date with the store
+        doc_count: Number of documents in the SQLite store
+    """
+    ok: bool
+    quick_check: str
+    store_gen: int
+    tvim_gen: int
+    coherent: bool
+    doc_count: int
+
+
+@dataclass
 class ReembedReport:
     """Result of a ``Collection.reembed()`` operation.
 
@@ -725,6 +745,37 @@ class Collection:
     @property
     def dim(self):
         return self._dim
+
+    def health(self):
+        """Run an integrity check on the collection.
+
+        Returns:
+            HealthResult with SQLite quick_check result, store-gen counters,
+            cache coherence status, and document count.
+
+        Raises:
+            TurboVecError: If the SQLite quick_check reports corruption.
+        """
+        with self._tlock:
+            qc = self._conn.execute("PRAGMA quick_check").fetchone()[0]
+            store_gen = self._store_gen()
+            tvim_gen = int(self._meta_get("tvim_gen", -1))
+            doc_count = int(self._conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
+            coherent = store_gen == tvim_gen
+            ok = qc == "ok"
+            if not ok:
+                from .errors import TurboVecError
+                raise TurboVecError(
+                    f"SQLite integrity check failed for {self.dir!r}: {qc}"
+                )
+            return HealthResult(
+                ok=ok,
+                quick_check=qc,
+                store_gen=store_gen,
+                tvim_gen=tvim_gen,
+                coherent=coherent,
+                doc_count=doc_count,
+            )
 
     def __enter__(self):
         return self

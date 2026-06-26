@@ -14,7 +14,7 @@ multi-process safety are built in. Bring your own embeddings, or pass an
     print(hits.ids, hits.distances)
 """
 
-from .collection import Collection, GetResult, QueryResult, ReembedReport
+from .collection import Collection, GetResult, HealthResult, QueryResult, ReembedReport
 from .database import Database, connect
 from .errors import (
     CollectionNotFoundError,
@@ -33,6 +33,7 @@ __all__ = [
     "Collection",
     "QueryResult",
     "GetResult",
+    "HealthResult",
     "ReembedReport",
     "TurboVecError",
     "CollectionNotFoundError",
