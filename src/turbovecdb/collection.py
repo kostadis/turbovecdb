@@ -345,6 +345,12 @@ class Collection:
 
     def _resolve_vectors(self, documents, vectors, n):
         if vectors is not None:
+            if self._embedder is not None:
+                _log.warning(
+                    "add/upsert with vectors= bypasses the configured embedder "
+                    "(%s); use documents= to embed via the collection's embedder",
+                    self._get_embedder_identity(self._embedder),
+                )
             return _idx.l2_normalize(vectors)
         if documents is None:
             raise ValueError("add/upsert requires either vectors= or documents= (with an embedder)")
@@ -445,6 +451,37 @@ class Collection:
                 self._conn.execute(
                     "UPDATE docs SET metadata=? WHERE str_id=?",
                     (meta_json, str_id),
+                )
+            self._meta_set("store_gen", self._store_gen() + 1)
+            self._conn.commit()
+            self._seen_gen = self._store_gen()
+
+    def update_documents(self, *, ids, documents):
+        """Update documents for existing entries without touching vectors/metadata.
+
+        Args:
+            ids: List of string IDs identifying the documents to update.
+            documents: List of document strings (one per id).
+
+        Raises:
+            ValueError: If an id is not found or lengths mismatch.
+        """
+        n = len(ids)
+        if len(documents) != n:
+            raise ValueError(f"documents length {len(documents)} != ids length {n}")
+        if n == 0:
+            return
+        with self._locked():
+            self._ensure_current()
+            for i, str_id in enumerate(ids):
+                row = self._conn.execute(
+                    "SELECT uid FROM docs WHERE str_id=?", (str_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"id {str_id!r} not found")
+                self._conn.execute(
+                    "UPDATE docs SET document=? WHERE str_id=?",
+                    (documents[i], str_id),
                 )
             self._meta_set("store_gen", self._store_gen() + 1)
             self._conn.commit()
@@ -829,6 +866,12 @@ class Collection:
     @property
     def dim(self):
         return self._dim
+
+    @property
+    def embedder_identity(self):
+        """The stored embedder identity string, or ``None`` if no embedder
+        has been recorded."""
+        return self._meta_get("embedder_identity")
 
     def health(self):
         """Run an integrity check on the collection.
