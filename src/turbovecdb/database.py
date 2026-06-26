@@ -5,6 +5,7 @@ subdirectory. Construction does no I/O — work is deferred to
 :meth:`Database.collection`.
 """
 
+import logging
 import os
 import re
 import threading
@@ -15,6 +16,7 @@ from .collection import Collection, _LOCK_TIMEOUT
 from .errors import CollectionNotFoundError, TurboVecError
 from .index import DEFAULT_BIT_WIDTH
 
+_log = logging.getLogger(__name__)
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 
 
@@ -93,8 +95,8 @@ class Database:
             if name in self._collections:
                 try:
                     self._collections[name].close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("error closing collection %r during delete: %s", name, exc)
                 del self._collections[name]
 
         # Acquire the write lock to serialize with concurrent writers.
@@ -122,11 +124,11 @@ class Database:
 
     def close(self):
         with self._lock:
-            for col in self._collections.values():
+            for name, col in list(self._collections.items()):
                 try:
                     col.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log.warning("error closing collection %r: %s", name, exc)
             self._collections.clear()
 
 
