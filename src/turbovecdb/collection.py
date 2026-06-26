@@ -405,6 +405,39 @@ class Collection:
             self._seen_gen = self._store_gen()
             self._dirty = True
 
+    def update_metadata(self, *, ids, metadatas):
+        """Update metadata for existing documents without touching vectors.
+
+        Args:
+            ids: List of string IDs identifying the documents to update.
+            metadatas: List of metadata dicts (one per id). ``None`` entries
+                       are replaced with ``{}``.
+
+        Raises:
+            ValueError: If an id is not found or lengths mismatch.
+        """
+        n = len(ids)
+        if len(metadatas) != n:
+            raise ValueError(f"metadatas length {len(metadatas)} != ids length {n}")
+        if n == 0:
+            return
+        with self._locked():
+            self._ensure_current()
+            for i, str_id in enumerate(ids):
+                meta_json = json.dumps(metadatas[i] if metadatas[i] else {})
+                row = self._conn.execute(
+                    "SELECT uid FROM docs WHERE str_id=?", (str_id,)
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"id {str_id!r} not found")
+                self._conn.execute(
+                    "UPDATE docs SET metadata=? WHERE str_id=?",
+                    (meta_json, str_id),
+                )
+            self._meta_set("store_gen", self._store_gen() + 1)
+            self._conn.commit()
+            self._seen_gen = self._store_gen()
+
     def delete(self, *, ids=None, where=None):
         with self._locked():
             self._ensure_current()
