@@ -110,6 +110,19 @@ class Database:
                 f"could not acquire write lock on {coll_dir!r} within "
                 f"{_LOCK_TIMEOUT}s to delete collection"
             )
+
+        # Re-check cache under lock — a concurrent collection(create=True)
+        # may have recreated the collection between the initial checks and
+        # the lock acquisition. Close and evict the new handle so rmtree
+        # does not delete a just-created collection out from under someone.
+        with self._lock:
+            if name in self._collections:
+                try:
+                    self._collections[name].close()
+                except Exception as exc:
+                    _log.warning("error closing collection %r during delete: %s", name, exc)
+                del self._collections[name]
+
         try:
             import shutil
             shutil.rmtree(coll_dir)
