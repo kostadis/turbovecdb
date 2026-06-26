@@ -225,6 +225,13 @@ class Collection:
         if self._store_gen() != self._seen_gen:
             self._reload_index()
 
+    def _checkpoint_wal(self):
+        """Truncate the WAL to prevent unbounded growth on busy writers."""
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception:
+            _log.warning("WAL checkpoint failed", exc_info=True)
+
     def flush(self):
         """Persist the in-memory index to ``index.tvim`` (a cache for cold start).
 
@@ -236,6 +243,7 @@ class Collection:
             _idx.write_index_atomic(self._index, self._tvim_path)
             self._meta_set("tvim_gen", self._store_gen())
             self._conn.commit()
+            self._checkpoint_wal()
             self._dirty = False
 
     # -- embedding ------------------------------------------------------------
@@ -713,4 +721,5 @@ class Collection:
                 self.flush()
             finally:
                 self._conn.commit()
+                self._checkpoint_wal()
                 self._conn.close()
