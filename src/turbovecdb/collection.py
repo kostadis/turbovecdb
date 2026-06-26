@@ -249,6 +249,10 @@ class Collection:
 
         Vectors are loaded from SQLite in batches of ``_REBUILD_BATCH_SIZE``
         to keep peak memory bounded on large collections.
+
+        On failure the ``_seen_gen`` is still advanced so that callers do not
+        enter an infinite retry loop.  The partially-built index is discarded
+        (set to ``None``) to avoid serving incomplete results.
         """
         if self._dim is None:
             self._index = None
@@ -265,22 +269,30 @@ class Collection:
                 pass
         self._index = _idx.new_index(self._dim, self._bit_width)
         last_uid = -1
-        while True:
-            rows = self._conn.execute(
-                "SELECT uid, vector FROM docs WHERE uid > ? ORDER BY uid LIMIT ?",
-                (last_uid, _REBUILD_BATCH_SIZE),
-            ).fetchall()
-            if not rows:
-                break
-            batch_uids = [int(r[0]) for r in rows]
-            batch_vecs = np.stack(
-                [np.frombuffer(r[1], dtype=np.float32) for r in rows]
-            ).astype(np.float32, copy=False)
-            self._index.add_with_ids(
-                np.ascontiguousarray(batch_vecs),
-                np.array(batch_uids, dtype=np.uint64),
-            )
-            last_uid = batch_uids[-1]
+        try:
+            while True:
+                rows = self._conn.execute(
+                    "SELECT uid, vector FROM docs WHERE uid > ? ORDER BY uid LIMIT ?",
+                    (last_uid, _REBUILD_BATCH_SIZE),
+                ).fetchall()
+                if not rows:
+                    break
+                batch_uids = [int(r[0]) for r in rows]
+                batch_vecs = np.stack(
+                    [np.frombuffer(r[1], dtype=np.float32) for r in rows]
+                ).astype(np.float32, copy=False)
+                self._index.add_with_ids(
+                    np.ascontiguousarray(batch_vecs),
+                    np.array(batch_uids, dtype=np.uint64),
+                )
+                last_uid = batch_uids[-1]
+        except Exception:
+            # Advance seen_gen to prevent infinite retry loop; create an
+            # empty index so the write path (which calls _ensure_current
+            # under the lock) does not crash.
+            self._index = _idx.new_index(self._dim, self._bit_width)
+            self._seen_gen = store_gen
+            raise
         self._seen_gen = store_gen
         self._dirty = True
 
