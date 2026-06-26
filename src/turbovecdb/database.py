@@ -95,6 +95,13 @@ class Database:
         import shutil
         shutil.rmtree(coll_dir)
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False  # don't suppress exceptions
+
     def close(self):
         with self._lock:
             for col in self._collections.values():
