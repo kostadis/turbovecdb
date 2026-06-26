@@ -700,6 +700,13 @@ class Collection:
     def dim(self):
         return self._dim
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.flush()
+        return False
+
     def close(self):
         with self._tlock:
             try:
