@@ -82,9 +82,14 @@ class Database:
             name: Name of the collection to delete
 
         Raises:
+            ValueError: If the name is invalid
             CollectionNotFoundError: If the collection does not exist
             TurboVecError: If the write lock cannot be acquired
         """
+        if not _SAFE_NAME.fullmatch(name):
+            raise ValueError(
+                f"invalid collection name {name!r}: must match [A-Za-z0-9_-]{{1,128}}"
+            )
         coll_dir = os.path.join(self._path, name)
         if not os.path.isdir(coll_dir):
             raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
