@@ -660,6 +660,37 @@ class Collection:
         with self._tlock:
             return int(self._conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
 
+    def clear(self):
+        """Remove every document from the collection in one operation.
+
+        Only the stored documents, their vectors, and the ANN index are
+        emptied; the collection's configuration (``dim``, ``bit_width``,
+        ``metric``, recorded embedder identity) is left intact, so the handle
+        stays usable and later ``add``/``upsert`` calls behave normally. Cheaper
+        than deleting ids one by one, and — like every other write — bumps
+        ``store_gen`` so other handles and processes drop their now-stale caches
+        on the next access. A no-op on an already-empty collection.
+        """
+        with self._locked():
+            self._ensure_current()
+            if self.count() == 0:
+                return
+            self._conn.execute("DELETE FROM docs")
+            self._meta_set("next_uid", 0)
+            self._meta_set("store_gen", self._store_gen() + 1)
+            self._commit()  # invalidates the index on commit failure
+            # Only once the DELETE is durable do we drop the in-memory index —
+            # so a failed commit leaves the (untouched) old index matching the
+            # rolled-back rows rather than a divergent empty one.
+            self._next_uid = 0
+            self._seen_gen = self._store_gen()
+            self._dirty = True
+            self._index = (
+                _idx.new_index(self._dim, self._bit_width)
+                if self._dim is not None else None
+            )
+            self._checkpoint_wal()  # bound WAL growth after a bulk delete
+
     def _get_embedder_identity(self, embedder):
         """Extract a stable identifier for the embedder function."""
         if hasattr(embedder, "__name__"):
@@ -738,147 +769,119 @@ class Collection:
 
             old_dim = self._dim
             old_bit_width = self._bit_width
-            processed = 0
-            skipped = 0
             start_time = time.time()
 
-            cursor = self._conn.cursor()
-            cursor.execute("SELECT uid, document FROM docs ORDER BY uid")
+            # -- Phase 1: classify docs and embed the non-empty ones. Nothing is
+            # written to the store yet, so any error here (the 'error' policy, an
+            # embedder failure, a dimension mismatch) leaves the collection
+            # untouched.
+            rows = self._conn.execute(
+                "SELECT uid, document, vector FROM docs ORDER BY uid"
+            ).fetchall()
+            embed_uids, embed_docs = [], []
+            keep = []       # (uid, old_vector_bytes) — retained under 'keep'
+            drop_uids = []  # uids to delete under 'drop'
+            skipped = 0
+            for uid, document, vec_blob in rows:
+                if document:
+                    embed_uids.append(uid)
+                    embed_docs.append(document)
+                elif skip_empty == "error":
+                    raise ValueError(f"Cannot re-embed empty document with uid {uid}")
+                elif skip_empty == "drop":
+                    drop_uids.append(uid)
+                    skipped += 1
+                else:  # keep
+                    keep.append((uid, vec_blob))
+                    skipped += 1
 
-            batch = []
-            batch_uids = []
-            updates = []  # (vector_bytes, uid) pairs
-
-            while True:
-                row = cursor.fetchone()
-                if not row:
-                    break
-
-                uid, document = row
-
-                # Handle empty document
-                if not document:
-                    if skip_empty == "error":
-                        raise ValueError(f"Cannot re-embed empty document with uid {uid}")
-                    elif skip_empty == "drop":
-                        skipped += 1
-                        processed += 1
-                        if on_progress:
-                            on_progress(processed, total_docs)
-                        continue
-                    else:  # keep
-                        # Keep old vector - read it from DB and re-normalize
-                        cursor2 = self._conn.cursor()
-                        cursor2.execute("SELECT vector FROM docs WHERE uid=?", (uid,))
-                        vec_row = cursor2.fetchone()
-                        if vec_row:
-                            old_vec = np.frombuffer(vec_row[0], dtype=np.float32)
-                            new_vec = _idx.l2_normalize(old_vec.reshape(1, -1))[0]
-                            updates.append((new_vec.tobytes(), uid))
-                        skipped += 1
-                        processed += 1
-                        if on_progress:
-                            on_progress(processed, total_docs)
-                        continue
-
-                # Add to batch
-                batch.append(document)
-                batch_uids.append(uid)
-
-                # Process batch when full
-                if len(batch) >= batch_size:
-                    uid_range = f"uids [{batch_uids[0]}..{batch_uids[-1]}]"
-                    # Embed batch
-                    try:
-                        new_vecs = np.asarray(embedder(batch), dtype=np.float32)
-                    except Exception as e:
-                        raise ValueError(f"Embedder failed on batch {uid_range}: {e}")
-
-                    # Validate dimension consistency across batches
-                    batch_dim = new_vecs.shape[1]
-                    if batch_dim != old_dim and dim is not None and batch_dim != dim:
-                        raise DimensionMismatchError(
-                            f"Embedder returned vectors of dimension {batch_dim}, "
-                            f"but dim was explicitly set to {dim}"
-                        )
-
-                    # Normalize vectors
-                    new_vecs = _idx.l2_normalize(new_vecs)
-
-                    # Collect updates
-                    for i, uid in enumerate(batch_uids):
-                        updates.append((new_vecs[i].tobytes(), uid))
-
-                    # Track progress
-                    processed += len(batch)
-                    if on_progress:
-                        on_progress(processed, total_docs)
-
-                    # Reset batch
-                    batch = []
-                    batch_uids = []
-
-            # Process remaining documents
-            if batch:
-                uid_range = f"uids [{batch_uids[0]}..{batch_uids[-1]}]"
+            updates = []    # (vector_bytes, uid)
+            new_dim = None
+            processed = 0
+            for start in range(0, len(embed_docs), batch_size):
+                b_docs = embed_docs[start:start + batch_size]
+                b_uids = embed_uids[start:start + batch_size]
+                uid_range = f"uids [{b_uids[0]}..{b_uids[-1]}]"
                 try:
-                    new_vecs = np.asarray(embedder(batch), dtype=np.float32)
+                    vecs = np.asarray(embedder(b_docs), dtype=np.float32)
                 except Exception as e:
-                    raise ValueError(f"Embedder failed on final batch {uid_range}: {e}")
-
-                # Validate dimension consistency
-                batch_dim = new_vecs.shape[1]
-                if batch_dim != old_dim and dim is not None and batch_dim != dim:
+                    raise ValueError(f"Embedder failed on batch {uid_range}: {e}")
+                if vecs.ndim != 2 or vecs.shape[0] != len(b_uids):
                     raise DimensionMismatchError(
-                        f"Embedder returned vectors of dimension {batch_dim}, "
-                        f"but dim was explicitly set to {dim}"
+                        f"embedder must return one 2-D vector per document; got array "
+                        f"of shape {vecs.shape} for {len(b_uids)} documents ({uid_range})"
                     )
-
-                # Normalize vectors
-                new_vecs = _idx.l2_normalize(new_vecs)
-
-                # Collect updates
-                for i, uid in enumerate(batch_uids):
-                    updates.append((new_vecs[i].tobytes(), uid))
-
-                processed += len(batch)
+                batch_dim = int(vecs.shape[1])
+                if new_dim is None:
+                    new_dim = batch_dim
+                elif batch_dim != new_dim:
+                    raise DimensionMismatchError(
+                        f"embedder returned inconsistent dimensions across batches: "
+                        f"{new_dim} then {batch_dim} ({uid_range})"
+                    )
+                vecs = _idx.l2_normalize(vecs)
+                for i, uid in enumerate(b_uids):
+                    updates.append((vecs[i].tobytes(), uid))
+                processed += len(b_docs)
                 if on_progress:
                     on_progress(processed, total_docs)
 
-            # Get new dimension from first update (or keep old if all were skipped)
-            new_dim = old_dim
-            new_bit_width = old_bit_width
-            if updates:
-                new_dim = len(updates[0][0]) // 4  # 4 bytes per float32
-
-            # Update dimension and bit_width if changed
-            if new_dim != old_dim or (bit_width is not None and bit_width != old_bit_width):
-                if dim is not None and new_dim != dim:
-                    raise DimensionMismatchError(
-                        f"Embedder returned vectors of dimension {new_dim}, "
-                        f"but dim was explicitly set to {dim}"
-                    )
-                # Update dim/bit_width in meta but don't rebuild index yet
-                self._dim = new_dim
-                if bit_width is not None:
-                    self._bit_width = bit_width
-                self._meta_set("dim", self._dim)
-                self._meta_set("bit_width", self._bit_width)
-
-            # Batch update vectors
-            if updates:
-                self._conn.executemany(
-                    "UPDATE docs SET vector=? WHERE uid=?",
-                    updates
+            # Resolve the collection's new dimension from the *actual* embedder
+            # output — never from a retained old vector — then validate it.
+            if new_dim is None:
+                new_dim = old_dim  # every doc was empty (all kept or dropped)
+            if dim is not None and new_dim != dim:
+                raise DimensionMismatchError(
+                    f"Embedder returned vectors of dimension {new_dim}, "
+                    f"but dim was explicitly set to {dim}"
                 )
+            if keep and new_dim != old_dim:
+                raise DimensionMismatchError(
+                    f"skip_empty='keep' cannot retain {old_dim}-dim vectors in a "
+                    f"{new_dim}-dim collection; use skip_empty='drop' or give the "
+                    f"empty documents text to embed"
+                )
+            # Retained docs keep their old vector (dims match new_dim here); just
+            # re-normalize in case the stored copy drifted.
+            for uid, vec_blob in keep:
+                old_vec = np.frombuffer(vec_blob, dtype=np.float32)
+                updates.append((_idx.l2_normalize(old_vec.reshape(1, -1))[0].tobytes(), uid))
+            if on_progress and skipped:
+                on_progress(processed + skipped, total_docs)
 
-            # Update metadata
-            self._meta_set("store_gen", self._store_gen() + 1)
-            self._meta_set("embedder_identity", embedder_identity)
-            self._conn.commit()
+            new_bit_width = bit_width if bit_width is not None else old_bit_width
 
-            # Rebuild index with new vectors and new dimension
-            self._reload_index()
+            # -- Phase 2: apply the whole re-embed in one transaction. The index
+            # is rebuilt from the *uncommitted* rows before the commit, so if the
+            # rebuild (or anything else) fails we roll the entire operation back
+            # and never leave a half-migrated, mixed-dimension store.
+            try:
+                for i in range(0, len(drop_uids), _SQL_CHUNK):
+                    chunk = drop_uids[i:i + _SQL_CHUNK]
+                    qmarks = ",".join("?" for _ in chunk)
+                    self._conn.execute(f"DELETE FROM docs WHERE uid IN ({qmarks})", chunk)
+                if updates:
+                    self._conn.executemany("UPDATE docs SET vector=? WHERE uid=?", updates)
+                self._dim = new_dim
+                self._bit_width = new_bit_width
+                self._meta_set("dim", new_dim)
+                self._meta_set("bit_width", new_bit_width)
+                self._meta_set("store_gen", self._store_gen() + 1)
+                self._meta_set("embedder_identity", embedder_identity)
+                # Rebuilds from the uncommitted rows (store_gen advanced past
+                # tvim_gen, so the stale .tvim cache is ignored); raises on failure.
+                self._reload_index()
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                self._dim = old_dim
+                self._bit_width = old_bit_width
+                self._index = None
+                self._seen_gen = -1
+                raise
+
+            self._seen_gen = self._store_gen()
+            self._dirty = True
             self.flush()
 
             elapsed = time.time() - start_time

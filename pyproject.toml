@@ -20,6 +20,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "ruff>=0.4.0"]
 
+[project.scripts]
+turbovecdb-service = "turbovecdb.service:main"
+
 [project.urls]
 Homepage = "https://github.com/kostadis/turbovecdb"
 Repository = "https://github.com/kostadis/turbovecdb"
