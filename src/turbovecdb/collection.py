@@ -660,6 +660,37 @@ class Collection:
         with self._tlock:
             return int(self._conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
 
+    def clear(self):
+        """Remove every document from the collection in one operation.
+
+        Only the stored documents, their vectors, and the ANN index are
+        emptied; the collection's configuration (``dim``, ``bit_width``,
+        ``metric``, recorded embedder identity) is left intact, so the handle
+        stays usable and later ``add``/``upsert`` calls behave normally. Cheaper
+        than deleting ids one by one, and — like every other write — bumps
+        ``store_gen`` so other handles and processes drop their now-stale caches
+        on the next access. A no-op on an already-empty collection.
+        """
+        with self._locked():
+            self._ensure_current()
+            if self.count() == 0:
+                return
+            self._conn.execute("DELETE FROM docs")
+            self._meta_set("next_uid", 0)
+            self._meta_set("store_gen", self._store_gen() + 1)
+            self._commit()  # invalidates the index on commit failure
+            # Only once the DELETE is durable do we drop the in-memory index —
+            # so a failed commit leaves the (untouched) old index matching the
+            # rolled-back rows rather than a divergent empty one.
+            self._next_uid = 0
+            self._seen_gen = self._store_gen()
+            self._dirty = True
+            self._index = (
+                _idx.new_index(self._dim, self._bit_width)
+                if self._dim is not None else None
+            )
+            self._checkpoint_wal()  # bound WAL growth after a bulk delete
+
     def _get_embedder_identity(self, embedder):
         """Extract a stable identifier for the embedder function."""
         if hasattr(embedder, "__name__"):

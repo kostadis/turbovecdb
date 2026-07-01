@@ -131,9 +131,6 @@ def op_count(req: dict) -> dict:
             return {"count": 0 if col is None else col.count()}
         finally:
             _close_db(db, col)
-    with _lock_for(req["db_path"]):
-        db, col = _open(req["db_path"])
-        return {"count": 0 if col is None else col.count()}
 
 
 def op_clear(req: dict) -> dict:
@@ -143,19 +140,10 @@ def op_clear(req: dict) -> dict:
         if col is None:
             return {"count": 0}
         try:
-            # Use native clear method instead of workaround
             col.clear()
             return {"count": col.count()}
         finally:
             _close_db(db, col)
-    db_path = req["db_path"]
-    with _lock_for(db_path):
-        db, col = _open(db_path)
-        if col is None:
-            return {"count": 0}
-        # Use native clear method instead of workaround
-        col.clear()
-        return {"count": col.count()}
 
 
 ROUTES = {
