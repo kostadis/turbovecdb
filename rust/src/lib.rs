@@ -304,6 +304,74 @@ fn l2_normalize<'py>(
     Ok(out.to_pyarray_bound(py))
 }
 
+// ── turbovec index lifecycle ────────────────────────────────────────────────
+//
+// turbovec ships only as a PyO3 Python extension (no Rust crate), so the core
+// drives its `IdMapIndex` through PyO3: we construct / load / persist the index
+// and hand the Python object back to the caller, which keeps calling
+// `.add_with_ids` / `.remove` / `.search` on it directly. This establishes the
+// turbovec calling pattern the later query/reembed slices depend on.
+
+/// `turbovec.IdMapIndex(dim=dim, bit_width=bit_width)`.
+#[pyfunction]
+fn new_index<'py>(
+    py: Python<'py>,
+    dim: &Bound<'py, PyAny>,
+    bit_width: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let turbovec = py.import_bound("turbovec")?;
+    let kwargs = PyDict::new_bound(py);
+    kwargs.set_item("dim", dim)?;
+    kwargs.set_item("bit_width", bit_width)?;
+    turbovec.getattr("IdMapIndex")?.call((), Some(&kwargs))
+}
+
+/// Build an index from parallel `uids` (1-D) and `vecs` (list of 1-D).
+#[pyfunction]
+fn build_index<'py>(
+    py: Python<'py>,
+    dim: &Bound<'py, PyAny>,
+    bit_width: &Bound<'py, PyAny>,
+    uids: &Bound<'py, PyAny>,
+    vecs: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let turbovec = py.import_bound("turbovec")?;
+    let kwargs = PyDict::new_bound(py);
+    kwargs.set_item("dim", dim)?;
+    kwargs.set_item("bit_width", bit_width)?;
+    let idx = turbovec.getattr("IdMapIndex")?.call((), Some(&kwargs))?;
+    if uids.len()? > 0 {
+        let np = py.import_bound("numpy")?;
+        let stacked = np.getattr("stack")?.call1((vecs,))?;
+        let ckw = PyDict::new_bound(py);
+        ckw.set_item("dtype", np.getattr("float32")?)?;
+        let mat = np.getattr("ascontiguousarray")?.call((stacked,), Some(&ckw))?;
+        let ukw = PyDict::new_bound(py);
+        ukw.set_item("dtype", np.getattr("uint64")?)?;
+        let uid_arr = np.getattr("asarray")?.call((uids,), Some(&ukw))?;
+        idx.call_method1("add_with_ids", (mat, uid_arr))?;
+    }
+    Ok(idx)
+}
+
+/// `turbovec.IdMapIndex.load(path)`.
+#[pyfunction]
+fn load_index<'py>(py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAny>> {
+    let turbovec = py.import_bound("turbovec")?;
+    turbovec.getattr("IdMapIndex")?.getattr("load")?.call1((path,))
+}
+
+/// Serialize `index` to `path` atomically (temp file + os.replace).
+#[pyfunction]
+fn write_index_atomic(py: Python<'_>, index: &Bound<'_, PyAny>, path: &str) -> PyResult<()> {
+    let tmp = format!("{}.tmp", path);
+    index.call_method1("write", (tmp.as_str(),))?;
+    py.import_bound("os")?
+        .getattr("replace")?
+        .call1((tmp.as_str(), path))?;
+    Ok(())
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FilterError", m.py().get_type_bound::<FilterError>())?;
@@ -311,5 +379,9 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(where_document_to_sql, m)?)?;
     m.add_function(wrap_pyfunction!(combined_sql, m)?)?;
     m.add_function(wrap_pyfunction!(l2_normalize, m)?)?;
+    m.add_function(wrap_pyfunction!(new_index, m)?)?;
+    m.add_function(wrap_pyfunction!(build_index, m)?)?;
+    m.add_function(wrap_pyfunction!(load_index, m)?)?;
+    m.add_function(wrap_pyfunction!(write_index_atomic, m)?)?;
     Ok(())
 }
