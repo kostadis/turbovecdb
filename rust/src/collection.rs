@@ -334,6 +334,42 @@ impl Collection {
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
     }
 
+    /// Mirror a write into the in-memory turbovec index: drop the replaced uids,
+    /// then add every row's (uid, vector). Keeps the index O(batch) per write
+    /// instead of rebuilding from the whole store.
+    fn mirror_write_to_index(
+        &self,
+        py: Python<'_>,
+        replaced: &[i64],
+        uids: &[i64],
+        vecs: &Bound<'_, numpy::PyArray2<f32>>,
+    ) -> PyResult<()> {
+        let index = self.index.as_ref().unwrap().bind(py);
+        if !replaced.is_empty() {
+            let u64ty = py.import_bound("numpy")?.getattr("uint64")?;
+            for &uid in replaced {
+                index.call_method1("remove", (u64ty.call1((uid,))?,))?;
+            }
+        }
+        let uid_arr =
+            Array1::from(uids.iter().map(|&x| x as u64).collect::<Vec<u64>>()).to_pyarray_bound(py);
+        index.call_method1("add_with_ids", (vecs, uid_arr))?;
+        Ok(())
+    }
+
+    /// Remove uids from the in-memory index (used by delete).
+    fn remove_from_index(&self, py: Python<'_>, uids: &[i64]) -> PyResult<()> {
+        if uids.is_empty() {
+            return Ok(());
+        }
+        let index = self.index.as_ref().unwrap().bind(py);
+        let u64ty = py.import_bound("numpy")?.getattr("uint64")?;
+        for &uid in uids {
+            index.call_method1("remove", (u64ty.call1((uid,))?,))?;
+        }
+        Ok(())
+    }
+
     fn set_reembed_meta(&self, new_dim: i64, new_bit_width: i64, identity: &str) -> PyResult<()> {
         self.meta_set("dim", &new_dim.to_string())?;
         self.meta_set("bit_width", &new_bit_width.to_string())?;
@@ -673,31 +709,55 @@ impl Collection {
         } else {
             format!(" WHERE {}", frags.join(" AND "))
         };
+
+        // Collect the uids we're about to delete so we can drop them from the
+        // in-memory index incrementally (no full rebuild).
+        let del_uids: Vec<i64> = {
+            let sel = format!("SELECT uid FROM docs{clause}");
+            let mut stmt = self.conn.prepare(&sel).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |r| r.get::<_, i64>(0))
+                .map_err(sql_err)?;
+            let mut v = Vec::new();
+            for row in rows {
+                v.push(row.map_err(sql_err)?);
+            }
+            v
+        };
+        if del_uids.is_empty() {
+            return Ok(());
+        }
+
         self.conn.execute_batch("BEGIN").map_err(sql_err)?;
         let sql = format!("DELETE FROM docs{clause}");
-        let changed = match self
+        if let Err(e) = self
             .conn
             .execute(&sql, rusqlite::params_from_iter(values.iter()))
         {
-            Ok(n) => n,
-            Err(e) => {
-                self.rollback();
-                return Err(sql_err(e));
-            }
-        };
-        if changed == 0 {
-            self.conn.execute_batch("COMMIT").map_err(sql_err)?;
-            return Ok(());
+            self.rollback();
+            return Err(sql_err(e));
         }
         let sg = self.store_gen_val()? + 1;
         if self.meta_set("store_gen", &sg.to_string()).is_err() {
             self.rollback();
             return Err(PyRuntimeError::new_err("delete: meta update failed"));
         }
-        self.conn.execute_batch("COMMIT").map_err(sql_err)?;
-        // Rows removed → index rebuilds lazily from the committed store.
-        self.dirty = true;
-        Ok(())
+        match self
+            .remove_from_index(py, &del_uids)
+            .and_then(|_| self.conn.execute_batch("COMMIT").map_err(sql_err))
+        {
+            Ok(()) => {
+                self.seen_gen = self.store_gen_val()?;
+                self.dirty = true;
+                Ok(())
+            }
+            Err(e) => {
+                self.rollback();
+                self.index = None;
+                self.seen_gen = -1;
+                Err(e)
+            }
+        }
     }
 
     fn update_metadata(
@@ -1346,6 +1406,7 @@ impl Collection {
         let vdim = view.ncols() as i64;
         if self.dim.is_none() {
             self.commit_dim(py, vdim)?;
+            self.index = Some(self.make_index(py)?);
         } else if Some(vdim) != self.dim {
             return Err(turbovec_error(
                 py,
@@ -1355,6 +1416,8 @@ impl Collection {
         }
 
         self.conn.execute_batch("BEGIN").map_err(sql_err)?;
+        let mut batch_uids: Vec<i64> = Vec::with_capacity(n);
+        let mut replaced_uids: Vec<i64> = Vec::new();
         for i in 0..n {
             let meta_json = match self.dumps_meta(py, metadatas.as_ref().map(|m| &m[i])) {
                 Ok(s) => s,
@@ -1379,7 +1442,7 @@ impl Collection {
                 }
             };
 
-            let res = if let Some(_uid) = existing {
+            let uid = if let Some(u) = existing {
                 if !replace {
                     self.rollback();
                     return Err(PyValueError::new_err(format!(
@@ -1387,22 +1450,28 @@ impl Collection {
                         ids[i]
                     )));
                 }
-                self.conn.execute(
+                if let Err(e) = self.conn.execute(
                     "UPDATE docs SET document=?1, metadata=?2, vector=?3 WHERE str_id=?4",
                     params![docs[i], meta_json, bytes, ids[i]],
-                )
+                ) {
+                    self.rollback();
+                    return Err(sql_err(e));
+                }
+                replaced_uids.push(u);
+                u
             } else {
-                let uid = self.next_uid;
+                let u = self.next_uid;
                 self.next_uid += 1;
-                self.conn.execute(
+                if let Err(e) = self.conn.execute(
                     "INSERT INTO docs(uid, str_id, document, metadata, vector) VALUES(?1,?2,?3,?4,?5)",
-                    params![uid, ids[i], docs[i], meta_json, bytes],
-                )
+                    params![u, ids[i], docs[i], meta_json, bytes],
+                ) {
+                    self.rollback();
+                    return Err(sql_err(e));
+                }
+                u
             };
-            if let Err(e) = res {
-                self.rollback();
-                return Err(sql_err(e));
-            }
+            batch_uids.push(uid);
         }
 
         let sg = self.store_gen_val()? + 1;
@@ -1414,10 +1483,23 @@ impl Collection {
             self.rollback();
             return Err(PyRuntimeError::new_err("write: meta update failed"));
         }
-        self.conn.execute_batch("COMMIT").map_err(sql_err)?;
 
-        // Index rebuilds lazily from the committed store on the next read.
-        self.dirty = true;
-        Ok(())
+        // Mirror the write into the in-memory index, then commit. If either
+        // fails, roll back and invalidate the index so the next read rebuilds
+        // it from the committed store — never a divergent cache.
+        let mirrored = self.mirror_write_to_index(py, &replaced_uids, &batch_uids, &vecs);
+        match mirrored.and_then(|_| self.conn.execute_batch("COMMIT").map_err(sql_err)) {
+            Ok(()) => {
+                self.seen_gen = self.store_gen_val()?;
+                self.dirty = true;
+                Ok(())
+            }
+            Err(e) => {
+                self.rollback();
+                self.index = None;
+                self.seen_gen = -1;
+                Err(e)
+            }
+        }
     }
 }
