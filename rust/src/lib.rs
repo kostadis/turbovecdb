@@ -10,8 +10,10 @@
 //! shim in `turbovecdb.filters` re-raises it as `UnsupportedFilterError` so the
 //! public contract (and every existing test) is unchanged.
 
+use numpy::ndarray::{Array2, Axis, Ix2};
+use numpy::{PyArray2, PyReadonlyArrayDyn, ToPyArray};
 use pyo3::create_exception;
-use pyo3::exceptions::PyException;
+use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
@@ -254,11 +256,60 @@ fn combined_sql<'py>(
     Ok(to_result(py, frags.join(" AND "), params))
 }
 
+/// Row-wise L2 normalization → C-contiguous float32, with a zero guard.
+///
+/// Faithful port of the former `turbovecdb.index.l2_normalize`: accepts any
+/// array-like (list, 1-D or 2-D array), returns a 2-D C-contiguous float32
+/// array (1-D input is treated as a single row). Rows with zero norm are left
+/// unchanged (divided by 1.0) rather than producing NaNs.
+#[pyfunction]
+fn l2_normalize<'py>(
+    py: Python<'py>,
+    matrix: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    // Coerce arbitrary array-like input to a float32 array, exactly like the
+    // former `np.asarray(matrix, dtype=np.float32)`.
+    let np = py.import_bound("numpy")?;
+    let kwargs = PyDict::new_bound(py);
+    kwargs.set_item("dtype", np.getattr("float32")?)?;
+    let arr_any = np.getattr("asarray")?.call((matrix,), Some(&kwargs))?;
+    let readonly: PyReadonlyArrayDyn<f32> = arr_any.extract()?;
+    let view = readonly.as_array();
+
+    let mut out: Array2<f32> = match view.ndim() {
+        1 => {
+            let n = view.len();
+            view.to_owned()
+                .into_shape_with_order((1, n))
+                .map_err(|e| PyValueError::new_err(e.to_string()))?
+        }
+        2 => view
+            .to_owned()
+            .into_dimensionality::<Ix2>()
+            .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "l2_normalize expects a 1-D or 2-D array, got {}-D",
+                other
+            )))
+        }
+    };
+
+    for mut row in out.axis_iter_mut(Axis(0)) {
+        let norm = row.iter().map(|&x| x * x).sum::<f32>().sqrt();
+        let denom = if norm == 0.0 { 1.0 } else { norm };
+        row.mapv_inplace(|x| x / denom);
+    }
+
+    Ok(out.to_pyarray_bound(py))
+}
+
 #[pymodule]
 fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("FilterError", m.py().get_type_bound::<FilterError>())?;
     m.add_function(wrap_pyfunction!(where_to_sql, m)?)?;
     m.add_function(wrap_pyfunction!(where_document_to_sql, m)?)?;
     m.add_function(wrap_pyfunction!(combined_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(l2_normalize, m)?)?;
     Ok(())
 }

@@ -11,18 +11,11 @@ import os
 import numpy as np
 import turbovec
 
+# Row-wise L2 normalization now lives in the Rust core (turbovecdb._core).
+from ._core import l2_normalize  # noqa: F401
+
 # turbovec's bit menu is {2, 3, 4}; 4 is the recall ceiling.
 DEFAULT_BIT_WIDTH = 4
-
-
-def l2_normalize(matrix):
-    """Row-wise L2 normalization → C-contiguous float32, with a zero guard."""
-    m = np.asarray(matrix, dtype=np.float32)
-    if m.ndim == 1:
-        m = m.reshape(1, -1)
-    norms = np.linalg.norm(m, axis=1, keepdims=True)
-    norms[norms == 0] = 1.0
-    return np.ascontiguousarray(m / norms, dtype=np.float32)
 
 
 def new_index(dim, bit_width):
