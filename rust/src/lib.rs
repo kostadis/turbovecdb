@@ -269,6 +269,14 @@ fn l2_normalize<'py>(
     py: Python<'py>,
     matrix: &Bound<'py, PyAny>,
 ) -> PyResult<Bound<'py, PyArray2<f32>>> {
+    l2_normalize_impl(py, matrix)
+}
+
+/// Shared implementation, reused by the Rust `Collection` write path.
+pub(crate) fn l2_normalize_impl<'py>(
+    py: Python<'py>,
+    matrix: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyArray2<f32>>> {
     // Coerce arbitrary array-like input to a float32 array, exactly like the
     // former `np.asarray(matrix, dtype=np.float32)`.
     let np = py.import_bound("numpy")?;
