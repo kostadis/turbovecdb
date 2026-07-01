@@ -1,6 +1,6 @@
 # Architecture
 
-System map for turbovecdb (v0.1.0). Read this first; drill into the per-area docs in [Detailed docs](#detailed-docs) when you need depth. The whole library is ~725 lines of Python across five modules, so this map is close to the territory.
+System map for turbovecdb (v0.2.0). Read this first; drill into the per-area docs in [Detailed docs](#detailed-docs) when you need depth. The whole library is ~725 lines of Python across five modules, so this map is close to the territory.
 
 ## What this system is
 
