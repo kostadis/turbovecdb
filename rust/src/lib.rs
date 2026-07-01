@@ -187,7 +187,7 @@ pub(crate) fn compile_where(
 }
 
 /// Core compiler for a `where_document` mapping (only `$contains`).
-fn compile_where_document(
+pub(crate) fn compile_where_document(
     py: Python<'_>,
     wd: &Bound<'_, PyAny>,
 ) -> PyResult<(String, Vec<PyObject>)> {

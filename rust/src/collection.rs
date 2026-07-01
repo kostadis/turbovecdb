@@ -16,6 +16,37 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rusqlite::{params, Connection, OptionalExtension};
+use std::collections::HashMap;
+
+const RERANK_FLOOR: i64 = 50;
+
+/// Which fields to materialize in a query/get result.
+struct Inc {
+    documents: bool,
+    metadatas: bool,
+    distances: bool,
+    vectors: bool,
+}
+
+fn resolve_include(include: Option<&Vec<String>>, default_distances: bool) -> Inc {
+    match include {
+        None => Inc {
+            documents: true,
+            metadatas: true,
+            distances: default_distances,
+            vectors: false,
+        },
+        Some(keys) => {
+            let has = |k: &str| keys.iter().any(|s| s == k);
+            Inc {
+                documents: has("documents"),
+                metadatas: has("metadatas"),
+                distances: has("distances"),
+                vectors: has("vectors"),
+            }
+        }
+    }
+}
 
 const SCHEMA_VERSION: i64 = 1;
 pub const DEFAULT_BIT_WIDTH: i64 = 4;
@@ -287,6 +318,74 @@ impl Collection {
             .map(|s| s.to_string())
             .unwrap_or_else(|_| e.to_string());
         turbovec_error(py, "UnsupportedFilterError", msg)
+    }
+
+    fn empty_query_result(&self, py: Python<'_>, inc_vectors: bool) -> PyResult<PyObject> {
+        let vectors: PyObject = if inc_vectors {
+            PyList::empty_bound(py).into_any().unbind()
+        } else {
+            py.None()
+        };
+        let qr = py
+            .import_bound("turbovecdb.collection")?
+            .getattr("QueryResult")?;
+        Ok(qr
+            .call1((
+                PyList::empty_bound(py),
+                PyList::empty_bound(py),
+                PyList::empty_bound(py),
+                PyList::empty_bound(py),
+                vectors,
+            ))?
+            .unbind())
+    }
+
+    /// uid allowlist for a query filter: None → search everything; Some(uids)
+    /// (possibly empty) → restrict to those uids.
+    fn query_allowlist(
+        &self,
+        py: Python<'_>,
+        where_: Option<&PyObject>,
+        where_document: Option<&PyObject>,
+    ) -> PyResult<Option<Vec<i64>>> {
+        if where_.is_none() && where_document.is_none() {
+            return Ok(None);
+        }
+        let mut frags: Vec<String> = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(w) = where_ {
+            let (s, ps) =
+                crate::compile_where(py, w.bind(py), 0).map_err(|e| self.map_filter_err(py, e))?;
+            if !s.is_empty() {
+                frags.push(format!("({s})"));
+                for p in ps {
+                    values.push(py_to_sql_value(p.bind(py)));
+                }
+            }
+        }
+        if let Some(wd) = where_document {
+            let (s, ps) = crate::compile_where_document(py, wd.bind(py))
+                .map_err(|e| self.map_filter_err(py, e))?;
+            if !s.is_empty() {
+                frags.push(format!("({s})"));
+                for p in ps {
+                    values.push(py_to_sql_value(p.bind(py)));
+                }
+            }
+        }
+        if frags.is_empty() {
+            return Ok(None);
+        }
+        let sql = format!("SELECT uid FROM docs WHERE {}", frags.join(" AND "));
+        let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+        let uids = stmt
+            .query_map(rusqlite::params_from_iter(values.iter()), |r| {
+                r.get::<_, i64>(0)
+            })
+            .map_err(sql_err)?
+            .collect::<Result<Vec<i64>, _>>()
+            .map_err(sql_err)?;
+        Ok(Some(uids))
     }
 }
 
@@ -618,6 +717,254 @@ impl Collection {
         self.conn.execute_batch("COMMIT").map_err(sql_err)?;
         self.seen_gen = sg; // vectors unchanged → index stays valid
         Ok(())
+    }
+
+    #[pyo3(signature = (text=None, vector=None, k=10, where_=None, where_document=None, include=None))]
+    fn query(
+        &mut self,
+        py: Python<'_>,
+        text: Option<String>,
+        vector: Option<PyObject>,
+        k: usize,
+        where_: Option<PyObject>,
+        where_document: Option<PyObject>,
+        include: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        if text.is_some() == vector.is_some() {
+            return Err(PyValueError::new_err(
+                "exactly one of text / vector is required",
+            ));
+        }
+        let inc = resolve_include(include.as_ref(), true);
+
+        // Normalized query vector, shape (1, dim).
+        let q: Bound<numpy::PyArray2<f32>> = if let Some(t) = text {
+            let emb = self.embedder.as_ref().ok_or_else(|| {
+                turbovec_error(
+                    py,
+                    "EmbedderRequiredError",
+                    "text was provided but this collection has no embedder; pass vectors \
+                     instead, or create the collection with embedder=..."
+                        .to_string(),
+                )
+            })?;
+            let out = emb.bind(py).call1((PyList::new_bound(py, [t]),))?;
+            crate::l2_normalize_impl(py, &out.get_item(0)?)?
+        } else {
+            crate::l2_normalize_impl(py, vector.as_ref().unwrap().bind(py))?
+        };
+
+        self.ensure_current(py)?;
+        if self.index.is_none() || self.dim.is_none() {
+            return self.empty_query_result(py, inc.vectors);
+        }
+
+        let allow = self.query_allowlist(py, where_.as_ref(), where_document.as_ref())?;
+        let allow_arr: PyObject = match &allow {
+            Some(uids) => {
+                if uids.is_empty() {
+                    return self.empty_query_result(py, inc.vectors);
+                }
+                let u: Vec<u64> = uids.iter().map(|&x| x as u64).collect();
+                Array1::from(u).to_pyarray_bound(py).into_any().unbind()
+            }
+            None => py.None(),
+        };
+
+        let pool = std::cmp::max(k as i64, RERANK_FLOOR);
+        let kwargs = PyDict::new_bound(py);
+        kwargs.set_item("k", pool)?;
+        kwargs.set_item("allowlist", allow_arr)?;
+        let cand_uids: Vec<i64> = {
+            let index = self.index.as_ref().unwrap().bind(py);
+            let res = index.call_method("search", (&q,), Some(&kwargs))?;
+            res.get_item(1)?.get_item(0)?.call_method0("tolist")?.extract()?
+        };
+
+        // Exact-cosine re-rank of the candidate pool.
+        let qrow: Vec<f32> = q.readonly().as_array().row(0).to_vec();
+        let mut map: HashMap<i64, (String, String, String, Vec<u8>)> = HashMap::new();
+        if !cand_uids.is_empty() {
+            let qs = vec!["?"; cand_uids.len()].join(",");
+            let sql = format!(
+                "SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN ({qs})"
+            );
+            let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(cand_uids.iter()), |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        r.get::<_, Vec<u8>>(4)?,
+                    ))
+                })
+                .map_err(sql_err)?;
+            for row in rows {
+                let (u, sid, doc, meta, vec) = row.map_err(sql_err)?;
+                map.insert(u, (sid, doc, meta, vec));
+            }
+        }
+        let mut scored: Vec<(f32, i64)> = Vec::new();
+        for &uid in &cand_uids {
+            if let Some((_, _, _, vecb)) = map.get(&uid) {
+                let dot: f32 = qrow.iter().zip(blob_to_f32(vecb)).map(|(a, b)| a * b).sum();
+                scored.push((1.0 - dot, uid));
+            }
+        }
+        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(k);
+
+        let ids = PyList::empty_bound(py);
+        let distances = PyList::empty_bound(py);
+        let documents = PyList::empty_bound(py);
+        let metadatas = PyList::empty_bound(py);
+        let vectors = PyList::empty_bound(py);
+        let json = py.import_bound("json")?;
+        for (dist, uid) in &scored {
+            let (sid, doc, meta, vecb) = map.get(uid).unwrap();
+            ids.append(sid)?;
+            if inc.distances {
+                distances.append(*dist as f64)?;
+            }
+            if inc.documents {
+                documents.append(doc)?;
+            }
+            if inc.metadatas {
+                let m: Bound<PyAny> = if meta.is_empty() {
+                    PyDict::new_bound(py).into_any()
+                } else {
+                    json.getattr("loads")?.call1((meta,))?
+                };
+                metadatas.append(m)?;
+            }
+            if inc.vectors {
+                let vlist = PyList::empty_bound(py);
+                for f in blob_to_f32(vecb) {
+                    vlist.append(f as f64)?;
+                }
+                vectors.append(vlist)?;
+            }
+        }
+        let vectors_arg: PyObject = if inc.vectors {
+            vectors.into_any().unbind()
+        } else {
+            py.None()
+        };
+        let qr = py
+            .import_bound("turbovecdb.collection")?
+            .getattr("QueryResult")?;
+        Ok(qr
+            .call1((ids, distances, documents, metadatas, vectors_arg))?
+            .unbind())
+    }
+
+    #[pyo3(signature = (ids=None, where_=None, where_document=None, limit=None, offset=None, include=None))]
+    fn get(
+        &self,
+        py: Python<'_>,
+        ids: Option<Vec<String>>,
+        where_: Option<PyObject>,
+        where_document: Option<PyObject>,
+        limit: Option<i64>,
+        offset: Option<i64>,
+        include: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        let inc = resolve_include(include.as_ref(), false);
+        let mut frags: Vec<String> = Vec::new();
+        let mut values: Vec<rusqlite::types::Value> = Vec::new();
+        if let Some(idlist) = &ids {
+            let qs = vec!["?"; idlist.len()].join(",");
+            frags.push(format!("str_id IN ({qs})"));
+            for id in idlist {
+                values.push(rusqlite::types::Value::Text(id.clone()));
+            }
+        }
+        if let Some(w) = &where_ {
+            let (s, ps) =
+                crate::compile_where(py, w.bind(py), 0).map_err(|e| self.map_filter_err(py, e))?;
+            if !s.is_empty() {
+                frags.push(s);
+                for p in ps {
+                    values.push(py_to_sql_value(p.bind(py)));
+                }
+            }
+        }
+        if let Some(wd) = &where_document {
+            let (s, ps) = crate::compile_where_document(py, wd.bind(py))
+                .map_err(|e| self.map_filter_err(py, e))?;
+            if !s.is_empty() {
+                frags.push(s);
+                for p in ps {
+                    values.push(py_to_sql_value(p.bind(py)));
+                }
+            }
+        }
+        let clause = if frags.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", frags.join(" AND "))
+        };
+        let mut sql =
+            format!("SELECT str_id, document, metadata, vector FROM docs{clause} ORDER BY uid");
+        if let Some(l) = limit {
+            sql.push_str(" LIMIT ?");
+            values.push(rusqlite::types::Value::Integer(l));
+            if let Some(o) = offset {
+                sql.push_str(" OFFSET ?");
+                values.push(rusqlite::types::Value::Integer(o));
+            }
+        }
+
+        let json = py.import_bound("json")?;
+        let out_ids = PyList::empty_bound(py);
+        let out_docs = PyList::empty_bound(py);
+        let out_metas = PyList::empty_bound(py);
+        let out_vecs = PyList::empty_bound(py);
+        {
+            let mut stmt = self.conn.prepare(&sql).map_err(sql_err)?;
+            let rows = stmt
+                .query_map(rusqlite::params_from_iter(values.iter()), |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        r.get::<_, Vec<u8>>(3)?,
+                    ))
+                })
+                .map_err(sql_err)?;
+            for row in rows {
+                let (sid, doc, meta, vecb) = row.map_err(sql_err)?;
+                out_ids.append(&sid)?;
+                if inc.documents {
+                    out_docs.append(&doc)?;
+                } else {
+                    out_docs.append(py.None())?;
+                }
+                if inc.metadatas && !meta.is_empty() {
+                    out_metas.append(json.getattr("loads")?.call1((&meta,))?)?;
+                } else {
+                    out_metas.append(PyDict::new_bound(py))?;
+                }
+                if inc.vectors {
+                    let vlist = PyList::empty_bound(py);
+                    for f in blob_to_f32(&vecb) {
+                        vlist.append(f as f64)?;
+                    }
+                    out_vecs.append(vlist)?;
+                }
+            }
+        }
+        let vectors_arg: PyObject = if inc.vectors {
+            out_vecs.into_any().unbind()
+        } else {
+            py.None()
+        };
+        let gr = py
+            .import_bound("turbovecdb.collection")?
+            .getattr("GetResult")?;
+        Ok(gr.call1((out_ids, out_docs, out_metas, vectors_arg))?.unbind())
     }
 }
 
