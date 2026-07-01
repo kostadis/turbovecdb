@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "turbovecdb"
-version = "0.1.0"
+version = "0.2.0"
 description = "An embedded vector database: turbovec 4-bit ANN + a durable SQLite store, with metadata filters, persistence, exact-cosine re-rank, and multi-process safety."
 readme = "README.md"
 requires-python = ">=3.9"
