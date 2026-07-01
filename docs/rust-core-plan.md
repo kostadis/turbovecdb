@@ -39,9 +39,38 @@ Rust deps added along the way: `rusqlite` (bundled SQLite), `numpy`/`ndarray`, a
 index either (a) via a native turbovec Rust crate if one is published, or (b) by
 calling the turbovec Python module back through PyO3. This affects slices 2/5/6.
 
+## Update (post-slice-2): slices 3–8 build one Rust `Collection`/`Database` class
+
+Slices 1–2 were stateless leaf functions, so they flipped cleanly. Slices 3–8
+cannot: the **SQLite connection is atomic** — `_write`/`reembed` write `docs` +
+`meta` (store_gen) in a single transaction on one connection, and
+`query`/`get`/`count` read that same connection. Moving only "storage" to a
+Rust-owned `rusqlite` connection while write/read/reembed stay on Python's
+`sqlite3` would mean two connections fighting over one file, breaking
+single-transaction atomicity and `store_gen`/`tvim_gen` coherence.
+
+So slices 3–8 become **internal milestones of building a Rust `Collection` (+
+`Database`) PyO3 class** that owns the `rusqlite` connection, the turbovec index
+(via PyO3), and the locks:
+
+- **#11 storage foundation** — conn + PRAGMAs, docs/meta schema, meta, store_gen/tvim_gen, next_uid, schema migration, `count`, `dim`
+- **#12 write paths** — `_write` (add/upsert), delete, update_metadata/documents, clear
+- **#13 read paths** — query (+ exact-cosine rerank), get, count
+- **#14 reembed** — atomic two-phase (drop/keep + bug-A/B fixes)
+- **#15 concurrency** — file lock, in-proc lock, generation cache reload, WAL checkpoint, health()
+- **#16 Database** — connect, collection cache, list/delete_collection
+
+The Rust class is built and tested incrementally (its methods exercised directly
+via `_core.Collection` while the Python `Collection` still runs the suite), but
+the **Python-facing flip happens once, at parity** — Python `Collection`/`Database`
+become thin delegators to `_core` (folded into **#17**). Expect fewer, larger
+green commits than one-per-slice.
+
 ## Working agreement
 
-- One slice at a time, in issue order, on `feat/rust-core`.
-- A slice is "done" only when its named tests **and** the full 163-suite pass.
-- On done: **stop for review**, then commit → `git push origin feat/rust-core` → close the issue → mark the todo complete.
-- No PR to `main` until slice 9 (#17).
+- Build on `feat/rust-core`; `main` stays Rust-free until the cutover (#17).
+- Each milestone lands when it builds, its own smoke/tests pass, and the **full
+  163-suite stays green** (green is trivial pre-flip since Python is unchanged;
+  the flip in #17 is where the suite proves parity).
+- On done: commit → `git push origin feat/rust-core` → close the issue → mark the todo complete. (No pre-commit checkpoint.)
+- No PR to `main` until the cutover (#17).
