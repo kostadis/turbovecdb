@@ -17,6 +17,8 @@ use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyTuple};
 
+mod collection;
+
 create_exception!(_core, FilterError, PyException);
 
 const MAX_DEPTH: i32 = 10;
@@ -383,5 +385,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_index, m)?)?;
     m.add_function(wrap_pyfunction!(load_index, m)?)?;
     m.add_function(wrap_pyfunction!(write_index_atomic, m)?)?;
+    m.add_class::<collection::Collection>()?;
     Ok(())
 }
