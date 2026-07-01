@@ -70,6 +70,26 @@ fn blob_to_f32(blob: &[u8]) -> impl Iterator<Item = f32> + '_ {
         .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
 }
 
+/// Call `embedder(docs)`, wrapping failures with the batch's uid range.
+fn emb_call<'py>(
+    py: Python<'py>,
+    embedder: &PyObject,
+    docs: &[String],
+    uids: &[i64],
+) -> PyResult<Bound<'py, PyAny>> {
+    embedder
+        .bind(py)
+        .call1((PyList::new_bound(py, docs),))
+        .map_err(|e| {
+            PyValueError::new_err(format!(
+                "Embedder failed on batch uids [{}..{}]: {}",
+                uids[0],
+                uids[uids.len() - 1],
+                e
+            ))
+        })
+}
+
 /// Bridge a Python filter operand into a rusqlite bound value. Metadata JSON
 /// scalars are str / int / float / bool / null; bool falls through to Integer.
 fn py_to_sql_value(obj: &Bound<'_, PyAny>) -> rusqlite::types::Value {
@@ -307,6 +327,15 @@ impl Collection {
 
     fn rollback(&self) {
         let _ = self.conn.execute_batch("ROLLBACK");
+    }
+
+    fn set_reembed_meta(&self, new_dim: i64, new_bit_width: i64, identity: &str) -> PyResult<()> {
+        self.meta_set("dim", &new_dim.to_string())?;
+        self.meta_set("bit_width", &new_bit_width.to_string())?;
+        let sg = self.store_gen_val()? + 1;
+        self.meta_set("store_gen", &sg.to_string())?;
+        self.meta_set("embedder_identity", identity)?;
+        Ok(())
     }
 
     /// The filter compiler raises `_core.FilterError`; the public engine raises
@@ -965,6 +994,236 @@ impl Collection {
             .import_bound("turbovecdb.collection")?
             .getattr("GetResult")?;
         Ok(gr.call1((out_ids, out_docs, out_metas, vectors_arg))?.unbind())
+    }
+
+    #[pyo3(signature = (embedder, dim=None, bit_width=None, batch_size=256, on_progress=None, skip_empty=None))]
+    fn reembed(
+        &mut self,
+        py: Python<'_>,
+        embedder: PyObject,
+        dim: Option<i64>,
+        bit_width: Option<i64>,
+        batch_size: usize,
+        on_progress: Option<PyObject>,
+        skip_empty: Option<String>,
+    ) -> PyResult<PyObject> {
+        let skip_empty = skip_empty.unwrap_or_else(|| "error".to_string());
+        if !matches!(skip_empty.as_str(), "error" | "keep" | "drop") {
+            return Err(PyValueError::new_err(format!(
+                "skip_empty must be 'error', 'keep', or 'drop', got {skip_empty:?}"
+            )));
+        }
+        if let Some(bw) = bit_width {
+            if !matches!(bw, 2 | 3 | 4) {
+                return Err(PyValueError::new_err(format!(
+                    "bit_width must be 2, 3, or 4, got {bw}"
+                )));
+            }
+        }
+        if !embedder.bind(py).is_callable() {
+            return Err(PyValueError::new_err("embedder must be a callable"));
+        }
+        if let Some(dd) = dim {
+            if dd <= 0 || dd % 8 != 0 {
+                return Err(turbovec_error(
+                    py,
+                    "DimensionMismatchError",
+                    format!("turbovec requires dim to be a positive multiple of 8, got {dd}"),
+                ));
+            }
+        }
+
+        let embedder_identity = self.embedder_identity(py, &embedder)?;
+        let rr = py
+            .import_bound("turbovecdb.collection")?
+            .getattr("ReembedReport")?;
+        let total_docs = self.count()?;
+        if total_docs == 0 {
+            return Ok(rr
+                .call1((0i64, self.dim, self.dim, 0i64, 0.0f64))?
+                .unbind());
+        }
+
+        self.ensure_current(py)?;
+        let start = std::time::Instant::now();
+        let old_dim = self.dim.expect("dim is set when documents exist");
+        let old_bit_width = self.bit_width;
+
+        // Phase 1 — classify every doc; nothing is written yet, so any error
+        // here (the 'error' policy, an embedder failure, a dim mismatch) leaves
+        // the collection untouched.
+        let mut embed_uids: Vec<i64> = Vec::new();
+        let mut embed_docs: Vec<String> = Vec::new();
+        let mut keep: Vec<(i64, Vec<u8>)> = Vec::new();
+        let mut drop_uids: Vec<i64> = Vec::new();
+        let mut skipped = 0i64;
+        {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT uid, document, vector FROM docs ORDER BY uid")
+                .map_err(sql_err)?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                        r.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(sql_err)?;
+            for row in rows {
+                let (uid, doc, vecb) = row.map_err(sql_err)?;
+                if !doc.is_empty() {
+                    embed_uids.push(uid);
+                    embed_docs.push(doc);
+                } else if skip_empty == "error" {
+                    return Err(PyValueError::new_err(format!(
+                        "Cannot re-embed empty document with uid {uid}"
+                    )));
+                } else if skip_empty == "drop" {
+                    drop_uids.push(uid);
+                    skipped += 1;
+                } else {
+                    keep.push((uid, vecb));
+                    skipped += 1;
+                }
+            }
+        }
+
+        // Embed the non-empty docs; new_dim comes from the real embedder output.
+        let mut updates: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut new_dim: Option<i64> = None;
+        let mut processed = 0i64;
+        let bs = batch_size.max(1);
+        let mut start_i = 0;
+        while start_i < embed_docs.len() {
+            let end = std::cmp::min(start_i + bs, embed_docs.len());
+            let b_docs = &embed_docs[start_i..end];
+            let b_uids = &embed_uids[start_i..end];
+            let out = emb_call(py, &embedder, b_docs, b_uids)?;
+            let normed = crate::l2_normalize_impl(py, &out)?;
+            let vro = normed.readonly();
+            let view = vro.as_array();
+            if view.shape()[0] != b_uids.len() {
+                return Err(turbovec_error(
+                    py,
+                    "DimensionMismatchError",
+                    format!(
+                        "embedder must return one 2-D vector per document; got array of shape {:?} for {} documents",
+                        view.shape(), b_uids.len()
+                    ),
+                ));
+            }
+            let bdim = view.ncols() as i64;
+            match new_dim {
+                None => new_dim = Some(bdim),
+                Some(nd) if bdim != nd => {
+                    return Err(turbovec_error(
+                        py,
+                        "DimensionMismatchError",
+                        format!(
+                            "embedder returned inconsistent dimensions across batches: {nd} then {bdim}"
+                        ),
+                    ));
+                }
+                _ => {}
+            }
+            for (i, &uid) in b_uids.iter().enumerate() {
+                let bytes: Vec<u8> = view.row(i).iter().flat_map(|x| x.to_ne_bytes()).collect();
+                updates.push((bytes, uid));
+            }
+            processed += b_docs.len() as i64;
+            if let Some(cb) = &on_progress {
+                cb.bind(py).call1((processed, total_docs))?;
+            }
+            start_i = end;
+        }
+
+        let new_dim_v = new_dim.unwrap_or(old_dim);
+        if let Some(dd) = dim {
+            if new_dim_v != dd {
+                return Err(turbovec_error(
+                    py,
+                    "DimensionMismatchError",
+                    format!(
+                        "Embedder returned vectors of dimension {new_dim_v}, but dim was explicitly set to {dd}"
+                    ),
+                ));
+            }
+        }
+        if !keep.is_empty() && new_dim_v != old_dim {
+            return Err(turbovec_error(
+                py,
+                "DimensionMismatchError",
+                format!(
+                    "skip_empty='keep' cannot retain {old_dim}-dim vectors in a {new_dim_v}-dim \
+                     collection; use skip_empty='drop' or give the empty documents text to embed"
+                ),
+            ));
+        }
+        // Retained docs keep their old vector (dims match new_dim here); re-normalize.
+        for (uid, vecb) in &keep {
+            let v: Vec<f32> = blob_to_f32(vecb).collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let denom = if norm == 0.0 { 1.0 } else { norm };
+            let bytes: Vec<u8> = v.iter().flat_map(|x| (x / denom).to_ne_bytes()).collect();
+            updates.push((bytes, *uid));
+        }
+        if let Some(cb) = &on_progress {
+            if skipped > 0 {
+                cb.bind(py).call1((processed + skipped, total_docs))?;
+            }
+        }
+        let new_bit_width = bit_width.unwrap_or(old_bit_width);
+
+        // Phase 2 — apply in one transaction; rebuild the index from the
+        // uncommitted rows, commit only if that succeeds, else roll back.
+        self.conn.execute_batch("BEGIN").map_err(sql_err)?;
+        let revert = |s: &mut Collection| {
+            s.rollback();
+            s.dim = Some(old_dim);
+            s.bit_width = old_bit_width;
+            s.index = None;
+            s.seen_gen = -1;
+        };
+        for chunk in drop_uids.chunks(900) {
+            let qs = vec!["?"; chunk.len()].join(",");
+            if let Err(e) = self.conn.execute(
+                &format!("DELETE FROM docs WHERE uid IN ({qs})"),
+                rusqlite::params_from_iter(chunk.iter()),
+            ) {
+                revert(self);
+                return Err(sql_err(e));
+            }
+        }
+        for (bytes, uid) in &updates {
+            if let Err(e) = self.conn.execute(
+                "UPDATE docs SET vector=?1 WHERE uid=?2",
+                params![bytes, uid],
+            ) {
+                revert(self);
+                return Err(sql_err(e));
+            }
+        }
+        self.dim = Some(new_dim_v);
+        self.bit_width = new_bit_width;
+        if let Err(e) = self.set_reembed_meta(new_dim_v, new_bit_width, &embedder_identity) {
+            revert(self);
+            return Err(e);
+        }
+        if let Err(e) = self.reload_index(py) {
+            revert(self);
+            return Err(e);
+        }
+        if let Err(e) = self.conn.execute_batch("COMMIT") {
+            revert(self);
+            return Err(sql_err(e));
+        }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        Ok(rr
+            .call1((total_docs, old_dim, new_dim_v, skipped, elapsed))?
+            .unbind())
     }
 }
 
