@@ -1,0 +1,264 @@
+//! Rust core for turbovecdb — first slice: the metadata/document filter compiler.
+//!
+//! This is a faithful port of the former pure-Python `turbovecdb.filters`. It
+//! translates Chroma/Mongo-style `where` / `where_document` dicts into a
+//! parameterised SQL fragment `(sql, params)` over the JSON `metadata` column.
+//! The JSON path and every operand are returned as *bound parameters* (never
+//! interpolated), so arbitrary field names and values cannot inject SQL.
+//!
+//! Unsupported input raises `turbovecdb._core.FilterError`; the thin Python
+//! shim in `turbovecdb.filters` re-raises it as `UnsupportedFilterError` so the
+//! public contract (and every existing test) is unchanged.
+
+use pyo3::create_exception;
+use pyo3::exceptions::PyException;
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList, PyTuple};
+
+create_exception!(_core, FilterError, PyException);
+
+const MAX_DEPTH: i32 = 10;
+const MAX_IN_LIST: usize = 900;
+
+/// Map a comparison operator to its SQL symbol.
+fn cmp_symbol(op: &str) -> Option<&'static str> {
+    match op {
+        "$eq" => Some("="),
+        "$ne" => Some("!="),
+        "$gt" => Some(">"),
+        "$gte" => Some(">="),
+        "$lt" => Some("<"),
+        "$lte" => Some("<="),
+        _ => None,
+    }
+}
+
+/// Coerce a Python object that is expected to be a non-empty list/tuple into a
+/// vector of its elements, or `None` if it is neither.
+fn as_sequence<'py>(obj: &Bound<'py, PyAny>) -> Option<Vec<Bound<'py, PyAny>>> {
+    if let Ok(list) = obj.downcast::<PyList>() {
+        Some(list.iter().collect())
+    } else if let Ok(tuple) = obj.downcast::<PyTuple>() {
+        Some(tuple.iter().collect())
+    } else {
+        None
+    }
+}
+
+/// LIKE-escape backslash, percent, and underscore (order matters: backslash first).
+fn like_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
+/// Compile a single `field: value` predicate. Pushes its bound params (path
+/// first, then operands) onto `params` and returns the SQL fragment.
+fn field_clause(
+    py: Python<'_>,
+    field: &str,
+    value: &Bound<'_, PyAny>,
+    params: &mut Vec<PyObject>,
+) -> PyResult<String> {
+    let path = format!("$.{}", field);
+
+    if let Ok(dict) = value.downcast::<PyDict>() {
+        if dict.len() != 1 {
+            return Err(FilterError::new_err(format!(
+                "field '{}' predicate must have exactly one operator",
+                field
+            )));
+        }
+        let (key, operand) = dict.iter().next().unwrap();
+        let op = key.extract::<String>().unwrap_or_default();
+
+        if op == "$in" || op == "$nin" {
+            let items = as_sequence(&operand).filter(|v| !v.is_empty()).ok_or_else(|| {
+                FilterError::new_err(format!("{} on '{}' requires a non-empty list", op, field))
+            })?;
+            if items.len() > MAX_IN_LIST {
+                return Err(FilterError::new_err(format!(
+                    "{} on '{}': list length {} exceeds maximum of {}",
+                    op,
+                    field,
+                    items.len(),
+                    MAX_IN_LIST
+                )));
+            }
+            let placeholders = vec!["?"; items.len()].join(",");
+            let negate = if op == "$nin" { "NOT " } else { "" };
+            params.push(path.to_object(py));
+            for item in items {
+                params.push(item.unbind());
+            }
+            return Ok(format!(
+                "json_extract(metadata, ?) {}IN ({})",
+                negate, placeholders
+            ));
+        }
+
+        if let Some(sym) = cmp_symbol(&op) {
+            params.push(path.to_object(py));
+            params.push(operand.unbind());
+            return Ok(format!("json_extract(metadata, ?) {} ?", sym));
+        }
+
+        return Err(FilterError::new_err(format!(
+            "unsupported operator '{}' on field '{}'",
+            op, field
+        )));
+    }
+
+    // Bare scalar → equality.
+    params.push(path.to_object(py));
+    params.push(value.clone().unbind());
+    Ok("json_extract(metadata, ?) = ?".to_string())
+}
+
+/// Core recursive compiler for a `where` mapping.
+fn compile_where(
+    py: Python<'_>,
+    where_obj: &Bound<'_, PyAny>,
+    depth: i32,
+) -> PyResult<(String, Vec<PyObject>)> {
+    if depth > MAX_DEPTH {
+        return Err(FilterError::new_err(format!(
+            "filter nesting depth exceeds maximum of {}",
+            MAX_DEPTH
+        )));
+    }
+    if where_obj.is_none() {
+        return Ok((String::new(), Vec::new()));
+    }
+    let dict = where_obj
+        .downcast::<PyDict>()
+        .map_err(|_| FilterError::new_err("where must be a mapping"))?;
+    if dict.is_empty() {
+        return Ok((String::new(), Vec::new()));
+    }
+
+    let has_and = dict.contains("$and")?;
+    let has_or = dict.contains("$or")?;
+    if has_and || has_or {
+        if dict.len() != 1 {
+            return Err(FilterError::new_err(
+                "a logical operator ($and/$or) cannot have sibling keys",
+            ));
+        }
+        let (key, subs) = dict.iter().next().unwrap();
+        let op = key.extract::<String>().unwrap_or_default();
+        let sub_items = as_sequence(&subs).filter(|v| !v.is_empty()).ok_or_else(|| {
+            FilterError::new_err(format!("{} requires a non-empty list of clauses", op))
+        })?;
+        let joiner = if op == "$and" { " AND " } else { " OR " };
+        let mut frags: Vec<String> = Vec::new();
+        let mut params: Vec<PyObject> = Vec::new();
+        for sub in sub_items {
+            let (frag, sub_params) = compile_where(py, &sub, depth + 1)?;
+            if !frag.is_empty() {
+                frags.push(format!("({})", frag));
+                params.extend(sub_params);
+            }
+        }
+        return Ok((frags.join(joiner), params));
+    }
+
+    // Reject any other top-level operator ($not, $nor, ...).
+    for key in dict.keys() {
+        if let Ok(s) = key.extract::<String>() {
+            if s.starts_with('$') {
+                return Err(FilterError::new_err(format!(
+                    "unsupported top-level operator '{}'",
+                    s
+                )));
+            }
+        }
+    }
+
+    let mut frags: Vec<String> = Vec::new();
+    let mut params: Vec<PyObject> = Vec::new();
+    for (key, value) in dict.iter() {
+        let field = key.str()?.to_string();
+        frags.push(field_clause(py, &field, &value, &mut params)?);
+    }
+    Ok((frags.join(" AND "), params))
+}
+
+/// Core compiler for a `where_document` mapping (only `$contains`).
+fn compile_where_document(
+    py: Python<'_>,
+    wd: &Bound<'_, PyAny>,
+) -> PyResult<(String, Vec<PyObject>)> {
+    if wd.is_none() {
+        return Ok((String::new(), Vec::new()));
+    }
+    let dict = wd
+        .downcast::<PyDict>()
+        .map_err(|_| FilterError::new_err("where_document must be a mapping"))?;
+    if dict.is_empty() {
+        return Ok((String::new(), Vec::new()));
+    }
+    if dict.len() != 1 || !dict.contains("$contains")? {
+        return Err(FilterError::new_err(
+            "where_document supports only $contains",
+        ));
+    }
+    let needle: String = dict.get_item("$contains")?.unwrap().extract()?;
+    let params = vec![format!("%{}%", like_escape(&needle)).to_object(py)];
+    Ok(("document LIKE ? ESCAPE '\\'".to_string(), params))
+}
+
+fn to_result<'py>(
+    py: Python<'py>,
+    sql: String,
+    params: Vec<PyObject>,
+) -> (String, Bound<'py, PyList>) {
+    (sql, PyList::new_bound(py, &params))
+}
+
+#[pyfunction]
+#[pyo3(signature = (where_obj, _depth=0))]
+fn where_to_sql<'py>(
+    py: Python<'py>,
+    where_obj: &Bound<'py, PyAny>,
+    _depth: i32,
+) -> PyResult<(String, Bound<'py, PyList>)> {
+    let (sql, params) = compile_where(py, where_obj, _depth)?;
+    Ok(to_result(py, sql, params))
+}
+
+#[pyfunction]
+fn where_document_to_sql<'py>(
+    py: Python<'py>,
+    where_document: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyList>)> {
+    let (sql, params) = compile_where_document(py, where_document)?;
+    Ok(to_result(py, sql, params))
+}
+
+#[pyfunction]
+fn combined_sql<'py>(
+    py: Python<'py>,
+    where_obj: &Bound<'py, PyAny>,
+    where_document: &Bound<'py, PyAny>,
+) -> PyResult<(String, Bound<'py, PyList>)> {
+    let mut frags: Vec<String> = Vec::new();
+    let mut params: Vec<PyObject> = Vec::new();
+    for (frag, p) in [
+        compile_where(py, where_obj, 0)?,
+        compile_where_document(py, where_document)?,
+    ] {
+        if !frag.is_empty() {
+            frags.push(format!("({})", frag));
+            params.extend(p);
+        }
+    }
+    Ok(to_result(py, frags.join(" AND "), params))
+}
+
+#[pymodule]
+fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add("FilterError", m.py().get_type_bound::<FilterError>())?;
+    m.add_function(wrap_pyfunction!(where_to_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(where_document_to_sql, m)?)?;
+    m.add_function(wrap_pyfunction!(combined_sql, m)?)?;
+    Ok(())
+}

@@ -1,0 +1,18 @@
+[package]
+name = "turbovecdb-core"
+version = "0.1.0"
+edition = "2021"
+description = "Rust core for turbovecdb (PyO3 extension module turbovecdb._core)"
+license = "MIT"
+
+[lib]
+name = "_core"
+path = "rust/src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["abi3-py39", "extension-module"] }
+
+[profile.release]
+opt-level = 3
+lto = true
