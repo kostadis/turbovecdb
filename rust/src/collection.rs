@@ -39,6 +39,28 @@ fn blob_to_f32(blob: &[u8]) -> impl Iterator<Item = f32> + '_ {
         .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
 }
 
+/// Bridge a Python filter operand into a rusqlite bound value. Metadata JSON
+/// scalars are str / int / float / bool / null; bool falls through to Integer.
+fn py_to_sql_value(obj: &Bound<'_, PyAny>) -> rusqlite::types::Value {
+    use rusqlite::types::Value;
+    if obj.is_none() {
+        return Value::Null;
+    }
+    if let Ok(i) = obj.extract::<i64>() {
+        return Value::Integer(i);
+    }
+    if let Ok(f) = obj.extract::<f64>() {
+        return Value::Real(f);
+    }
+    if let Ok(s) = obj.extract::<String>() {
+        return Value::Text(s);
+    }
+    match obj.str() {
+        Ok(s) => Value::Text(s.to_string()),
+        Err(_) => Value::Null,
+    }
+}
+
 #[pyclass]
 pub struct Collection {
     #[pyo3(get)]
@@ -255,6 +277,17 @@ impl Collection {
     fn rollback(&self) {
         let _ = self.conn.execute_batch("ROLLBACK");
     }
+
+    /// The filter compiler raises `_core.FilterError`; the public engine raises
+    /// `UnsupportedFilterError`. Re-wrap so behavior matches.
+    fn map_filter_err(&self, py: Python<'_>, e: PyErr) -> PyErr {
+        let msg = e
+            .value_bound(py)
+            .str()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|_| e.to_string());
+        turbovec_error(py, "UnsupportedFilterError", msg)
+    }
 }
 
 #[pymethods]
@@ -408,6 +441,182 @@ impl Collection {
         } else {
             None
         };
+        Ok(())
+    }
+
+    #[pyo3(signature = (ids=None, where_=None))]
+    fn delete(
+        &mut self,
+        py: Python<'_>,
+        ids: Option<Vec<String>>,
+        where_: Option<PyObject>,
+    ) -> PyResult<()> {
+        use rusqlite::types::Value;
+        let mut frags: Vec<String> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+        if let Some(idlist) = &ids {
+            if idlist.is_empty() {
+                return Ok(());
+            }
+            let qs = vec!["?"; idlist.len()].join(",");
+            frags.push(format!("str_id IN ({qs})"));
+            for id in idlist {
+                values.push(Value::Text(id.clone()));
+            }
+        }
+        if let Some(w) = &where_ {
+            let (wsql, wparams) =
+                crate::compile_where(py, w.bind(py), 0).map_err(|e| self.map_filter_err(py, e))?;
+            if !wsql.is_empty() {
+                frags.push(format!("({wsql})"));
+                for p in wparams {
+                    values.push(py_to_sql_value(p.bind(py)));
+                }
+            }
+        }
+        self.ensure_current(py)?;
+        let clause = if frags.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", frags.join(" AND "))
+        };
+        self.conn.execute_batch("BEGIN").map_err(sql_err)?;
+        let sql = format!("DELETE FROM docs{clause}");
+        let changed = match self
+            .conn
+            .execute(&sql, rusqlite::params_from_iter(values.iter()))
+        {
+            Ok(n) => n,
+            Err(e) => {
+                self.rollback();
+                return Err(sql_err(e));
+            }
+        };
+        if changed == 0 {
+            self.conn.execute_batch("COMMIT").map_err(sql_err)?;
+            return Ok(());
+        }
+        let sg = self.store_gen_val()? + 1;
+        if self.meta_set("store_gen", &sg.to_string()).is_err() {
+            self.rollback();
+            return Err(PyRuntimeError::new_err("delete: meta update failed"));
+        }
+        self.conn.execute_batch("COMMIT").map_err(sql_err)?;
+        // Rows removed → index rebuilds lazily from the committed store.
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn update_metadata(
+        &mut self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        metadatas: Vec<PyObject>,
+    ) -> PyResult<()> {
+        if metadatas.len() != ids.len() {
+            return Err(PyValueError::new_err(format!(
+                "metadatas length {} != ids length {}",
+                metadatas.len(),
+                ids.len()
+            )));
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.ensure_current(py)?;
+        self.conn.execute_batch("BEGIN").map_err(sql_err)?;
+        for i in 0..ids.len() {
+            let exists: Option<i64> = match self
+                .conn
+                .query_row("SELECT uid FROM docs WHERE str_id=?1", params![ids[i]], |r| r.get(0))
+                .optional()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    self.rollback();
+                    return Err(sql_err(e));
+                }
+            };
+            if exists.is_none() {
+                self.rollback();
+                return Err(PyValueError::new_err(format!("id {:?} not found", ids[i])));
+            }
+            let truthy = metadatas[i].bind(py).is_truthy().unwrap_or(true);
+            let arg = if truthy { Some(&metadatas[i]) } else { None };
+            let meta_json = match self.dumps_meta(py, arg) {
+                Ok(s) => s,
+                Err(e) => {
+                    self.rollback();
+                    return Err(e);
+                }
+            };
+            if let Err(e) = self.conn.execute(
+                "UPDATE docs SET metadata=?1 WHERE str_id=?2",
+                params![meta_json, ids[i]],
+            ) {
+                self.rollback();
+                return Err(sql_err(e));
+            }
+        }
+        let sg = self.store_gen_val()? + 1;
+        if self.meta_set("store_gen", &sg.to_string()).is_err() {
+            self.rollback();
+            return Err(PyRuntimeError::new_err("update_metadata: meta update failed"));
+        }
+        self.conn.execute_batch("COMMIT").map_err(sql_err)?;
+        self.seen_gen = sg; // vectors unchanged → index stays valid
+        Ok(())
+    }
+
+    fn update_documents(
+        &mut self,
+        py: Python<'_>,
+        ids: Vec<String>,
+        documents: Vec<String>,
+    ) -> PyResult<()> {
+        if documents.len() != ids.len() {
+            return Err(PyValueError::new_err(format!(
+                "documents length {} != ids length {}",
+                documents.len(),
+                ids.len()
+            )));
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.ensure_current(py)?;
+        self.conn.execute_batch("BEGIN").map_err(sql_err)?;
+        for i in 0..ids.len() {
+            let exists: Option<i64> = match self
+                .conn
+                .query_row("SELECT uid FROM docs WHERE str_id=?1", params![ids[i]], |r| r.get(0))
+                .optional()
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    self.rollback();
+                    return Err(sql_err(e));
+                }
+            };
+            if exists.is_none() {
+                self.rollback();
+                return Err(PyValueError::new_err(format!("id {:?} not found", ids[i])));
+            }
+            if let Err(e) = self.conn.execute(
+                "UPDATE docs SET document=?1 WHERE str_id=?2",
+                params![documents[i], ids[i]],
+            ) {
+                self.rollback();
+                return Err(sql_err(e));
+            }
+        }
+        let sg = self.store_gen_val()? + 1;
+        if self.meta_set("store_gen", &sg.to_string()).is_err() {
+            self.rollback();
+            return Err(PyRuntimeError::new_err("update_documents: meta update failed"));
+        }
+        self.conn.execute_batch("COMMIT").map_err(sql_err)?;
+        self.seen_gen = sg; // vectors unchanged → index stays valid
         Ok(())
     }
 }

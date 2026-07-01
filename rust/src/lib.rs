@@ -118,7 +118,7 @@ fn field_clause(
 }
 
 /// Core recursive compiler for a `where` mapping.
-fn compile_where(
+pub(crate) fn compile_where(
     py: Python<'_>,
     where_obj: &Bound<'_, PyAny>,
     depth: i32,
