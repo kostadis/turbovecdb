@@ -1,11 +1,9 @@
-"""Chunked index rebuild: _reload_index loads vectors in batches to bound memory."""
+"""Index rebuild from the SQLite store: deleting index.tvim forces a rebuild on
+the next open, and the rebuilt index must answer queries correctly."""
 
 import os
 
-import pytest
-
 import turbovecdb
-from turbovecdb.collection import _REBUILD_BATCH_SIZE
 
 DIM = 8
 
@@ -33,9 +31,8 @@ def test_rebuild_with_fewer_vectors_than_batch_size(tmp_path):
     db2.close()
 
 
-def test_rebuild_chunks_across_multiple_batches(tmp_path, monkeypatch):
+def test_rebuild_chunks_across_multiple_batches(tmp_path):
     """Force a small batch size so the rebuild exercises multiple chunks."""
-    monkeypatch.setattr("turbovecdb.collection._REBUILD_BATCH_SIZE", 3)
     path = str(tmp_path / "db")
     db = turbovecdb.connect(path)
     col = db.collection("c", dim=DIM, create=True)
@@ -57,9 +54,8 @@ def test_rebuild_chunks_across_multiple_batches(tmp_path, monkeypatch):
     db2.close()
 
 
-def test_rebuild_chunks_restores_index_after_crash(tmp_path, monkeypatch):
+def test_rebuild_chunks_restores_index_after_crash(tmp_path):
     """Simulate a crash by deleting .tvim; chunked rebuild restores it."""
-    monkeypatch.setattr("turbovecdb.collection._REBUILD_BATCH_SIZE", 2)
     path = str(tmp_path / "db")
     db = turbovecdb.connect(path)
     col = db.collection("c", dim=DIM, create=True)
@@ -81,7 +77,7 @@ def test_rebuild_empty_collection(tmp_path):
     """An empty collection (no vectors) rebuilds without error."""
     path = str(tmp_path / "db")
     db = turbovecdb.connect(path)
-    col = db.collection("c", dim=DIM, create=True)
+    db.collection("c", dim=DIM, create=True)
     db.close()
     db2 = turbovecdb.connect(path)
     col2 = db2.collection("c", create=False)

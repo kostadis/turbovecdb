@@ -12,9 +12,9 @@ keep + real dim change is a clean error; and the whole rewrite is atomic.
 """
 import numpy as np
 import pytest
+import turbovec
 
 import turbovecdb
-from turbovecdb import index as _idx
 from turbovecdb.errors import DimensionMismatchError
 
 
@@ -112,12 +112,11 @@ def test_reembed_rolls_back_when_index_rebuild_fails(tmp_path, monkeypatch):
           vectors=e8(["hi", "yo", "hey", "sup"]))
     before = c.count()
 
-    boom = RuntimeError("simulated index rebuild failure")
+    def exploding_index(*args, **kwargs):
+        raise RuntimeError("simulated index rebuild failure")
 
-    def exploding_new_index(dim, bit_width):
-        raise boom
-
-    monkeypatch.setattr(_idx, "new_index", exploding_new_index)
+    # The Rust core builds the index by calling turbovec.IdMapIndex directly.
+    monkeypatch.setattr(turbovec, "IdMapIndex", exploding_index)
     with pytest.raises(RuntimeError):
         c.reembed(e8, batch_size=2)  # embeds fine; blows up rebuilding the index
     monkeypatch.undo()

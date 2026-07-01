@@ -16,3 +16,6 @@ venv/
 /target/
 *.abi3.so
 *.so
+
+# uv (maturin build tool) lockfile
+uv.lock

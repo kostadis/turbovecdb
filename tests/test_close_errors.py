@@ -2,7 +2,6 @@
 
 import logging
 
-import pytest
 
 import turbovecdb
 
@@ -40,8 +39,10 @@ def test_close_logs_warning_on_error(tmp_path, caplog):
     col = db.collection("c", dim=DIM, create=True)
     col.add(ids=["a"], documents=["hello"], vectors=[[1.0] + [0.0] * (DIM - 1)])
 
-    # Corrupt the collection's connection to trigger a close error
-    col._conn.close()  # close the inner connection early
+    # Make the collection's close() raise, to trigger the database's warning path
+    def _boom():
+        raise RuntimeError("boom")
+    col.close = _boom
 
     with caplog.at_level(logging.WARNING, logger="turbovecdb.database"):
         db.close()
@@ -55,7 +56,9 @@ def test_delete_collection_logs_warning_on_close_error(tmp_path, caplog):
     col.add(ids=["a"], documents=["hello"], vectors=[[1.0] + [0.0] * (DIM - 1)])
 
     # Break the collection to trigger a close error
-    col._conn.close()
+    def _boom():
+        raise RuntimeError("boom")
+    col.close = _boom
 
     with caplog.at_level(logging.WARNING, logger="turbovecdb.database"):
         db.delete_collection("c")
@@ -70,7 +73,9 @@ def test_close_continues_after_error(tmp_path):
 
     bad = db.collection("bad", dim=DIM, create=True)
     bad.add(ids=["b"], documents=["world"], vectors=[[0.0, 1.0] + [0.0] * (DIM - 2)])
-    bad._conn.close()  # corrupt
+    def _boom():
+        raise RuntimeError("boom")
+    bad.close = _boom  # make this collection fail to close
 
     # close() should not raise, and both should be evicted from cache
     db.close()

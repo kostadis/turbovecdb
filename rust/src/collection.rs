@@ -447,9 +447,14 @@ impl Collection {
         let tvim_path = format!("{coll_dir}/index.tvim");
 
         let conn = Connection::open(&db_path).map_err(sql_err)?;
+        // Set the busy timeout FIRST — before the WAL-mode switch and DDL below,
+        // which briefly need a write lock. The constructor runs outside the
+        // cross-process file lock, so concurrent opens must wait here rather
+        // than fail with SQLITE_BUSY ("database is locked").
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .map_err(sql_err)?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; \
-             PRAGMA busy_timeout=5000; \
              CREATE TABLE IF NOT EXISTS docs (uid INTEGER PRIMARY KEY, str_id TEXT UNIQUE NOT NULL, document TEXT, metadata TEXT, vector BLOB); \
              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
         )
