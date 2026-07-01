@@ -329,6 +329,11 @@ impl Collection {
         let _ = self.conn.execute_batch("ROLLBACK");
     }
 
+    /// Truncate the WAL to bound its growth (best-effort).
+    fn wal_checkpoint(&self) {
+        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+    }
+
     fn set_reembed_meta(&self, new_dim: i64, new_bit_width: i64, identity: &str) -> PyResult<()> {
         self.meta_set("dim", &new_dim.to_string())?;
         self.meta_set("bit_width", &new_bit_width.to_string())?;
@@ -518,6 +523,61 @@ impl Collection {
     #[pyo3(name = "meta_get")]
     fn py_meta_get(&self, key: &str) -> PyResult<Option<String>> {
         self.meta_get(key)
+    }
+
+    /// Persist the in-memory index to `index.tvim` (a cold-start cache) and
+    /// checkpoint the WAL. The cross-process write lock is held by the Python
+    /// wrapper around this call.
+    fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.ensure_current(py)?;
+        if self.index.is_none() || !self.dirty {
+            return Ok(());
+        }
+        let tmp = format!("{}.tmp", self.tvim_path);
+        {
+            let index = self.index.as_ref().unwrap().bind(py);
+            index.call_method1("write", (tmp.as_str(),))?;
+        }
+        py.import_bound("os")?
+            .getattr("replace")?
+            .call1((tmp.as_str(), self.tvim_path.as_str()))?;
+        let sg = self.store_gen_val()?;
+        self.meta_set("tvim_gen", &sg.to_string())?; // autocommits
+        self.wal_checkpoint();
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        self.flush(py)?;
+        self.wal_checkpoint();
+        Ok(())
+    }
+
+    /// SQLite integrity + cache-coherence report (returns HealthResult).
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let qc: String = self
+            .conn
+            .query_row("PRAGMA quick_check", [], |r| r.get(0))
+            .map_err(sql_err)?;
+        let store_gen = self.store_gen_val()?;
+        let tvim_gen = self.meta_get_i64("tvim_gen", -1)?;
+        let doc_count = self.count()?;
+        let coherent = store_gen == tvim_gen;
+        let ok = qc == "ok";
+        if !ok {
+            return Err(turbovec_error(
+                py,
+                "TurboVecError",
+                format!("SQLite integrity check failed for {:?}: {}", self.dir, qc),
+            ));
+        }
+        let hr = py
+            .import_bound("turbovecdb.collection")?
+            .getattr("HealthResult")?;
+        Ok(hr
+            .call1((ok, qc, store_gen, tvim_gen, coherent, doc_count))?
+            .unbind())
     }
 
     #[pyo3(signature = (ids, documents=None, metadatas=None, vectors=None))]
