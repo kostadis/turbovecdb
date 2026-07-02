@@ -60,30 +60,43 @@ confirmed:
   same result. Confirms the format is genuinely shared, not just
   superficially similar.
 
-**New risk found, not in the original design: `turbovec` requires a system
-BLAS to build.** `turbovec`'s own `Cargo.toml` unconditionally enables
-`ndarray`'s `blas` feature on `cfg(target_os = "linux")` and `"macos"`, which
-pulls in `cblas-sys` and requires linking `-lopenblas` (or another BLAS
-provider) at build time. This sandbox has no system OpenBLAS installed and
-no root access to `apt install libopenblas-dev`; the spike only linked by
-pointing the linker at the `.so` already bundled inside the **Python wheel's**
-`turbovec.libs/` directory (an `auditwheel`-repaired, non-versioned bundle) —
-confirming the upstream project already solves *wheel* distribution this way,
-but that doesn't help a plain `cargo build`/`cargo test` on a clean machine or
-CI runner. **This must be resolved before Phase C2 and is a hard prerequisite
-for Phase E** (`cargo test -p turbovecdb-core` needs to link and run without
-manual system-package setup). Options to evaluate in Phase C2: (a) add
-`openblas-src` (or `blas-src` + a backend) with a `static`/vendored feature so
-`cargo build` compiles its own BLAS from source — needs a Fortran-capable
-toolchain (only the `libgfortran5` *runtime* was present here, not a Fortran
-*compiler*; must confirm `gfortran` availability in the actual CI/dev
-environment or use a Fortran-free OpenBLAS build mode); (b) document a system
-BLAS package as a required build dependency (simpler, but reintroduces a
-"works on my machine" build requirement the project doesn't have today); (c)
-vendor the same prebuilt `.so` the Python wheel already ships, keyed off how
-`turbovec-python`'s own build pipeline produces it. No decision made yet —
-flagged for Phase C2 (issue #23) to resolve before swapping the index
-backend.
+**Risk found in the spike, resolved in Phase C2 (2026-07-01): `turbovec`
+requires a BLAS provider to build.** `turbovec`'s own `Cargo.toml`
+unconditionally enables `ndarray`'s `blas` feature on `cfg(target_os =
+"linux")` and `"macos"`, which pulls in `cblas-sys` and requires linking
+`-lopenblas` (or another BLAS provider) at build time. No system OpenBLAS was
+available in the spike sandbox and no root access to install one.
+**Resolution:** add `openblas-src` (`features = ["static"]`) as a direct
+dependency of `turbovecdb-core`. Its build script compiles a vendored OpenBLAS
+from source and statically links it — no system package, no root, and (contrary
+to the spike's worry) **no working `gfortran` binary was needed either**; only
+the `libgfortran5` *runtime* was present in this sandbox and the build still
+succeeded. Verified end-to-end: a real `#[test]` in `turbovecdb-core`
+constructing a `TurbovecIndex` (wrapping `turbovec::IdMapIndex` directly, no
+PyO3 callback), running add/remove/write/load/search, passes standalone via
+`cargo test -p turbovecdb-core`; `maturin develop` + the full 163-test suite
+also stayed green with `turbovec` now a real dependency. Cost: ~4 minutes
+added to a clean build (one-time; Cargo caches the compiled OpenBLAS in
+`target/` afterward) — acceptable for both local dev and CI.
+
+**Scope correction, found while implementing C2:** the original issue
+description assumed `rust/src/lib.rs`'s `new_index`/`build_index`/
+`load_index`/`write_index_atomic` functions were what drove the Python
+callback — they're actually **dead code**, re-exported by
+`turbovecdb.index` but called from nowhere in `collection.rs`.
+`Collection`'s own methods (`make_index`/`reload_index`/
+`mirror_write_to_index`/`remove_from_index`/the search call in `query`)
+have their *own* separate inline `py.import_bound("turbovec")` calls — that's
+the real, live Python-callback code, and it lives in `Collection`'s fields
+(`index: Option<PyObject>`) and business logic, not in freestanding `lib.rs`
+functions. Actually swapping it out means changing what `Collection` owns and
+calls — which is exactly split phase 5/8's job ("port `Collection`'s business
+logic... using the new abstractions"), not this phase's. So C2's real,
+self-contained scope is: prove the native `turbovec` dependency and
+`TurbovecIndex` (implementing `VectorIndex`) work end-to-end, available for
+Phase D to consume. Phase D deletes the dead `lib.rs` functions and
+`Collection`'s inline PyO3-callback calls once it rewires `Collection` to use
+`TurbovecIndex`.
 
 ## Target layout
 
@@ -222,25 +235,36 @@ established "flip once, at parity" incremental-slice style
 3. **Phase B — extract the filter compiler** into `turbovecdb-core::filters`
    (nearly pure already), switching its input type to `serde_json::Value`.
    Verify `test_filters.py` green plus the message-parity check.
-4. **Phase C1 — introduce traits, keep the old index backend.** Add
-   `CoreError`/`Embedder`/`VectorIndex` to `turbovecdb-core`; the
-   `VectorIndex` production impl still calls back into Python's `turbovec`
-   wheel for now. This decouples the abstraction refactor from Phase 0's
-   outcome — if the spike finds a gap, this phase isn't blocked on it.
-5. **Phase C2 — swap to the native `turbovec` crate**, once Phase 0 has
-   confirmed compatibility. Replace the `VectorIndex` impl with one wrapping
-   `turbovec::IdMapIndex` directly; delete `new_index`/`build_index`/
-   `load_index`/`write_index_atomic`'s Python callbacks.
+4. **Phase C1 — introduce traits, no production `VectorIndex` impl yet.** Add
+   `CoreError`/`Embedder`/`VectorIndex` to `turbovecdb-core`, each with a
+   `#[cfg(test)]`-only fake implementation; `Collection`'s actual index
+   handling is untouched (still its own inline PyO3 calls into Python's
+   `turbovec` wheel). This decouples the abstraction refactor from Phase
+   0's outcome — if the spike finds a gap, this phase isn't blocked on it.
+5. **Phase C2 — add the native `turbovec` crate as a real dependency** and
+   implement `TurbovecIndex` (wrapping `turbovec::IdMapIndex` directly, no
+   PyO3 callback) as `VectorIndex`'s production impl, proven via a real
+   `cargo test` exercising add/remove/write/load/search. Resolves the
+   BLAS-build risk (see above). Does **not** yet touch `Collection` —
+   scope-corrected while implementing: the live Python-callback code is
+   `Collection`'s own inline calls, not the dead `new_index`/`build_index`/
+   `load_index`/`write_index_atomic` functions this issue originally named;
+   rewiring `Collection` to consume `TurbovecIndex` (and deleting the old
+   callback code) is Phase D's job.
 6. **Phase D — port `Collection`'s business logic** (SQLite reads/writes,
    generation bookkeeping, reembed algorithm) into `turbovecdb-core` using
    the new abstractions; `PyCollection` becomes a thin wrapper per the
-   adapter responsibilities above.
+   adapter responsibilities above. This is also where `Collection` actually
+   switches from its inline PyO3-callback index handling to `TurbovecIndex`,
+   and the now-fully-dead `new_index`/`build_index`/`load_index`/
+   `write_index_atomic` functions get deleted.
 7. **Phase E — add `cargo test` coverage** directly against
    `turbovecdb-core` (filter compiler unit tests, write/read/reembed against
    a temp SQLite file + fake `VectorIndex`) — a capability that doesn't
    exist today.
-8. **Phase F — cleanup.** Fix the outdated "turbovec has no Rust crate"
-   comment; update `docs/rust-core-plan.md` to record this slice and its
+8. **Phase F — cleanup.** Confirm the outdated "turbovec has no Rust crate"
+   comment is gone (deleted along with the dead functions it annotated in
+   Phase D); update `docs/rust-core-plan.md` to record this slice and its
    position ahead of #16/#17; note that #16 (Database in Rust) should be
    authored directly against the new `turbovecdb-core`/`turbovecdb-py` shape.
 
