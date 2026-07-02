@@ -11,6 +11,9 @@ path = "src/lib.rs"
 crate-type = ["cdylib"]
 
 [dependencies]
+turbovecdb-core = { path = "../turbovecdb-core" }
 pyo3 = { version = "0.22", features = ["abi3-py39", "extension-module"] }
 numpy = "0.22"
 rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1.0.150"
+pythonize = "0.22"

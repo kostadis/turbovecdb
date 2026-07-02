@@ -17,6 +17,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
+use turbovecdb_core::filters;
 
 const RERANK_FLOOR: i64 = 50;
 
@@ -90,25 +91,28 @@ fn emb_call<'py>(
         })
 }
 
-/// Bridge a Python filter operand into a rusqlite bound value. Metadata JSON
-/// scalars are str / int / float / bool / null; bool falls through to Integer.
-fn py_to_sql_value(obj: &Bound<'_, PyAny>) -> rusqlite::types::Value {
+/// Bridge a filter-compiler operand (already `serde_json::Value`, produced by
+/// `turbovecdb_core::filters`) into a rusqlite bound value. Metadata JSON
+/// scalars are str / int / float / bool / null; bool falls through to
+/// Integer — JSON's `Bool` is a distinct variant from `Number`, unlike
+/// Python where `bool` is an `int` subclass, so this must special-case it to
+/// match the historical PyAny-based converter's behavior.
+fn json_to_sql_value(v: &serde_json::Value) -> rusqlite::types::Value {
     use rusqlite::types::Value;
-    if obj.is_none() {
-        return Value::Null;
-    }
-    if let Ok(i) = obj.extract::<i64>() {
-        return Value::Integer(i);
-    }
-    if let Ok(f) = obj.extract::<f64>() {
-        return Value::Real(f);
-    }
-    if let Ok(s) = obj.extract::<String>() {
-        return Value::Text(s);
-    }
-    match obj.str() {
-        Ok(s) => Value::Text(s.to_string()),
-        Err(_) => Value::Null,
+    match v {
+        serde_json::Value::Null => Value::Null,
+        serde_json::Value::Bool(b) => Value::Integer(if *b { 1 } else { 0 }),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                Value::Integer(i)
+            } else if let Some(f) = n.as_f64() {
+                Value::Real(f)
+            } else {
+                Value::Null
+            }
+        }
+        serde_json::Value::String(s) => Value::Text(s.clone()),
+        other => Value::Text(other.to_string()),
     }
 }
 
@@ -379,15 +383,11 @@ impl Collection {
         Ok(())
     }
 
-    /// The filter compiler raises `_core.FilterError`; the public engine raises
-    /// `UnsupportedFilterError`. Re-wrap so behavior matches.
-    fn map_filter_err(&self, py: Python<'_>, e: PyErr) -> PyErr {
-        let msg = e
-            .value_bound(py)
-            .str()
-            .map(|s| s.to_string())
-            .unwrap_or_else(|_| e.to_string());
-        turbovec_error(py, "UnsupportedFilterError", msg)
+    /// The core filter compiler raises a plain `filters::FilterError`; the
+    /// public engine raises `UnsupportedFilterError`. Re-wrap so behavior
+    /// matches.
+    fn map_filter_err(&self, py: Python<'_>, e: filters::FilterError) -> PyErr {
+        turbovec_error(py, "UnsupportedFilterError", e.0)
     }
 
     fn empty_query_result(&self, py: Python<'_>, inc_vectors: bool) -> PyResult<PyObject> {
@@ -424,22 +424,24 @@ impl Collection {
         let mut frags: Vec<String> = Vec::new();
         let mut values: Vec<rusqlite::types::Value> = Vec::new();
         if let Some(w) = where_ {
+            let w_json = crate::py_to_json(w.bind(py))?;
             let (s, ps) =
-                crate::compile_where(py, w.bind(py), 0).map_err(|e| self.map_filter_err(py, e))?;
+                filters::compile_where(&w_json, 0).map_err(|e| self.map_filter_err(py, e))?;
             if !s.is_empty() {
                 frags.push(format!("({s})"));
-                for p in ps {
-                    values.push(py_to_sql_value(p.bind(py)));
+                for p in &ps {
+                    values.push(json_to_sql_value(p));
                 }
             }
         }
         if let Some(wd) = where_document {
-            let (s, ps) = crate::compile_where_document(py, wd.bind(py))
+            let wd_json = crate::py_to_json(wd.bind(py))?;
+            let (s, ps) = filters::compile_where_document(&wd_json)
                 .map_err(|e| self.map_filter_err(py, e))?;
             if !s.is_empty() {
                 frags.push(format!("({s})"));
-                for p in ps {
-                    values.push(py_to_sql_value(p.bind(py)));
+                for p in &ps {
+                    values.push(json_to_sql_value(p));
                 }
             }
         }
@@ -694,12 +696,13 @@ impl Collection {
             }
         }
         if let Some(w) = &where_ {
+            let w_json = crate::py_to_json(w.bind(py))?;
             let (wsql, wparams) =
-                crate::compile_where(py, w.bind(py), 0).map_err(|e| self.map_filter_err(py, e))?;
+                filters::compile_where(&w_json, 0).map_err(|e| self.map_filter_err(py, e))?;
             if !wsql.is_empty() {
                 frags.push(format!("({wsql})"));
-                for p in wparams {
-                    values.push(py_to_sql_value(p.bind(py)));
+                for p in &wparams {
+                    values.push(json_to_sql_value(p));
                 }
             }
         }
@@ -1036,22 +1039,24 @@ impl Collection {
             }
         }
         if let Some(w) = &where_ {
+            let w_json = crate::py_to_json(w.bind(py))?;
             let (s, ps) =
-                crate::compile_where(py, w.bind(py), 0).map_err(|e| self.map_filter_err(py, e))?;
+                filters::compile_where(&w_json, 0).map_err(|e| self.map_filter_err(py, e))?;
             if !s.is_empty() {
                 frags.push(s);
-                for p in ps {
-                    values.push(py_to_sql_value(p.bind(py)));
+                for p in &ps {
+                    values.push(json_to_sql_value(p));
                 }
             }
         }
         if let Some(wd) = &where_document {
-            let (s, ps) = crate::compile_where_document(py, wd.bind(py))
+            let wd_json = crate::py_to_json(wd.bind(py))?;
+            let (s, ps) = filters::compile_where_document(&wd_json)
                 .map_err(|e| self.map_filter_err(py, e))?;
             if !s.is_empty() {
                 frags.push(s);
-                for p in ps {
-                    values.push(py_to_sql_value(p.bind(py)));
+                for p in &ps {
+                    values.push(json_to_sql_value(p));
                 }
             }
         }

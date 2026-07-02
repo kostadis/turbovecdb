@@ -6,3 +6,4 @@ description = "Pure Rust engine for turbovecdb (no PyO3/Python dependency)"
 license = "MIT"
 
 [dependencies]
+serde_json = "1.0.150"
