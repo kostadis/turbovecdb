@@ -1,10 +1,15 @@
 # Rust core/adapter split — design
 
+**Status: done.** All 8 phases (#19-#26) landed on `feat/rust-core`; see the
+[Phased migration](#phased-migration) section below for what shipped in each
+commit. This doc is kept as the design record for the split, not a live plan.
+
 Companion to `docs/rust-core-plan.md`. Tracks the fix for
-[#18](https://github.com/kostadis/turbovecdb/issues/18): the Rust engine is
-not currently a pure, standalone crate — it reaches into Python for its own
-domain types, error types, and ANN index. This doc designs the split into a
-pure `turbovecdb-core` crate and a thin `turbovecdb-py` PyO3 adapter crate.
+[#18](https://github.com/kostadis/turbovecdb/issues/18): the Rust engine was
+not a pure, standalone crate — it reached into Python for its own domain
+types, error types, and ANN index. This doc designed (and now records) the
+split into a pure `turbovecdb-core` crate and a thin `turbovecdb-py` PyO3
+adapter crate.
 
 ## Sequencing: before #16, before #17
 
@@ -219,54 +224,50 @@ Each phase keeps the existing pytest suite green, matching the project's
 established "flip once, at parity" incremental-slice style
 (`docs/rust-core-plan.md`).
 
-1. **Phase 0 — spike (do first, blocking).** Verify `turbovec::IdMapIndex`'s
-   exact method signatures and whether `write`/`load` need extra feature
-   flags. Run a **falsifiable cross-format test**: write a `.tvim` index via
-   the existing Python-wheel path, then load and search it from a small
-   native-crate spike binary (or vice versa), and assert identical search
-   results — "confirm signatures" alone won't catch format drift between the
-   0.8.0 wheel and the 0.9.0 pure crate. Also verify `turbovec::IdMapIndex`
-   is `Send`.
-2. **Phase A — mechanical workspace shell, zero logic change.** Move
-   existing `rust/src/*.rs` as-is into `crates/turbovecdb-py/src/*`, add an
-   empty `crates/turbovecdb-core`, update `Cargo.toml`/`pyproject.toml`.
-   Verify build + full suite green with no behavior change — de-risks the
-   structural move before any logic changes.
-3. **Phase B — extract the filter compiler** into `turbovecdb-core::filters`
-   (nearly pure already), switching its input type to `serde_json::Value`.
-   Verify `test_filters.py` green plus the message-parity check.
-4. **Phase C1 — introduce traits, no production `VectorIndex` impl yet.** Add
-   `CoreError`/`Embedder`/`VectorIndex` to `turbovecdb-core`, each with a
-   `#[cfg(test)]`-only fake implementation; `Collection`'s actual index
-   handling is untouched (still its own inline PyO3 calls into Python's
-   `turbovec` wheel). This decouples the abstraction refactor from Phase
-   0's outcome — if the spike finds a gap, this phase isn't blocked on it.
-5. **Phase C2 — add the native `turbovec` crate as a real dependency** and
-   implement `TurbovecIndex` (wrapping `turbovec::IdMapIndex` directly, no
-   PyO3 callback) as `VectorIndex`'s production impl, proven via a real
-   `cargo test` exercising add/remove/write/load/search. Resolves the
-   BLAS-build risk (see above). Does **not** yet touch `Collection` —
-   scope-corrected while implementing: the live Python-callback code is
-   `Collection`'s own inline calls, not the dead `new_index`/`build_index`/
-   `load_index`/`write_index_atomic` functions this issue originally named;
-   rewiring `Collection` to consume `TurbovecIndex` (and deleting the old
-   callback code) is Phase D's job.
-6. **Phase D — port `Collection`'s business logic** (SQLite reads/writes,
-   generation bookkeeping, reembed algorithm) into `turbovecdb-core` using
-   the new abstractions; `PyCollection` becomes a thin wrapper per the
-   adapter responsibilities above. This is also where `Collection` actually
-   switches from its inline PyO3-callback index handling to `TurbovecIndex`,
-   and the now-fully-dead `new_index`/`build_index`/`load_index`/
-   `write_index_atomic` functions get deleted.
-7. **Phase E — add `cargo test` coverage** directly against
-   `turbovecdb-core` (filter compiler unit tests, write/read/reembed against
-   a temp SQLite file + fake `VectorIndex`) — a capability that doesn't
-   exist today.
-8. **Phase F — cleanup.** Confirm the outdated "turbovec has no Rust crate"
-   comment is gone (deleted along with the dead functions it annotated in
-   Phase D); update `docs/rust-core-plan.md` to record this slice and its
-   position ahead of #16/#17; note that #16 (Database in Rust) should be
-   authored directly against the new `turbovecdb-core`/`turbovecdb-py` shape.
+1. **[Done, #19] Phase 0 — spike.** Verified `turbovec::IdMapIndex`'s exact
+   method signatures, confirmed it's `Send`, and ran a falsifiable
+   cross-format test: a `.tvim` index written by the Python wheel
+   (`turbovec==0.8.0`) loaded and searched correctly from the native 0.9.0
+   crate, and vice versa — format is genuinely shared, not just superficially
+   similar.
+2. **[Done, #20] Phase A — mechanical workspace shell, zero logic change.**
+   Moved `rust/src/*.rs` as-is into `crates/turbovecdb-py/src/*`, added
+   `crates/turbovecdb-core`, updated `Cargo.toml`/`pyproject.toml`. Build +
+   full suite green with no behavior change.
+3. **[Done, #21] Phase B — extracted the filter compiler** into
+   `turbovecdb-core::filters`, retyped over `serde_json::Value`.
+   `test_filters.py` green.
+4. **[Done, #22] Phase C1 — introduced `CoreError`/`Embedder`/`VectorIndex`.**
+   Each with `#[cfg(test)]`-only fakes; `Collection`'s actual index handling
+   was untouched in this phase (still its own inline PyO3 calls into Python's
+   `turbovec` wheel).
+5. **[Done, #23] Phase C2 — added the native `turbovec` crate dependency**
+   and `TurbovecIndex` (wraps `turbovec::IdMapIndex` directly, no PyO3
+   callback) as `VectorIndex`'s production impl. Resolved the BLAS-build risk
+   via `openblas-src` (`features = ["static"]`) — no system package, no root,
+   no `gfortran` needed. Scope-corrected while implementing: the live
+   Python-callback code turned out to be `Collection`'s own inline calls, not
+   the (already-dead) `new_index`/`build_index`/`load_index`/
+   `write_index_atomic` functions this issue originally named.
+6. **[Done, #24] Phase D — ported `Collection`'s business logic** (SQLite
+   reads/writes, generation bookkeeping, reembed) into
+   `turbovecdb-core::collection::Collection<E: Embedder, I: VectorIndex>`
+   (generic, not `dyn`-boxed). `turbovecdb-py::collection::Collection` is now
+   a ~230-line thin wrapper (down from 1500). `Collection` switched from
+   inline PyO3-callback index handling to `TurbovecIndex`; the dead
+   `new_index`/`build_index`/`load_index`/`write_index_atomic` functions and
+   the stale "turbovec has no Rust crate" comment are gone. One test needed
+   updating: `test_reembed_rolls_back_when_index_rebuild_fails` monkeypatched
+   Python's `turbovec.IdMapIndex`, which the native index no longer calls —
+   replaced with a real failure (embedder output dim not a multiple of 8).
+7. **[Done, #25] Phase E — added `cargo test` coverage**: 17 filter-compiler
+   tests plus 13 `Collection` integration tests against
+   `Collection<ConstantEmbedder, FakeIndex>` and a temp SQLite dir. Landed as
+   `#[cfg(test)]` modules in `filters.rs`/`collection.rs` (matching the
+   pattern in `error.rs`/`embedder.rs`/`index.rs`) rather than a separate
+   `tests/` directory. `turbovecdb-core` has 37 tests total, zero Python.
+8. **[Done, #26] Phase F — cleanup.** This doc, `docs/rust-core-plan.md`, and
+   issue #18 updated to record the completed split.
 
 ## Out of scope
 

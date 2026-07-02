@@ -15,15 +15,22 @@ until the rewrite is complete, then lands as a single PR.
 - PyO3 crate scaffold (`Cargo.toml`, `rust/src/lib.rs`, maturin build backend).
 - `where` / `where_document` **filter compiler** ported to Rust; `turbovecdb.filters` is now a thin shim re-raising `_core.FilterError` as `UnsupportedFilterError`.
 
-## Interlude: core/adapter split (before #16)
+## Interlude: core/adapter split (done, before #16)
 
 [#18](https://github.com/kostadis/turbovecdb/issues/18) found that the Rust
-engine built so far isn't a pure, standalone crate — it reaches back into
+engine built so far wasn't a pure, standalone crate — it reached back into
 Python for its own result/error types and its ANN index. See
-`docs/rust-core-split-design.md` for the fix: splitting into a pure
-`turbovecdb-core` crate plus a thin `turbovecdb-py` PyO3 adapter. This lands
-**before slice #16** below, so Database-in-Rust is authored directly against
-the clean shape instead of the tangled one.
+`docs/rust-core-split-design.md` for the design and phase-by-phase record
+(issues #19-#26, all closed): the single `rust/` crate became a Cargo
+workspace — `crates/turbovecdb-core` (pure Rust: SQLite store, filter
+compiler, generation bookkeeping, reembed, native `turbovec` crate
+dependency for the ANN index, 37 `cargo test`s, zero Python) plus
+`crates/turbovecdb-py` (thin PyO3 adapter — `convert.rs` is now the only
+place that constructs Python objects/exceptions by name). Landed **before**
+slice #16 below, so Database-in-Rust is authored directly against the clean
+shape instead of the tangled one. `rust/src/lib.rs` referenced elsewhere in
+this doc no longer exists — see the workspace layout in
+`docs/rust-core-split-design.md`.
 
 ## Roadmap
 
@@ -43,11 +50,16 @@ Ordered; later slices build on earlier ones. Each is a GitHub issue (label `rust
 
 Rust deps added along the way: `rusqlite` (bundled SQLite), `numpy`/`ndarray`, a file-lock crate (e.g. `fs2`).
 
-## Open design question (resolve at slice 2 / #10)
+## Open design question (resolve at slice 2 / #10) — resolved in the core/adapter split
 
-`turbovec` ships as a PyO3 Python extension. The Rust core must reach the ANN
-index either (a) via a native turbovec Rust crate if one is published, or (b) by
-calling the turbovec Python module back through PyO3. This affects slices 2/5/6.
+`turbovec` ships as a PyO3 Python extension, **and** (contrary to what was
+assumed here) is also published independently as a pure Rust crate on
+crates.io with no PyO3/numpy dependency. The Rust core depends on it
+directly (`turbovec = "0.9"` in `crates/turbovecdb-core/Cargo.toml`) rather
+than calling back through PyO3 — see `docs/rust-core-split-design.md`'s
+"The `turbovec` crate is real and pure" section for how this was confirmed
+and the BLAS-build-dependency risk it surfaced (resolved via a vendored
+static OpenBLAS build).
 
 ## Update (post-slice-2): slices 3–8 build one Rust `Collection`/`Database` class
 
@@ -83,4 +95,4 @@ green commits than one-per-slice.
   163-suite stays green** (green is trivial pre-flip since Python is unchanged;
   the flip in #17 is where the suite proves parity).
 - On done: commit → `git push origin feat/rust-core` → close the issue → mark the todo complete. (No pre-commit checkpoint.)
-- No PR to `main` until the cutover (#17).
+- [PR #27](https://github.com/kostadis/turbovecdb/pull/27) to `main` is open as a **draft**, accumulating `feat/rust-core`'s commits as they land (opened during the core/adapter split so each phase's diff is reviewable as it goes) — it stays draft and unmerged until #16 and #17 are done too.
