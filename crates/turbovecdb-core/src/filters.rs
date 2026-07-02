@@ -187,3 +187,134 @@ pub fn compile_where_document(wd: &Value) -> Result<(String, Vec<Value>), Filter
     let params = vec![Value::String(format!("%{}%", like_escape(needle)))];
     Ok(("document LIKE ? ESCAPE '\\'".to_string(), params))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn empty_or_null_where_compiles_to_nothing() {
+        assert_eq!(compile_where(&Value::Null, 0).unwrap(), (String::new(), vec![]));
+        assert_eq!(compile_where(&json!({}), 0).unwrap(), (String::new(), vec![]));
+    }
+
+    #[test]
+    fn bare_scalar_is_equality() {
+        let (sql, params) = compile_where(&json!({"lang": "en"}), 0).unwrap();
+        assert_eq!(sql, "json_extract(metadata, ?) = ?");
+        assert_eq!(params, vec![json!("$.lang"), json!("en")]);
+    }
+
+    #[test]
+    fn comparison_operators() {
+        for (op, sym) in [("$eq", "="), ("$ne", "!="), ("$gt", ">"), ("$gte", ">="), ("$lt", "<"), ("$lte", "<=")] {
+            let (sql, params) = compile_where(&json!({"year": {op: 2020}}), 0).unwrap();
+            assert_eq!(sql, format!("json_extract(metadata, ?) {sym} ?"));
+            assert_eq!(params, vec![json!("$.year"), json!(2020)]);
+        }
+    }
+
+    #[test]
+    fn in_and_nin() {
+        let (sql, params) = compile_where(&json!({"lang": {"$in": ["fr", "la"]}}), 0).unwrap();
+        assert_eq!(sql, "json_extract(metadata, ?) IN (?,?)");
+        assert_eq!(params, vec![json!("$.lang"), json!("fr"), json!("la")]);
+
+        let (sql, _) = compile_where(&json!({"lang": {"$nin": ["fr"]}}), 0).unwrap();
+        assert_eq!(sql, "json_extract(metadata, ?) NOT IN (?)");
+    }
+
+    #[test]
+    fn in_rejects_empty_list() {
+        let e = compile_where(&json!({"lang": {"$in": []}}), 0).unwrap_err();
+        assert!(e.0.contains("non-empty list"));
+    }
+
+    #[test]
+    fn and_or_recurse_and_join() {
+        let (sql, params) =
+            compile_where(&json!({"$and": [{"lang": "en"}, {"year": {"$gte": 2020}}]}), 0).unwrap();
+        assert_eq!(
+            sql,
+            "(json_extract(metadata, ?) = ?) AND (json_extract(metadata, ?) >= ?)"
+        );
+        assert_eq!(params.len(), 4);
+
+        let (sql, _) = compile_where(&json!({"$or": [{"a": 1}, {"b": 2}]}), 0).unwrap();
+        assert!(sql.contains(" OR "));
+    }
+
+    #[test]
+    fn logical_operator_rejects_sibling_keys() {
+        let e = compile_where(&json!({"$and": [{"a": 1}], "b": 2}), 0).unwrap_err();
+        assert!(e.0.contains("sibling keys"));
+    }
+
+    #[test]
+    fn unsupported_top_level_operator_rejected() {
+        let e = compile_where(&json!({"$not": {"a": 1}}), 0).unwrap_err();
+        assert!(e.0.contains("unsupported top-level operator"));
+    }
+
+    #[test]
+    fn unsupported_field_operator_rejected() {
+        let e = compile_where(&json!({"a": {"$bogus": 1}}), 0).unwrap_err();
+        assert!(e.0.contains("unsupported operator"));
+    }
+
+    #[test]
+    fn multi_operator_predicate_rejected() {
+        let e = compile_where(&json!({"a": {"$gt": 1, "$lt": 5}}), 0).unwrap_err();
+        assert!(e.0.contains("exactly one operator"));
+    }
+
+    #[test]
+    fn nesting_depth_is_bounded() {
+        // Build a chain of MAX_DEPTH + 2 nested $and wrappers.
+        let mut inner = json!({"a": 1});
+        for _ in 0..(MAX_DEPTH as usize + 2) {
+            inner = json!({"$and": [inner]});
+        }
+        let e = compile_where(&inner, 0).unwrap_err();
+        assert!(e.0.contains("nesting depth"));
+    }
+
+    #[test]
+    fn in_list_length_is_bounded() {
+        let items: Vec<i64> = (0..(MAX_IN_LIST as i64 + 1)).collect();
+        let e = compile_where(&json!({"a": {"$in": items}}), 0).unwrap_err();
+        assert!(e.0.contains("exceeds maximum"));
+    }
+
+    #[test]
+    fn where_must_be_a_mapping() {
+        let e = compile_where(&json!([1, 2]), 0).unwrap_err();
+        assert!(e.0.contains("must be a mapping"));
+    }
+
+    #[test]
+    fn where_document_contains() {
+        let (sql, params) = compile_where_document(&json!({"$contains": "fox"})).unwrap();
+        assert_eq!(sql, "document LIKE ? ESCAPE '\\'");
+        assert_eq!(params, vec![json!("%fox%")]);
+    }
+
+    #[test]
+    fn where_document_escapes_like_wildcards() {
+        let (_, params) = compile_where_document(&json!({"$contains": "100%_off\\"})).unwrap();
+        assert_eq!(params, vec![json!("%100\\%\\_off\\\\%")]);
+    }
+
+    #[test]
+    fn where_document_rejects_other_operators() {
+        let e = compile_where_document(&json!({"$startswith": "x"})).unwrap_err();
+        assert!(e.0.contains("only $contains"));
+    }
+
+    #[test]
+    fn null_scalar_value_is_valid_equality_operand() {
+        let (_, params) = compile_where(&json!({"a": null}), 0).unwrap();
+        assert_eq!(params, vec![json!("$.a"), Value::Null]);
+    }
+}

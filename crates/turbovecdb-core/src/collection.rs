@@ -1202,3 +1202,246 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedder::ConstantEmbedder;
+    use crate::index::FakeIndex;
+
+    fn temp_dir(name: &str) -> String {
+        let dir = std::env::temp_dir()
+            .join(format!("turbovecdb-core-collection-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.to_str().unwrap().to_string()
+    }
+
+    struct NamedEmbedder {
+        name: String,
+        dim: usize,
+    }
+
+    impl Embedder for NamedEmbedder {
+        fn embed(&self, docs: &[String]) -> Result<Array2<f32>, CoreError> {
+            Ok(Array2::from_elem((docs.len(), self.dim), 1.0 / (self.dim as f32).sqrt()))
+        }
+
+        fn identity(&self) -> String {
+            self.name.clone()
+        }
+    }
+
+    fn new_collection(dir: &str, dim: Option<i64>) -> Collection<ConstantEmbedder, FakeIndex> {
+        Collection::new(dir.to_string(), dim, 4, None, Some(ConstantEmbedder { dim: 8 })).unwrap()
+    }
+
+    fn vecs(rows: &[[f32; 8]]) -> Array2<f32> {
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        Array2::from_shape_vec((rows.len(), 8), flat).unwrap()
+    }
+
+    #[test]
+    fn add_and_get_roundtrip() {
+        let dir = temp_dir("add_get");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(
+            vec!["a".into(), "b".into()],
+            Some(vec!["doc-a".into(), "doc-b".into()]),
+            None,
+            Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.], [0., 1., 0., 0., 0., 0., 0., 0.]])),
+        )
+        .unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+        let r = c.get(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.ids, vec!["a", "b"]);
+        assert_eq!(r.documents, vec![Some("doc-a".to_string()), Some("doc-b".to_string())]);
+    }
+
+    #[test]
+    fn add_duplicate_id_errors() {
+        let dir = temp_dir("dup");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        let e = c
+            .add(vec!["a".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap_err();
+        match e {
+            CoreError::InvalidArgument(m) => assert!(m.contains("already exists")),
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upsert_replaces_existing() {
+        let dir = temp_dir("upsert");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], Some(vec!["v1".into()]), None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.upsert(vec!["a".into()], Some(vec!["v2".into()]), None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        assert_eq!(c.count().unwrap(), 1);
+        let r = c.get(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.documents, vec![Some("v2".to_string())]);
+    }
+
+    #[test]
+    fn dimension_mismatch_is_rejected() {
+        let dir = temp_dir("dimmismatch");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        let bad = Array2::from_shape_vec((1, 4), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+        let e = c.add(vec!["b".into()], None, None, Some(bad)).unwrap_err();
+        assert!(matches!(e, CoreError::DimensionMismatch(_)));
+    }
+
+    #[test]
+    fn delete_by_ids_and_where() {
+        let dir = temp_dir("delete");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(
+            vec!["a".into(), "b".into(), "c".into()],
+            None,
+            Some(vec![r#"{"k":1}"#.into(), r#"{"k":2}"#.into(), r#"{"k":1}"#.into()]),
+            Some(vecs(&[
+                [1., 0., 0., 0., 0., 0., 0., 0.],
+                [0., 1., 0., 0., 0., 0., 0., 0.],
+                [0., 0., 1., 0., 0., 0., 0., 0.],
+            ])),
+        )
+        .unwrap();
+        c.delete(Some(vec!["a".into()]), None).unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+        let filter = serde_json::json!({"k": 1});
+        c.delete(None, Some(&filter)).unwrap();
+        assert_eq!(c.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn clear_removes_everything_but_keeps_config() {
+        let dir = temp_dir("clear");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        c.clear().unwrap();
+        assert_eq!(c.count().unwrap(), 0);
+        assert_eq!(c.dim(), Some(8));
+    }
+
+    #[test]
+    fn update_metadata_and_documents() {
+        let dir = temp_dir("update");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], Some(vec!["orig".into()]), None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.update_documents(vec!["a".into()], vec!["updated".into()]).unwrap();
+        c.update_metadata(vec!["a".into()], vec![r#"{"x":1}"#.into()]).unwrap();
+        let include = ["documents".to_string(), "metadatas".to_string()];
+        let r = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r.documents, vec![Some("updated".to_string())]);
+        assert_eq!(r.metadatas, vec![r#"{"x":1}"#.to_string()]);
+    }
+
+    #[test]
+    fn update_missing_id_errors() {
+        let dir = temp_dir("update_missing");
+        let mut c = new_collection(&dir, Some(8));
+        let e = c.update_documents(vec!["nope".into()], vec!["x".into()]).unwrap_err();
+        assert!(matches!(e, CoreError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn query_returns_nearest_by_cosine() {
+        let dir = temp_dir("query");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(
+            vec!["a".into(), "b".into(), "c".into()],
+            None,
+            None,
+            Some(vecs(&[
+                [1., 0., 0., 0., 0., 0., 0., 0.],
+                [0., 1., 0., 0., 0., 0., 0., 0.],
+                [0.7071, 0.7071, 0., 0., 0., 0., 0., 0.],
+            ])),
+        )
+        .unwrap();
+        let q = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let r = c.query(None, Some(q), 1, None, None, None).unwrap();
+        assert_eq!(r.ids, vec!["a"]);
+    }
+
+    #[test]
+    fn health_reports_ok_and_coherence() {
+        let dir = temp_dir("health");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        let h = c.health().unwrap();
+        assert!(h.ok);
+        assert_eq!(h.doc_count, 1);
+    }
+
+    #[test]
+    fn flush_close_and_reopen_preserve_data() {
+        let dir = temp_dir("reopen");
+        {
+            let mut c = new_collection(&dir, Some(8));
+            c.add(vec!["a".into()], Some(vec!["hi".into()]), None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+                .unwrap();
+            c.close().unwrap();
+        }
+        let c2 = new_collection(&dir, None);
+        assert_eq!(c2.count().unwrap(), 1);
+        let h = c2.health().unwrap();
+        assert!(h.coherent);
+    }
+
+    #[test]
+    fn reembed_changes_dim_and_records_new_identity() {
+        let dir = temp_dir("reembed");
+        let mut c: Collection<NamedEmbedder, FakeIndex> = Collection::new(
+            dir,
+            Some(8),
+            4,
+            None,
+            Some(NamedEmbedder { name: "old-embedder".into(), dim: 8 }),
+        )
+        .unwrap();
+        c.add(
+            vec!["a".into(), "b".into()],
+            Some(vec!["x".into(), "y".into()]),
+            None,
+            Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.], [0., 1., 0., 0., 0., 0., 0., 0.]])),
+        )
+        .unwrap();
+        let report = c
+            .reembed(NamedEmbedder { name: "new-embedder".into(), dim: 8 }, None, None, 10, None, "error")
+            .unwrap();
+        assert_eq!(report.total_docs, 2);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(c.meta_get("embedder_identity").unwrap(), Some("new-embedder".to_string()));
+    }
+
+    #[test]
+    fn embedder_identity_mismatch_blocks_write() {
+        let dir = temp_dir("identity");
+        let mut c: Collection<NamedEmbedder, FakeIndex> = Collection::new(
+            dir.clone(),
+            Some(8),
+            4,
+            None,
+            Some(NamedEmbedder { name: "embedder-a".into(), dim: 8 }),
+        )
+        .unwrap();
+        c.add(vec!["a".into()], Some(vec!["x".into()]), None, None).unwrap();
+        drop(c);
+
+        let mut c2: Collection<NamedEmbedder, FakeIndex> = Collection::new(
+            dir,
+            Some(8),
+            4,
+            None,
+            Some(NamedEmbedder { name: "embedder-b".into(), dim: 8 }),
+        )
+        .unwrap();
+        let e = c2.add(vec!["b".into()], Some(vec!["y".into()]), None, None).unwrap_err();
+        assert!(matches!(e, CoreError::EmbedderIdentityMismatch(_)));
+    }
+}
