@@ -1,5 +1,9 @@
 # Rust core rewrite — plan & roadmap
 
+**Status: complete.** All nine slices (#9–#17) plus the interlude core/adapter
+split (#18–#26) are done; the rewrite landed on `main` via PR #27. This doc is
+the historical record of the plan and its evolution.
+
 Tracking doc for migrating turbovecdb's Python "core" engine to Rust. All work
 happens on the long-lived branch **`feat/rust-core`**; `main` stays Rust-free
 until the rewrite is complete, then lands as a single PR.
@@ -46,7 +50,7 @@ Ordered; later slices build on earlier ones. Each is a GitHub issue (label `rust
 | 6. reembed (atomic) | [#14](https://github.com/kostadis/turbovecdb/issues/14) | atomic two-phase reembed; carry the drop/keep + bug-A/B fixes |
 | 7. concurrency & coherence | [#15](https://github.com/kostadis/turbovecdb/issues/15) | file lock, in-proc lock, generation cache reload, WAL checkpoint, health() |
 | 8. Database layer | [#16](https://github.com/kostadis/turbovecdb/issues/16) (done) | `database.py`: connect, collection cache, list/delete_collection |
-| 9. cutover & cleanup | [#17](https://github.com/kostadis/turbovecdb/issues/17) | thin-shim/remove dead Python engine; full green; completion PR to `main` |
+| 9. cutover & cleanup | [#17](https://github.com/kostadis/turbovecdb/issues/17) (done) | thin-shim/remove dead Python engine; full green; completion PR to `main` — see `docs/rust-core-cutover-plan.md`: the flip had already happened incrementally (#14–#16), so this became dependency/docs cleanup + a clean-venv wheel parity proof |
 
 Rust deps added along the way: `rusqlite` (bundled SQLite), `numpy`/`ndarray`, a file-lock crate (e.g. `fs2`).
 
@@ -106,4 +110,4 @@ cache, locking, and the `delete_collection` race-guard dance are unchanged.
   163-suite stays green** (green is trivial pre-flip since Python is unchanged;
   the flip in #17 is where the suite proves parity).
 - On done: commit → `git push origin feat/rust-core` → close the issue → mark the todo complete. (No pre-commit checkpoint.)
-- [PR #27](https://github.com/kostadis/turbovecdb/pull/27) to `main` is open as a **draft**, accumulating `feat/rust-core`'s commits as they land (opened during the core/adapter split so each phase's diff is reviewable as it goes) — it stays draft and unmerged until #16 and #17 are done too.
+- [PR #27](https://github.com/kostadis/turbovecdb/pull/27) to `main` was opened as a **draft** during the core/adapter split, accumulating `feat/rust-core`'s commits as they landed so each phase's diff was reviewable as it went; it stayed draft until #16 and #17 were done, then merged as the completion PR.

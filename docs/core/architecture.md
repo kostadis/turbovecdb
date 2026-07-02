@@ -35,8 +35,11 @@ rebuilds the index from SQLite.
           └────────────────────────────────────────────────────────────────────┘
 ```
 
-Source: `src/turbovecdb/collection.py` (the engine), `database.py` (collection
-factory), `filters.py`, `index.py` (turbovec lifecycle), `errors.py`.
+Source: the engine is Rust — `crates/turbovecdb-core` (store, filters, index
+lifecycle, reembed) behind the `crates/turbovecdb-py` PyO3 adapter.
+`src/turbovecdb/*.py` is the thin public wrapper: `collection.py` /
+`database.py` own the locks, handle cache, and result dataclasses;
+`errors.py` the exception hierarchy.
 
 ## The write path — `add` / `upsert`
 
@@ -85,11 +88,10 @@ far cheaper than the alternative graph indexes' query path in practice (see
 
 | Concern | Where | Notes |
 |---|---|---|
-| Public API | `__init__.py`, `database.py` | `connect()`, `Database.collection()` |
-| Engine | `collection.py` | the read/write paths above; `QueryResult`/`GetResult` |
-| Index lifecycle | `index.py` | build / load / atomic write + L2 normalize |
-| Filters | `filters.py` | filter dict → SQL (see [data-model](data-model.md)) |
-| Errors | `errors.py` | `UnsupportedFilter`, `DimensionMismatch`, … |
+| Public API | `__init__.py`, `database.py`, `collection.py` | `connect()`, `Database.collection()`, locks + handle cache, `QueryResult`/`GetResult` dataclasses |
+| Engine | `crates/turbovecdb-core` | pure Rust: store, read/write paths above, index lifecycle, reembed, filter compiler (37+ `cargo test`s) |
+| Python↔Rust boundary | `crates/turbovecdb-py` | thin PyO3 adapter; `convert.rs` is the only place Python objects are constructed by name |
+| Errors | `errors.py` | `UnsupportedFilter`, `DimensionMismatch`, … (raised from Rust via `convert.rs`) |
 
 ## What turbovecdb is *not*
 

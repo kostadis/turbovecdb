@@ -21,8 +21,10 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Kostadis Rousoss", email = "kostadis@gmail.com" }]
 keywords = ["vector-database", "embeddings", "ann", "turbovec", "quantization"]
+# The turbovec ANN engine is a native Rust dependency of the extension module
+# (statically linked, OpenBLAS included) — the turbovec PyPI wheel is NOT a
+# runtime dependency anymore.
 dependencies = [
-    "turbovec>=0.7",
     "numpy>=1.21",
     "filelock>=3.12",
 ]
