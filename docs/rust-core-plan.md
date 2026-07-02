@@ -15,6 +15,16 @@ until the rewrite is complete, then lands as a single PR.
 - PyO3 crate scaffold (`Cargo.toml`, `rust/src/lib.rs`, maturin build backend).
 - `where` / `where_document` **filter compiler** ported to Rust; `turbovecdb.filters` is now a thin shim re-raising `_core.FilterError` as `UnsupportedFilterError`.
 
+## Interlude: core/adapter split (before #16)
+
+[#18](https://github.com/kostadis/turbovecdb/issues/18) found that the Rust
+engine built so far isn't a pure, standalone crate — it reaches back into
+Python for its own result/error types and its ANN index. See
+`docs/rust-core-split-design.md` for the fix: splitting into a pure
+`turbovecdb-core` crate plus a thin `turbovecdb-py` PyO3 adapter. This lands
+**before slice #16** below, so Database-in-Rust is authored directly against
+the clean shape instead of the tangled one.
+
 ## Roadmap
 
 Ordered; later slices build on earlier ones. Each is a GitHub issue (label `rust-core`).
