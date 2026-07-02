@@ -38,6 +38,8 @@ pub enum CoreError {
     Io(std::io::Error),
     /// -> `turbovecdb.errors.TurboVecError` (the root/catch-all class).
     Other(String),
+    /// -> `turbovecdb.errors.CollectionNotFoundError`.
+    CollectionNotFound(String),
 }
 
 impl fmt::Display for CoreError {
@@ -49,7 +51,8 @@ impl fmt::Display for CoreError {
             | CoreError::UnsupportedFilter(m)
             | CoreError::InvalidArgument(m)
             | CoreError::Runtime(m)
-            | CoreError::Other(m) => write!(f, "{m}"),
+            | CoreError::Other(m)
+            | CoreError::CollectionNotFound(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),
         }
