@@ -3,12 +3,6 @@
 //! callable. This is the legitimate, permanent Python callback the split
 //! design doesn't try to eliminate (see `docs/rust-core-split-design.md`):
 //! embedders are inherently user-supplied code.
-//!
-//! Wired into `Collection`'s ported write/query/reembed methods in split
-//! phase 5/8 (#24); today `Collection` still calls its `PyObject` embedder
-//! directly.
-
-#![allow(dead_code)] // consumed by split phase 5/8 (#24)
 
 use numpy::ndarray::{Array2, Ix2};
 use numpy::PyReadonlyArrayDyn;
@@ -46,6 +40,30 @@ impl Embedder for PyEmbedder {
                 .into_dimensionality::<Ix2>()
                 .map_err(|e| CoreError::Other(e.to_string()))?;
             Ok(arr)
+        })
+    }
+
+    /// Mirror of the historical `Collection::embedder_identity`.
+    fn identity(&self) -> String {
+        Python::with_gil(|py| {
+            let b = self.callable.bind(py);
+            if let Ok(name) = b.getattr("__name__") {
+                if let Ok(s) = name.extract::<String>() {
+                    return s;
+                }
+            }
+            if let Ok(cls) = b.getattr("__class__") {
+                let module = cls
+                    .getattr("__module__")
+                    .and_then(|m| m.extract::<String>())
+                    .unwrap_or_default();
+                let qn = cls
+                    .getattr("__name__")
+                    .and_then(|m| m.extract::<String>())
+                    .unwrap_or_default();
+                return format!("{module}.{qn}");
+            }
+            "unknown_embedder".to_string()
         })
     }
 }

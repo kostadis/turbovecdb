@@ -1,21 +1,14 @@
-"""turbovec index lifecycle helpers — implemented in the Rust core.
+"""Vector L2 normalization — implemented in the Rust core.
 
 The turbovec ``IdMapIndex`` maps ``uint64`` ids → quantized vectors. It is a
 *derived cache*: the durable copy of every vector is a float32 BLOB in SQLite,
-so the index can always be rebuilt. The lifecycle helpers (create / build /
-load / atomic write) plus vector L2 normalization now live in
-:mod:`turbovecdb._core`, which drives the turbovec Python API via PyO3
-(turbovec has no Rust crate). This module just re-exports them so callers keep
-importing ``turbovecdb.index``.
+so the index can always be rebuilt. `Collection`'s Rust core owns the index
+lifecycle directly against the native ``turbovec`` crate (see
+``docs/rust-core-split-design.md``); this module now only re-exports vector
+L2 normalization, which remains a standalone public helper.
 """
 
-from ._core import (  # noqa: F401
-    build_index,
-    l2_normalize,
-    load_index,
-    new_index,
-    write_index_atomic,
-)
+from ._core import l2_normalize  # noqa: F401
 
 # turbovec's bit menu is {2, 3, 4}; 4 is the recall ceiling.
 DEFAULT_BIT_WIDTH = 4

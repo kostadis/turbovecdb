@@ -22,10 +22,19 @@ pub enum CoreError {
     EmbedderIdentityMismatch(String),
     /// -> `turbovecdb.errors.UnsupportedFilterError`
     UnsupportedFilter(String),
+    /// -> a plain `ValueError` (bad argument shape/value — length mismatches,
+    /// "already exists", "not found", etc.). Matches the many historical
+    /// `PyValueError::new_err(...)` call sites that never raised a
+    /// `turbovecdb.errors.*` class.
+    InvalidArgument(String),
+    /// -> a plain `RuntimeError` (matches the historical "X: meta update
+    /// failed" call sites, which deliberately swallowed the underlying
+    /// error and raised a generic one instead).
+    Runtime(String),
     /// -> a plain `RuntimeError` (matches the historical `sql_err()` helper,
     /// which never raised a `turbovecdb.errors.*` class for SQL failures).
     Sql(rusqlite::Error),
-    /// -> a plain `RuntimeError` / `OSError`, case by case at the call site.
+    /// -> a plain `RuntimeError`.
     Io(std::io::Error),
     /// -> `turbovecdb.errors.TurboVecError` (the root/catch-all class).
     Other(String),
@@ -38,6 +47,8 @@ impl fmt::Display for CoreError {
             | CoreError::EmbedderRequired(m)
             | CoreError::EmbedderIdentityMismatch(m)
             | CoreError::UnsupportedFilter(m)
+            | CoreError::InvalidArgument(m)
+            | CoreError::Runtime(m)
             | CoreError::Other(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),

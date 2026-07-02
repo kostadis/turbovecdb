@@ -12,10 +12,9 @@ keep + real dim change is a clean error; and the whole rewrite is atomic.
 """
 import numpy as np
 import pytest
-import turbovec
 
 import turbovecdb
-from turbovecdb.errors import DimensionMismatchError
+from turbovecdb.errors import DimensionMismatchError, TurboVecError
 
 
 def e8(texts):
@@ -101,9 +100,16 @@ def test_reembed_keep_with_dim_change_raises_and_is_intact(tmp_path):
     assert _byte_lengths(coll_dir) == [32, 32, 32]
 
 
-def test_reembed_rolls_back_when_index_rebuild_fails(tmp_path, monkeypatch):
+def test_reembed_rolls_back_when_index_rebuild_fails(tmp_path):
     """Force a failure AFTER the DML (during index rebuild) and prove the whole
-    re-embed rolls back — this is the phase-2 rollback branch."""
+    re-embed rolls back — this is the phase-2 rollback branch.
+
+    The index build now happens in Rust against the native turbovec crate
+    directly (no Python turbovec.IdMapIndex call left to monkeypatch), so the
+    failure is triggered by an embedder returning a dimension turbovec's
+    index construction rejects outright: not a positive multiple of 8. That
+    surfaces exactly at reload_index()'s rebuild step, after the DML has
+    already run — the same rollback branch the old monkeypatch exercised."""
     db = turbovecdb.connect(str(tmp_path / "db"))
     coll_dir = str(tmp_path / "db" / "c")
     c = db.collection("c", dim=8, create=True)
@@ -112,14 +118,11 @@ def test_reembed_rolls_back_when_index_rebuild_fails(tmp_path, monkeypatch):
           vectors=e8(["hi", "yo", "hey", "sup"]))
     before = c.count()
 
-    def exploding_index(*args, **kwargs):
-        raise RuntimeError("simulated index rebuild failure")
+    def bad_dim_embedder(texts):
+        return np.array([[1.0] * 5 for _ in texts], dtype=np.float32)
 
-    # The Rust core builds the index by calling turbovec.IdMapIndex directly.
-    monkeypatch.setattr(turbovec, "IdMapIndex", exploding_index)
-    with pytest.raises(RuntimeError):
-        c.reembed(e8, batch_size=2)  # embeds fine; blows up rebuilding the index
-    monkeypatch.undo()
+    with pytest.raises(TurboVecError):
+        c.reembed(bad_dim_embedder, batch_size=2)  # embeds fine; blows up rebuilding the index
 
     # Nothing committed: count, dim, and vectors are exactly as before.
     assert c.count() == before

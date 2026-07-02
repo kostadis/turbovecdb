@@ -16,7 +16,12 @@
 
 use crate::error::CoreError;
 
-pub trait VectorIndex: Send {
+pub trait VectorIndex: Send
+where
+    Self: Sized,
+{
+    fn new(dim: usize, bit_width: usize) -> Result<Self, CoreError>;
+    fn load(path: &str) -> Result<Self, CoreError>;
     fn add_with_ids(&mut self, vectors: &[f32], ids: &[u64]) -> Result<(), CoreError>;
     fn remove(&mut self, id: u64) -> bool;
     /// Row-major `(scores, ids)` for the top-`k` matches per query row.
@@ -28,16 +33,6 @@ pub trait VectorIndex: Send {
 pub struct TurbovecIndex(turbovec::IdMapIndex);
 
 impl TurbovecIndex {
-    pub fn new(dim: usize, bit_width: usize) -> Result<Self, CoreError> {
-        turbovec::IdMapIndex::new(dim, bit_width)
-            .map(Self)
-            .map_err(|e| CoreError::Other(e.to_string()))
-    }
-
-    pub fn load(path: &str) -> Result<Self, CoreError> {
-        turbovec::IdMapIndex::load(path).map(Self).map_err(CoreError::from)
-    }
-
     pub fn dim(&self) -> usize {
         self.0.dim()
     }
@@ -48,6 +43,16 @@ impl TurbovecIndex {
 }
 
 impl VectorIndex for TurbovecIndex {
+    fn new(dim: usize, bit_width: usize) -> Result<Self, CoreError> {
+        turbovec::IdMapIndex::new(dim, bit_width)
+            .map(Self)
+            .map_err(|e| CoreError::Other(e.to_string()))
+    }
+
+    fn load(path: &str) -> Result<Self, CoreError> {
+        turbovec::IdMapIndex::load(path).map(Self).map_err(CoreError::from)
+    }
+
     fn add_with_ids(&mut self, vectors: &[f32], ids: &[u64]) -> Result<(), CoreError> {
         self.0
             .add_with_ids(vectors, ids)
@@ -74,14 +79,25 @@ pub(crate) struct FakeIndex {
 }
 
 #[cfg(test)]
-impl FakeIndex {
-    pub fn new(dim: usize) -> Self {
-        Self { dim, entries: Vec::new() }
-    }
-}
-
-#[cfg(test)]
 impl VectorIndex for FakeIndex {
+    fn new(dim: usize, _bit_width: usize) -> Result<Self, CoreError> {
+        Ok(Self { dim, entries: Vec::new() })
+    }
+
+    fn load(path: &str) -> Result<Self, CoreError> {
+        let data = std::fs::read_to_string(path).map_err(CoreError::from)?;
+        let mut lines = data.lines();
+        let dim: usize = lines.next().unwrap_or("0").parse().unwrap_or(0);
+        let mut entries = Vec::new();
+        for line in lines {
+            let mut parts = line.split(',');
+            let id: u64 = parts.next().unwrap().parse().unwrap();
+            let row: Vec<f32> = parts.map(|p| p.parse().unwrap()).collect();
+            entries.push((id, row));
+        }
+        Ok(Self { dim, entries })
+    }
+
     fn add_with_ids(&mut self, vectors: &[f32], ids: &[u64]) -> Result<(), CoreError> {
         for (i, &id) in ids.iter().enumerate() {
             let row = vectors[i * self.dim..(i + 1) * self.dim].to_vec();
@@ -117,8 +133,13 @@ impl VectorIndex for FakeIndex {
         (scores, ids)
     }
 
-    fn write(&self, _path: &str) -> Result<(), CoreError> {
-        Ok(())
+    fn write(&self, path: &str) -> Result<(), CoreError> {
+        let mut out = format!("{}\n", self.dim);
+        for (id, row) in &self.entries {
+            let row_str: Vec<String> = row.iter().map(|f| f.to_string()).collect();
+            out.push_str(&format!("{},{}\n", id, row_str.join(",")));
+        }
+        std::fs::write(path, out).map_err(CoreError::from)
     }
 }
 
@@ -128,7 +149,7 @@ mod tests {
 
     #[test]
     fn add_search_remove_roundtrip() {
-        let mut idx = FakeIndex::new(2);
+        let mut idx = FakeIndex::new(2, 4).unwrap();
         idx.add_with_ids(&[0.0, 0.0, 1.0, 1.0, 2.0, 2.0], &[10, 20, 30]).unwrap();
         let (_, ids) = idx.search(&[0.1, 0.1], 1, None);
         assert_eq!(ids, vec![10]);

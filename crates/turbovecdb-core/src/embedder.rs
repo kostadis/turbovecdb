@@ -13,8 +13,17 @@ use ndarray::Array2;
 use crate::error::CoreError;
 
 pub trait Embedder: Send {
-    /// Embed a batch of documents, returning one row per document.
+    /// Embed a batch of documents, returning one L2-normalized row per
+    /// document (row-normalization is the caller's contract — `Collection`
+    /// relies on embedder output already being unit-norm, matching the
+    /// historical `resolve_vectors`, which normalized the embedder's output
+    /// exactly once at the call site).
     fn embed(&self, docs: &[String]) -> Result<Array2<f32>, CoreError>;
+
+    /// A stable string identifying this embedder (its Python
+    /// `__name__`/`__class__` today). Persisted so `Collection` can detect
+    /// an accidental embedder swap on the write path (the "GAP-1 guard").
+    fn identity(&self) -> String;
 }
 
 #[cfg(test)]
@@ -25,7 +34,11 @@ pub(crate) struct ConstantEmbedder {
 #[cfg(test)]
 impl Embedder for ConstantEmbedder {
     fn embed(&self, docs: &[String]) -> Result<Array2<f32>, CoreError> {
-        Ok(Array2::from_elem((docs.len(), self.dim), 1.0f32))
+        Ok(Array2::from_elem((docs.len(), self.dim), 1.0f32 / (self.dim as f32).sqrt()))
+    }
+
+    fn identity(&self) -> String {
+        "ConstantEmbedder".to_string()
     }
 }
 
