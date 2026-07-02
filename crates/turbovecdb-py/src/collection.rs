@@ -56,16 +56,6 @@ fn sql_err(e: rusqlite::Error) -> PyErr {
     PyRuntimeError::new_err(format!("sqlite error: {e}"))
 }
 
-/// Raise one of the public `turbovecdb.errors.*` classes so behavior (and
-/// tests) match the Python engine once flipped.
-fn turbovec_error(py: Python<'_>, cls: &str, msg: String) -> PyErr {
-    let build = || -> PyResult<PyErr> {
-        let c = py.import_bound("turbovecdb.errors")?.getattr(cls)?;
-        Ok(PyErr::from_value_bound(c.call1((msg,))?))
-    };
-    build().unwrap_or_else(|e| e)
-}
-
 fn blob_to_f32(blob: &[u8]) -> impl Iterator<Item = f32> + '_ {
     blob.chunks_exact(4)
         .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
@@ -166,7 +156,7 @@ impl Collection {
 
     fn commit_dim(&mut self, py: Python<'_>, dim: i64) -> PyResult<()> {
         if dim <= 0 || dim % 8 != 0 {
-            return Err(turbovec_error(
+            return Err(crate::convert::turbovec_error(
                 py,
                 "DimensionMismatchError",
                 format!("turbovec requires dim to be a positive multiple of 8, got {dim}"),
@@ -293,7 +283,7 @@ impl Collection {
             )
         })?;
         let emb = self.embedder.as_ref().ok_or_else(|| {
-            turbovec_error(
+            crate::convert::turbovec_error(
                 py,
                 "EmbedderRequiredError",
                 "text was provided but this collection has no embedder; pass vectors instead, \
@@ -305,7 +295,7 @@ impl Collection {
         if let Some(stored) = self.meta_get("embedder_identity")? {
             let current = self.embedder_identity(py, emb)?;
             if current != stored {
-                return Err(turbovec_error(
+                return Err(crate::convert::turbovec_error(
                     py,
                     "EmbedderIdentityMismatchError",
                     format!(
@@ -387,7 +377,7 @@ impl Collection {
     /// public engine raises `UnsupportedFilterError`. Re-wrap so behavior
     /// matches.
     fn map_filter_err(&self, py: Python<'_>, e: filters::FilterError) -> PyErr {
-        turbovec_error(py, "UnsupportedFilterError", e.0)
+        crate::convert::turbovec_error(py, "UnsupportedFilterError", e.0)
     }
 
     fn empty_query_result(&self, py: Python<'_>, inc_vectors: bool) -> PyResult<PyObject> {
@@ -609,7 +599,7 @@ impl Collection {
         let coherent = store_gen == tvim_gen;
         let ok = qc == "ok";
         if !ok {
-            return Err(turbovec_error(
+            return Err(crate::convert::turbovec_error(
                 py,
                 "TurboVecError",
                 format!("SQLite integrity check failed for {:?}: {}", self.dir, qc),
@@ -897,7 +887,7 @@ impl Collection {
         // Normalized query vector, shape (1, dim).
         let q: Bound<numpy::PyArray2<f32>> = if let Some(t) = text {
             let emb = self.embedder.as_ref().ok_or_else(|| {
-                turbovec_error(
+                crate::convert::turbovec_error(
                     py,
                     "EmbedderRequiredError",
                     "text was provided but this collection has no embedder; pass vectors \
@@ -1155,7 +1145,7 @@ impl Collection {
         }
         if let Some(dd) = dim {
             if dd <= 0 || dd % 8 != 0 {
-                return Err(turbovec_error(
+                return Err(crate::convert::turbovec_error(
                     py,
                     "DimensionMismatchError",
                     format!("turbovec requires dim to be a positive multiple of 8, got {dd}"),
@@ -1235,7 +1225,7 @@ impl Collection {
             let vro = normed.readonly();
             let view = vro.as_array();
             if view.shape()[0] != b_uids.len() {
-                return Err(turbovec_error(
+                return Err(crate::convert::turbovec_error(
                     py,
                     "DimensionMismatchError",
                     format!(
@@ -1248,7 +1238,7 @@ impl Collection {
             match new_dim {
                 None => new_dim = Some(bdim),
                 Some(nd) if bdim != nd => {
-                    return Err(turbovec_error(
+                    return Err(crate::convert::turbovec_error(
                         py,
                         "DimensionMismatchError",
                         format!(
@@ -1272,7 +1262,7 @@ impl Collection {
         let new_dim_v = new_dim.unwrap_or(old_dim);
         if let Some(dd) = dim {
             if new_dim_v != dd {
-                return Err(turbovec_error(
+                return Err(crate::convert::turbovec_error(
                     py,
                     "DimensionMismatchError",
                     format!(
@@ -1282,7 +1272,7 @@ impl Collection {
             }
         }
         if !keep.is_empty() && new_dim_v != old_dim {
-            return Err(turbovec_error(
+            return Err(crate::convert::turbovec_error(
                 py,
                 "DimensionMismatchError",
                 format!(
@@ -1413,7 +1403,7 @@ impl Collection {
             self.commit_dim(py, vdim)?;
             self.index = Some(self.make_index(py)?);
         } else if Some(vdim) != self.dim {
-            return Err(turbovec_error(
+            return Err(crate::convert::turbovec_error(
                 py,
                 "DimensionMismatchError",
                 format!("vector dim {} != collection dim {}", vdim, self.dim.unwrap()),

@@ -21,6 +21,8 @@ use serde_json::Value as Json;
 use turbovecdb_core::filters;
 
 mod collection;
+mod convert;
+mod embedder;
 
 create_exception!(_core, FilterError, PyException);
 
