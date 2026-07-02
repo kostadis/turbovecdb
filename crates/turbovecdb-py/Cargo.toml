@@ -1,0 +1,16 @@
+[package]
+name = "turbovecdb-py"
+version = "0.1.0"
+edition = "2021"
+description = "PyO3 adapter for turbovecdb — compiles to the extension module turbovecdb._core"
+license = "MIT"
+
+[lib]
+name = "_core"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["abi3-py39", "extension-module"] }
+numpy = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }

@@ -1,0 +1,8 @@
+[package]
+name = "turbovecdb-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust engine for turbovecdb (no PyO3/Python dependency)"
+license = "MIT"
+
+[dependencies]

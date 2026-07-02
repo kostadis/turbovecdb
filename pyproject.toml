@@ -4,7 +4,10 @@ build-backend = "maturin"
 
 [tool.maturin]
 # Mixed Python/Rust project: Python package lives in src/, the Rust core is
-# compiled into the extension module turbovecdb._core.
+# compiled into the extension module turbovecdb._core. The Rust side is a
+# Cargo workspace (see docs/rust-core-split-design.md): turbovecdb-core is
+# the pure engine, turbovecdb-py is the PyO3 adapter maturin actually builds.
+manifest-path = "crates/turbovecdb-py/Cargo.toml"
 python-source = "src"
 module-name = "turbovecdb._core"
 features = ["pyo3/extension-module"]
