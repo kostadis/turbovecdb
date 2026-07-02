@@ -1,6 +1,17 @@
 # Architecture
 
-System map for turbovecdb (v0.2.0). Read this first; drill into the per-area docs in [Detailed docs](#detailed-docs) when you need depth. The whole library is ~725 lines of Python across five modules, so this map is close to the territory.
+> **Implementation note (Rust rewrite).** This document was written against the
+> v0.2.0 pure-Python implementation, and its file/line references
+> (`collection.py:316` etc.) describe that code. The engine has since moved to
+> Rust: the design below — the two-tier store, the invariants, the read/write
+> paths, generations, locking — carried over 1:1, but the code now lives in
+> `crates/turbovecdb-core` (pure engine) and `crates/turbovecdb-py` (PyO3
+> adapter), with `src/turbovecdb/*.py` reduced to a thin wrapper that owns the
+> locks and the public dataclasses. Read this for the *design*; for current
+> code pointers see [rust-core-plan.md](rust-core-plan.md) and
+> [rust-core-split-design.md](rust-core-split-design.md).
+
+System map for turbovecdb (v0.2.0). Read this first; drill into the per-area docs in [Detailed docs](#detailed-docs) when you need depth.
 
 ## What this system is
 

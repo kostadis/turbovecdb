@@ -1,64 +1,36 @@
-"""The turbovecdb Collection — turbovec ANN + a durable SQLite sidecar.
+"""Collection — a thin Python wrapper over the Rust core (``turbovecdb._core``).
 
-Storage layout (one directory per collection)::
+The storage engine (rusqlite store + turbovec index + query/reembed) now lives in
+Rust. This wrapper owns the cross-process file lock (a Python ``filelock``, held
+around every write) and the in-process lock, exposes the historical
+``turbovecdb.Collection`` API, and delegates the real work to
+``_core.Collection``.
+
+The result dataclasses live here because the Rust core constructs them by name
+(``turbovecdb.collection.QueryResult`` etc.).
+
+Storage layout (one directory per collection) is unchanged::
 
     <dir>/store.sqlite3     durable source of truth (WAL)
     <dir>/index.tvim        rebuildable turbovec cache
     <dir>/write.lock        cross-process write lock (filelock)
-
-SQLite::
-
-    docs(uid INTEGER PRIMARY KEY,     -- turbovec external uint64 id
-         str_id TEXT UNIQUE NOT NULL, -- caller's string id
-         document TEXT, metadata TEXT,-- metadata is JSON
-         vector BLOB)                 -- float32 bytes, L2-normalized
-    meta(key TEXT PRIMARY KEY, value TEXT)
-
-``meta`` holds ``dim``, ``bit_width``, ``metric``, ``next_uid`` and two
-generation counters:
-
-* ``store_gen`` — bumped on every committed write.
-* ``tvim_gen``  — the ``store_gen`` the on-disk ``index.tvim`` reflects.
-
-Concurrency. Writes take a cross-process ``filelock`` and, under it, refresh
-``meta`` and reload the index if another process advanced ``store_gen`` — so
-multiple writers never collide on uids or lose each other's rows. Reads are
-lock-free: each query/get first reads ``store_gen`` and, if it advanced past
-what this handle last saw, reloads the index (loading ``index.tvim`` when it is
-current, else rebuilding from the SQLite vectors). SQLite is always the source
-of truth; the ``.tvim`` is flushed on ``flush()``/``close()`` and is purely an
-accelerator for the next cold start.
-
-Distance. With ``metric="cosine"`` (the only metric today) the stored vectors
-are L2-normalized and ``query`` returns ``distance = 1 - cosine ∈ [0, 2]`` via an
-exact re-rank of the turbovec candidate pool — so turbovec's approximate,
-unnormalized scores never reach the caller.
 """
 
-import json
 import logging
 import os
-import sqlite3
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
-_log = logging.getLogger(__name__)
-_SQL_CHUNK = 900  # stay under SQLITE_MAX_VARIABLE_NUMBER on all SQLite builds
-
-import numpy as np
 from filelock import FileLock, Timeout
 
-from . import index as _idx
-from .errors import DimensionMismatchError, EmbedderIdentityMismatchError, EmbedderRequiredError
-from .filters import combined_sql, where_to_sql
+from ._core import Collection as _CoreCollection
+from .errors import TurboVecError
+from .index import DEFAULT_BIT_WIDTH
 
-_RERANK_FLOOR = 50
-_VALID_INCLUDE = frozenset({"documents", "metadatas", "distances", "vectors"})
+_log = logging.getLogger(__name__)
 _LOCK_TIMEOUT = 30
-_SCHEMA_VERSION = 1
-_REBUILD_BATCH_SIZE = 10000
 
 
 @dataclass
@@ -83,16 +55,8 @@ class GetResult:
 
 @dataclass
 class HealthResult:
-    """Result of a ``Collection.health()`` check.
+    """Result of a ``Collection.health()`` check."""
 
-    Attributes:
-        ok: True if both SQLite and the index are healthy and coherent
-        quick_check: Raw result of ``PRAGMA quick_check``
-        store_gen: Current committed-write counter
-        tvim_gen: Counter that the cached index reflects
-        coherent: True if the cache is up-to-date with the store
-        doc_count: Number of documents in the SQLite store
-    """
     ok: bool
     quick_check: str
     store_gen: int
@@ -103,15 +67,8 @@ class HealthResult:
 
 @dataclass
 class ReembedReport:
-    """Result of a ``Collection.reembed()`` operation.
+    """Result of a ``Collection.reembed()`` operation."""
 
-    Attributes:
-        total_docs: Total number of documents processed
-        old_dim: Dimension before re-embedding
-        new_dim: Dimension after re-embedding
-        skipped: Number of documents skipped (due to empty content or drop policy)
-        elapsed_seconds: Total time taken in seconds
-    """
     total_docs: int
     old_dim: int
     new_dim: int
@@ -119,814 +76,108 @@ class ReembedReport:
     elapsed_seconds: float
 
 
-def _resolve_include(include, *, default_distances):
-    if include is None:
-        keys = {"documents", "metadatas"}
-        if default_distances:
-            keys.add("distances")
-    else:
-        keys = {k for k in include if k in _VALID_INCLUDE}
-    return {
-        "documents": "documents" in keys,
-        "metadatas": "metadatas" in keys,
-        "distances": "distances" in keys,
-        "vectors": "vectors" in keys,
-    }
+def _inc(include):
+    """Normalize an ``include`` argument for the Rust core (list or None)."""
+    return list(include) if include is not None else None
 
 
 class Collection:
-    def __init__(self, coll_dir, *, dim=None, bit_width=_idx.DEFAULT_BIT_WIDTH,
+    def __init__(self, coll_dir, *, dim=None, bit_width=DEFAULT_BIT_WIDTH,
                  metric="cosine", embedder=None, lock_timeout=_LOCK_TIMEOUT):
-        if metric != "cosine":
-            raise ValueError(f"unsupported metric {metric!r} (only 'cosine' for now)")
         self.dir = coll_dir
-        os.makedirs(coll_dir, exist_ok=True)
-        self._db_path = os.path.join(coll_dir, "store.sqlite3")
-        self._tvim_path = os.path.join(coll_dir, "index.tvim")
-        self._metric = metric
-        self._embedder = embedder
-        self._tlock = threading.RLock()      # in-process structure guard
+        self._tlock = threading.RLock()  # in-process structure guard
+        # Cross-process write lock. Held around every write; the Rust core does
+        # not lock, so this wrapper is the sole serialization point.
         self._flock = FileLock(os.path.join(coll_dir, "write.lock"), timeout=lock_timeout)
-        self._dirty = False
+        self._has_embedder = embedder is not None
+        self._core = _CoreCollection(coll_dir, dim, bit_width, metric, embedder, lock_timeout)
 
-        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS docs ("
-            "uid INTEGER PRIMARY KEY, str_id TEXT UNIQUE NOT NULL, "
-            "document TEXT, metadata TEXT, vector BLOB)"
-        )
-        self._conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
-        self._conn.commit()
-
-        self._bit_width = int(self._meta_get("bit_width", bit_width))
-        self._meta_set("bit_width", self._bit_width)
-        self._meta_set("metric", metric)
-        stored_dim = self._meta_get("dim", None)
-        self._dim = int(stored_dim) if stored_dim is not None else None
-        if self._dim is None and dim is not None:
-            self._commit_dim(int(dim))
-        self._next_uid = int(self._meta_get("next_uid", 0))
-        self._conn.commit()
-
-        self._migrate_schema()
-
-        # Store embedder identity on first creation so that subsequent
-        # opens with a different embedder are caught by the write-path guard.
-        if self._embedder is not None:
-            stored = self._meta_get("embedder_identity")
-            if stored is None:
-                self._meta_set("embedder_identity", self._get_embedder_identity(self._embedder))
-                self._conn.commit()
-
-        self._index = None
-        self._seen_gen = -1
-        self._reload_index()
+    def _warn_vectors_bypass(self, vectors):
+        if vectors is not None and self._has_embedder:
+            _log.warning(
+                "add/upsert with vectors= bypasses the configured embedder; use "
+                "documents= to embed via the collection's embedder"
+            )
 
     @contextmanager
     def _locked(self):
         """Acquire the in-process lock and cross-process file lock.
 
-        Raises ``TurboVecError`` if the file lock cannot be acquired within
-        the configured timeout (prevents indefinite blocking when a writer
-        crashes while holding the lock).
-        """
+        Raises ``TurboVecError`` if the file lock cannot be acquired within the
+        configured timeout (prevents indefinite blocking when a writer crashes
+        while holding the lock)."""
         with self._tlock:
             try:
                 with self._flock:
                     yield
             except Timeout:
-                from .errors import TurboVecError
                 raise TurboVecError(
                     f"could not acquire write lock on {self.dir!r} within "
                     f"{self._flock.timeout:.1f}s"
                 )
 
-    # -- meta -----------------------------------------------------------------
-
-    def _meta_get(self, key, default=None):
-        row = self._conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
-        return row[0] if row is not None else default
-
-    def _meta_set(self, key, value):
-        self._conn.execute(
-            "INSERT INTO meta(key, value) VALUES(?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
-        )
-
-    def _store_gen(self):
-        return int(self._meta_get("store_gen", 0))
-
-    def _commit_dim(self, dim):
-        if dim <= 0 or dim % 8 != 0:
-            raise DimensionMismatchError(
-                f"turbovec requires dim to be a positive multiple of 8, got {dim}"
-            )
-        self._dim = dim
-        self._meta_set("dim", dim)
-
-    # -- schema migration ----------------------------------------------------
-
-    def _migrate_schema(self):
-        """Forward-only schema migration. Runs at most once per collection open."""
-        stored_version = int(self._meta_get("schema_version", 0))
-        if stored_version >= _SCHEMA_VERSION:
-            return
-        # Apply pending migrations sequentially.
-        for version in range(stored_version + 1, _SCHEMA_VERSION + 1):
-            meth = getattr(self, f"_migrate_v{version}", None)
-            if meth is not None:
-                meth()
-        self._meta_set("schema_version", _SCHEMA_VERSION)
-        self._conn.commit()
-
-    # -- index lifecycle ------------------------------------------------------
-
-    def _reload_index(self):
-        """(Re)build the in-memory index to reflect the current store_gen.
-
-        Vectors are loaded from SQLite in batches of ``_REBUILD_BATCH_SIZE``
-        to keep peak memory bounded on large collections.
-
-        On failure the ``_seen_gen`` is still advanced so that callers do not
-        enter an infinite retry loop.  The partially-built index is discarded
-        (set to ``None``) to avoid serving incomplete results.
-        """
-        if self._dim is None:
-            self._index = None
-            self._seen_gen = self._store_gen()
-            return
-        store_gen = self._store_gen()
-        tvim_gen = int(self._meta_get("tvim_gen", -1))
-        if os.path.exists(self._tvim_path) and tvim_gen == store_gen:
-            try:
-                self._index = _idx.load_index(self._tvim_path)
-                self._seen_gen = store_gen
-                return
-            except Exception:
-                pass
-        self._index = _idx.new_index(self._dim, self._bit_width)
-        last_uid = -1
-        try:
-            while True:
-                rows = self._conn.execute(
-                    "SELECT uid, vector FROM docs WHERE uid > ? ORDER BY uid LIMIT ?",
-                    (last_uid, _REBUILD_BATCH_SIZE),
-                ).fetchall()
-                if not rows:
-                    break
-                batch_uids = [int(r[0]) for r in rows]
-                batch_vecs = np.stack(
-                    [np.frombuffer(r[1], dtype=np.float32) for r in rows]
-                ).astype(np.float32, copy=False)
-                self._index.add_with_ids(
-                    np.ascontiguousarray(batch_vecs),
-                    np.array(batch_uids, dtype=np.uint64),
-                )
-                last_uid = batch_uids[-1]
-        except Exception:
-            # Advance seen_gen to prevent infinite retry loop; create an
-            # empty index so the write path (which calls _ensure_current
-            # under the lock) does not crash.
-            self._index = _idx.new_index(self._dim, self._bit_width)
-            self._seen_gen = store_gen
-            raise
-        self._seen_gen = store_gen
-        self._dirty = True
-
-    def _ensure_current(self):
-        """Cheap staleness check for readers: reload if another writer advanced
-        store_gen past what this handle last saw."""
-        if self._store_gen() != self._seen_gen:
-            self._reload_index()
-
-    def _commit(self):
-        """Commit the current transaction, keeping the cache and store in sync.
-
-        The write paths mirror their changes into the in-memory turbovec index
-        *before* committing. If the commit fails (e.g. ``SQLITE_FULL``, an I/O
-        error) SQLite rolls the transaction back, but the in-memory index has
-        already been mutated. Because ``store_gen`` never advanced and
-        ``_seen_gen`` was not updated, ``_ensure_current`` would never notice
-        the mismatch and the cache would silently diverge from the durable
-        store for the life of this handle.
-
-        On failure we therefore invalidate the index so the next access rebuilds
-        it from the committed SQLite state — the source of truth.
-        """
-        try:
-            self._conn.commit()
-        except Exception:
-            self._index = None
-            self._seen_gen = -1
-            raise
-
-    def _checkpoint_wal(self):
-        """Truncate the WAL to prevent unbounded growth on busy writers."""
-        try:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except Exception:
-            _log.warning("WAL checkpoint failed", exc_info=True)
-
-    def flush(self):
-        """Persist the in-memory index to ``index.tvim`` (a cache for cold start).
-
-        Takes the cross-process write lock because it writes ``tvim_gen`` to
-        SQLite — that write must be serialized with other processes' writers."""
-        with self._locked():
-            if self._index is None or not self._dirty:
-                return
-            _idx.write_index_atomic(self._index, self._tvim_path)
-            self._meta_set("tvim_gen", self._store_gen())
-            self._conn.commit()
-            self._checkpoint_wal()
-            self._dirty = False
-
-    # -- embedding ------------------------------------------------------------
-
-    def _embed(self, texts):
-        if self._embedder is None:
-            raise EmbedderRequiredError(
-                "text was provided but this collection has no embedder; "
-                "pass vectors instead, or create the collection with embedder=..."
-            )
-        return np.asarray(self._embedder(list(texts)), dtype=np.float32)
-
-    # -- writes ---------------------------------------------------------------
+    # -- writes (serialized by the file lock) ---------------------------------
 
     def add(self, *, ids, documents=None, metadatas=None, vectors=None):
-        self._write(ids=ids, documents=documents, metadatas=metadatas,
-                    vectors=vectors, replace=False)
+        self._warn_vectors_bypass(vectors)
+        with self._locked():
+            self._core.add(ids, documents, metadatas, vectors)
 
     def upsert(self, *, ids, documents=None, metadatas=None, vectors=None):
-        self._write(ids=ids, documents=documents, metadatas=metadatas,
-                    vectors=vectors, replace=True)
-
-    def _resolve_vectors(self, documents, vectors, n):
-        if vectors is not None:
-            if self._embedder is not None:
-                _log.warning(
-                    "add/upsert with vectors= bypasses the configured embedder "
-                    "(%s); use documents= to embed via the collection's embedder",
-                    self._get_embedder_identity(self._embedder),
-                )
-            return _idx.l2_normalize(vectors)
-        if documents is None:
-            raise ValueError("add/upsert requires either vectors= or documents= (with an embedder)")
-        # GAP-1 guard: prevent accidental embedder swap on write path
-        if self._embedder is not None:
-            stored = self._meta_get("embedder_identity")
-            if stored is not None:
-                current = self._get_embedder_identity(self._embedder)
-                if current != stored:
-                    raise EmbedderIdentityMismatchError(
-                        f"embedder identity mismatch: stored {stored!r} != "
-                        f"current {current!r}; use reembed() to change embedders"
-                    )
-        return _idx.l2_normalize(self._embed(documents))
-
-    def _write(self, *, ids, documents, metadatas, vectors, replace):
-        n = len(ids)
-        for label, seq in (("documents", documents), ("metadatas", metadatas), ("vectors", vectors)):
-            if seq is not None and len(seq) != n:
-                raise ValueError(f"{label} length {len(seq)} != ids length {n}")
-        if n == 0:
-            return
-        vecs = self._resolve_vectors(documents, vectors, n)
-        docs = documents if documents is not None else [""] * n
-
+        self._warn_vectors_bypass(vectors)
         with self._locked():
-            # Refresh under the lock so concurrent writers see each other's rows.
-            self._next_uid = int(self._meta_get("next_uid", 0))
-            self._ensure_current()
-            if self._dim is None:
-                self._commit_dim(int(vecs.shape[1]))
-                self._index = _idx.new_index(self._dim, self._bit_width)
-            elif vecs.shape[1] != self._dim:
-                raise DimensionMismatchError(
-                    f"vector dim {vecs.shape[1]} != collection dim {self._dim}"
-                )
-
-            new_uids, new_vecs = [], []
-            for i, str_id in enumerate(ids):
-                meta_json = json.dumps(metadatas[i] if metadatas else {})
-                vec_bytes = vecs[i].tobytes()
-                row = self._conn.execute("SELECT uid FROM docs WHERE str_id=?", (str_id,)).fetchone()
-                if row is not None:
-                    if not replace:
-                        raise ValueError(f"id {str_id!r} already exists (use upsert)")
-                    uid = int(row[0])
-                    self._index.remove(np.uint64(uid))
-                    self._conn.execute(
-                        "UPDATE docs SET document=?, metadata=?, vector=? WHERE uid=?",
-                        (docs[i], meta_json, vec_bytes, uid),
-                    )
-                else:
-                    uid = self._next_uid
-                    self._next_uid += 1
-                    self._conn.execute(
-                        "INSERT INTO docs(uid, str_id, document, metadata, vector) "
-                        "VALUES(?, ?, ?, ?, ?)",
-                        (uid, str_id, docs[i], meta_json, vec_bytes),
-                    )
-                new_uids.append(uid)
-                new_vecs.append(vecs[i])
-
-            self._index.add_with_ids(
-                np.ascontiguousarray(np.stack(new_vecs), dtype=np.float32),
-                np.array(new_uids, dtype=np.uint64),
-            )
-            self._meta_set("next_uid", self._next_uid)
-            self._meta_set("store_gen", self._store_gen() + 1)
-            self._commit()
-            self._seen_gen = self._store_gen()
-            self._dirty = True
-
-    def update_metadata(self, *, ids, metadatas):
-        """Update metadata for existing documents without touching vectors.
-
-        Args:
-            ids: List of string IDs identifying the documents to update.
-            metadatas: List of metadata dicts (one per id). ``None`` entries
-                       are replaced with ``{}``.
-
-        Raises:
-            ValueError: If an id is not found or lengths mismatch.
-        """
-        n = len(ids)
-        if len(metadatas) != n:
-            raise ValueError(f"metadatas length {len(metadatas)} != ids length {n}")
-        if n == 0:
-            return
-        with self._locked():
-            self._ensure_current()
-            for i, str_id in enumerate(ids):
-                meta_json = json.dumps(metadatas[i] if metadatas[i] else {})
-                row = self._conn.execute(
-                    "SELECT uid FROM docs WHERE str_id=?", (str_id,)
-                ).fetchone()
-                if row is None:
-                    raise ValueError(f"id {str_id!r} not found")
-                self._conn.execute(
-                    "UPDATE docs SET metadata=? WHERE str_id=?",
-                    (meta_json, str_id),
-                )
-            self._meta_set("store_gen", self._store_gen() + 1)
-            self._conn.commit()
-            self._seen_gen = self._store_gen()
-
-    def update_documents(self, *, ids, documents):
-        """Update documents for existing entries without touching vectors/metadata.
-
-        Args:
-            ids: List of string IDs identifying the documents to update.
-            documents: List of document strings (one per id).
-
-        Raises:
-            ValueError: If an id is not found or lengths mismatch.
-        """
-        n = len(ids)
-        if len(documents) != n:
-            raise ValueError(f"documents length {len(documents)} != ids length {n}")
-        if n == 0:
-            return
-        with self._locked():
-            self._ensure_current()
-            for i, str_id in enumerate(ids):
-                row = self._conn.execute(
-                    "SELECT uid FROM docs WHERE str_id=?", (str_id,)
-                ).fetchone()
-                if row is None:
-                    raise ValueError(f"id {str_id!r} not found")
-                self._conn.execute(
-                    "UPDATE docs SET document=? WHERE str_id=?",
-                    (documents[i], str_id),
-                )
-            self._meta_set("store_gen", self._store_gen() + 1)
-            self._conn.commit()
-            self._seen_gen = self._store_gen()
+            self._core.upsert(ids, documents, metadatas, vectors)
 
     def delete(self, *, ids=None, where=None):
         with self._locked():
-            self._ensure_current()
-            uids = self._select_uids(ids=ids, where=where)
-            if not uids:
-                return
-            for uid in uids:
-                try:
-                    self._index.remove(np.uint64(uid))
-                except Exception:
-                    _log.warning("ANN index remove failed for uid %d; ghost entry will clear on next reload", uid)
-            for i in range(0, len(uids), _SQL_CHUNK):
-                chunk = uids[i:i + _SQL_CHUNK]
-                qmarks = ",".join("?" for _ in chunk)
-                self._conn.execute(f"DELETE FROM docs WHERE uid IN ({qmarks})", chunk)
-            self._meta_set("store_gen", self._store_gen() + 1)
-            self._commit()
-            self._seen_gen = self._store_gen()
-            self._dirty = True
+            self._core.delete(ids, where)
 
-    def _select_uids(self, *, ids=None, where=None):
-        wsql, wparams = where_to_sql(where)
-        if ids is not None:
-            # Chunk str_id lookups to stay under SQLITE_MAX_VARIABLE_NUMBER.
-            uid_rows = []
-            for i in range(0, max(len(ids), 1), _SQL_CHUNK):
-                chunk = ids[i:i + _SQL_CHUNK]
-                qmarks = ",".join("?" for _ in chunk)
-                clause = f"WHERE str_id IN ({qmarks})"
-                if wsql:
-                    clause += f" AND ({wsql})"
-                uid_rows.extend(
-                    self._conn.execute(
-                        f"SELECT uid FROM docs {clause}", list(chunk) + wparams
-                    ).fetchall()
-                )
-            return [int(r[0]) for r in uid_rows]
-        clause = (f" WHERE {wsql}") if wsql else ""
-        rows = self._conn.execute(f"SELECT uid FROM docs{clause}", wparams).fetchall()
-        return [int(r[0]) for r in rows]
+    def update_metadata(self, *, ids, metadatas):
+        with self._locked():
+            self._core.update_metadata(ids, metadatas)
+
+    def update_documents(self, *, ids, documents):
+        with self._locked():
+            self._core.update_documents(ids, documents)
+
+    def clear(self):
+        with self._locked():
+            self._core.clear()
+
+    def reembed(self, embedder, *, dim=None, bit_width=None, batch_size=256,
+                on_progress=None, skip_empty="error"):
+        with self._locked():
+            return self._core.reembed(embedder, dim, bit_width, batch_size, on_progress, skip_empty)
 
     # -- reads ----------------------------------------------------------------
 
     def query(self, *, text=None, vector=None, k=10, where=None, where_document=None,
               include=("documents", "metadatas", "distances")):
-        if (text is None) == (vector is None):
-            raise ValueError("exactly one of text / vector is required")
-        inc = _resolve_include(include, default_distances=True)
-        if text is not None:
-            vector = self._embed([text])[0]
-        q = _idx.l2_normalize(np.asarray(vector, dtype=np.float32))
-
         with self._tlock:
-            self._ensure_current()
-            if self._index is None or self._dim is None:
-                return QueryResult([], [], [], [], [] if inc["vectors"] else None)
-
-            allow = None
-            if where or where_document:
-                sql, params = combined_sql(where, where_document)
-                if sql:
-                    rows = self._conn.execute(
-                        f"SELECT uid FROM docs WHERE {sql}", params
-                    ).fetchall()
-                    allow_ids = [int(r[0]) for r in rows]
-                    if not allow_ids:
-                        return QueryResult([], [], [], [], [] if inc["vectors"] else None)
-                    allow = np.array(allow_ids, dtype=np.uint64)
-
-            pool = max(k, _RERANK_FLOOR)
-            _, cand = self._index.search(q, k=pool, allowlist=allow)
-            cand_uids = [int(u) for u in cand[0].tolist()]
-            hits = self._rerank(q[0], cand_uids, k, inc)
-            return QueryResult(
-                ids=[h["id"] for h in hits],
-                distances=[h["distance"] for h in hits] if inc["distances"] else [],
-                documents=[h["document"] for h in hits] if inc["documents"] else [],
-                metadatas=[h["metadata"] for h in hits] if inc["metadatas"] else [],
-                vectors=[h["vector"] for h in hits] if inc["vectors"] else None,
-            )
-
-    def _rerank(self, qvec, cand_uids, k, inc):
-        if not cand_uids:
-            return []
-        qmarks = ",".join("?" for _ in cand_uids)
-        rows = self._conn.execute(
-            f"SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN ({qmarks})",
-            cand_uids,
-        ).fetchall()
-        by_uid = {int(r[0]): r for r in rows}
-        scored = []
-        for uid in cand_uids:  # turbovec order is the tiebreak
-            r = by_uid.get(uid)
-            if r is None:
-                continue
-            v = np.frombuffer(r[4], dtype=np.float32)
-            distance = 1.0 - float(np.dot(qvec, v))  # both L2-normalized → cosine
-            scored.append({
-                "id": r[1],
-                "document": r[2] if inc["documents"] else None,
-                "metadata": json.loads(r[3]) if inc["metadatas"] and r[3] else {},
-                "distance": distance,
-                "vector": v.tolist() if inc["vectors"] else None,
-            })
-        scored.sort(key=lambda h: h["distance"])
-        return scored[:k]
+            return self._core.query(text, vector, k, where, where_document, _inc(include))
 
     def get(self, *, ids=None, where=None, where_document=None, limit=None,
             offset=None, include=("documents", "metadatas")):
-        inc = _resolve_include(include, default_distances=False)
-        frags, params = [], []
-        if ids is not None:
-            qmarks = ",".join("?" for _ in ids)
-            frags.append(f"str_id IN ({qmarks})")
-            params.extend(ids)
-        wsql, wparams = where_to_sql(where)
-        if wsql:
-            frags.append(wsql)
-            params.extend(wparams)
-        from .filters import where_document_to_sql
-        wdsql, wdparams = where_document_to_sql(where_document)
-        if wdsql:
-            frags.append(wdsql)
-            params.extend(wdparams)
-        clause = (" WHERE " + " AND ".join(frags)) if frags else ""
-        sql = f"SELECT str_id, document, metadata, vector FROM docs{clause} ORDER BY uid"
-        if limit is not None:
-            sql += " LIMIT ?"
-            params.append(int(limit))
-            if offset is not None:
-                sql += " OFFSET ?"
-                params.append(int(offset))
         with self._tlock:
-            rows = self._conn.execute(sql, params).fetchall()
-        out_ids, out_docs, out_metas, out_vecs = [], [], [], []
-        for r in rows:
-            out_ids.append(r[0])
-            out_docs.append(r[1] if inc["documents"] else None)
-            out_metas.append(json.loads(r[2]) if inc["metadatas"] and r[2] else {})
-            if inc["vectors"]:
-                out_vecs.append(np.frombuffer(r[3], dtype=np.float32).tolist())
-        return GetResult(
-            ids=out_ids,
-            documents=out_docs,
-            metadatas=out_metas,
-            vectors=out_vecs if inc["vectors"] else None,
-        )
+            return self._core.get(ids, where, where_document, limit, offset, _inc(include))
 
     def count(self):
         with self._tlock:
-            return int(self._conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
-
-    def clear(self):
-        """Remove every document from the collection in one operation.
-
-        Only the stored documents, their vectors, and the ANN index are
-        emptied; the collection's configuration (``dim``, ``bit_width``,
-        ``metric``, recorded embedder identity) is left intact, so the handle
-        stays usable and later ``add``/``upsert`` calls behave normally. Cheaper
-        than deleting ids one by one, and — like every other write — bumps
-        ``store_gen`` so other handles and processes drop their now-stale caches
-        on the next access. A no-op on an already-empty collection.
-        """
-        with self._locked():
-            self._ensure_current()
-            if self.count() == 0:
-                return
-            self._conn.execute("DELETE FROM docs")
-            self._meta_set("next_uid", 0)
-            self._meta_set("store_gen", self._store_gen() + 1)
-            self._commit()  # invalidates the index on commit failure
-            # Only once the DELETE is durable do we drop the in-memory index —
-            # so a failed commit leaves the (untouched) old index matching the
-            # rolled-back rows rather than a divergent empty one.
-            self._next_uid = 0
-            self._seen_gen = self._store_gen()
-            self._dirty = True
-            self._index = (
-                _idx.new_index(self._dim, self._bit_width)
-                if self._dim is not None else None
-            )
-            self._checkpoint_wal()  # bound WAL growth after a bulk delete
-
-    def _get_embedder_identity(self, embedder):
-        """Extract a stable identifier for the embedder function."""
-        if hasattr(embedder, "__name__"):
-            return embedder.__name__
-        elif hasattr(embedder, "__class__"):
-            return f"{embedder.__class__.__module__}.{embedder.__class__.__name__}"
-        else:
-            return "unknown_embedder"
-
-    def _recommit_dim(self, new_dim, bit_width=None):
-        """Update collection dimension and rebuild index.
-
-        Args:
-            new_dim: The new dimension (must be positive multiple of 8)
-            bit_width: Optional new bit_width (2/3/4). If None, keeps current.
-        """
-        if new_dim <= 0 or new_dim % 8 != 0:
-            raise DimensionMismatchError(
-                f"turbovec requires dim to be a positive multiple of 8, got {new_dim}"
-            )
-        if bit_width is not None and bit_width not in (2, 3, 4):
-            raise ValueError(f"bit_width must be 2, 3, or 4, got {bit_width!r}")
-
-        with self._locked():
-            self._ensure_current()
-            self._dim = new_dim
-            if bit_width is not None:
-                self._bit_width = bit_width
-            self._meta_set("dim", self._dim)
-            self._meta_set("bit_width", self._bit_width)
-            self._conn.commit()
-            self._reload_index()
-            self.flush()
-
-    def reembed(self, embedder, *, dim=None, bit_width=None, batch_size=256, on_progress=None, skip_empty="error"):
-        """Recompute every vector in place from stored documents using a new embedder.
-
-        Args:
-            embedder: Callable that takes list of texts and returns list of vectors
-            dim: Optional new dimension to validate against embedder output
-            bit_width: Optional new bit_width (2/3/4) for quantization
-            batch_size: Number of documents to embed in each batch
-            on_progress: Optional callback function with signature (done, total)
-            skip_empty: Policy for empty documents ("error", "keep", or "drop")
-
-        Returns:
-            ReembedReport: Summary of re-embedding operation
-        """
-        import time
-
-        # Pre-validation (before acquiring locks)
-        if skip_empty not in ("error", "keep", "drop"):
-            raise ValueError(f"skip_empty must be 'error', 'keep', or 'drop', got {skip_empty!r}")
-        if bit_width is not None:
-            if bit_width not in (2, 3, 4):
-                raise ValueError(f"bit_width must be 2, 3, or 4, got {bit_width!r}")
-        if not callable(embedder):
-            raise ValueError("embedder must be a callable")
-        if dim is not None:
-            if dim <= 0 or dim % 8 != 0:
-                raise DimensionMismatchError(
-                    f"turbovec requires dim to be a positive multiple of 8, got {dim}"
-                )
-
-        # Get embedder identity (for GAP-1 integration)
-        embedder_identity = self._get_embedder_identity(embedder)
-
-        # Get total count (before locks)
-        total_docs = self.count()
-        if total_docs == 0:
-            return ReembedReport(0, self._dim, self._dim, 0, 0)
-
-        # Acquire write lock and perform re-embedding
-        with self._locked():
-            self._ensure_current()
-
-            old_dim = self._dim
-            old_bit_width = self._bit_width
-            start_time = time.time()
-
-            # -- Phase 1: classify docs and embed the non-empty ones. Nothing is
-            # written to the store yet, so any error here (the 'error' policy, an
-            # embedder failure, a dimension mismatch) leaves the collection
-            # untouched.
-            rows = self._conn.execute(
-                "SELECT uid, document, vector FROM docs ORDER BY uid"
-            ).fetchall()
-            embed_uids, embed_docs = [], []
-            keep = []       # (uid, old_vector_bytes) — retained under 'keep'
-            drop_uids = []  # uids to delete under 'drop'
-            skipped = 0
-            for uid, document, vec_blob in rows:
-                if document:
-                    embed_uids.append(uid)
-                    embed_docs.append(document)
-                elif skip_empty == "error":
-                    raise ValueError(f"Cannot re-embed empty document with uid {uid}")
-                elif skip_empty == "drop":
-                    drop_uids.append(uid)
-                    skipped += 1
-                else:  # keep
-                    keep.append((uid, vec_blob))
-                    skipped += 1
-
-            updates = []    # (vector_bytes, uid)
-            new_dim = None
-            processed = 0
-            for start in range(0, len(embed_docs), batch_size):
-                b_docs = embed_docs[start:start + batch_size]
-                b_uids = embed_uids[start:start + batch_size]
-                uid_range = f"uids [{b_uids[0]}..{b_uids[-1]}]"
-                try:
-                    vecs = np.asarray(embedder(b_docs), dtype=np.float32)
-                except Exception as e:
-                    raise ValueError(f"Embedder failed on batch {uid_range}: {e}")
-                if vecs.ndim != 2 or vecs.shape[0] != len(b_uids):
-                    raise DimensionMismatchError(
-                        f"embedder must return one 2-D vector per document; got array "
-                        f"of shape {vecs.shape} for {len(b_uids)} documents ({uid_range})"
-                    )
-                batch_dim = int(vecs.shape[1])
-                if new_dim is None:
-                    new_dim = batch_dim
-                elif batch_dim != new_dim:
-                    raise DimensionMismatchError(
-                        f"embedder returned inconsistent dimensions across batches: "
-                        f"{new_dim} then {batch_dim} ({uid_range})"
-                    )
-                vecs = _idx.l2_normalize(vecs)
-                for i, uid in enumerate(b_uids):
-                    updates.append((vecs[i].tobytes(), uid))
-                processed += len(b_docs)
-                if on_progress:
-                    on_progress(processed, total_docs)
-
-            # Resolve the collection's new dimension from the *actual* embedder
-            # output — never from a retained old vector — then validate it.
-            if new_dim is None:
-                new_dim = old_dim  # every doc was empty (all kept or dropped)
-            if dim is not None and new_dim != dim:
-                raise DimensionMismatchError(
-                    f"Embedder returned vectors of dimension {new_dim}, "
-                    f"but dim was explicitly set to {dim}"
-                )
-            if keep and new_dim != old_dim:
-                raise DimensionMismatchError(
-                    f"skip_empty='keep' cannot retain {old_dim}-dim vectors in a "
-                    f"{new_dim}-dim collection; use skip_empty='drop' or give the "
-                    f"empty documents text to embed"
-                )
-            # Retained docs keep their old vector (dims match new_dim here); just
-            # re-normalize in case the stored copy drifted.
-            for uid, vec_blob in keep:
-                old_vec = np.frombuffer(vec_blob, dtype=np.float32)
-                updates.append((_idx.l2_normalize(old_vec.reshape(1, -1))[0].tobytes(), uid))
-            if on_progress and skipped:
-                on_progress(processed + skipped, total_docs)
-
-            new_bit_width = bit_width if bit_width is not None else old_bit_width
-
-            # -- Phase 2: apply the whole re-embed in one transaction. The index
-            # is rebuilt from the *uncommitted* rows before the commit, so if the
-            # rebuild (or anything else) fails we roll the entire operation back
-            # and never leave a half-migrated, mixed-dimension store.
-            try:
-                for i in range(0, len(drop_uids), _SQL_CHUNK):
-                    chunk = drop_uids[i:i + _SQL_CHUNK]
-                    qmarks = ",".join("?" for _ in chunk)
-                    self._conn.execute(f"DELETE FROM docs WHERE uid IN ({qmarks})", chunk)
-                if updates:
-                    self._conn.executemany("UPDATE docs SET vector=? WHERE uid=?", updates)
-                self._dim = new_dim
-                self._bit_width = new_bit_width
-                self._meta_set("dim", new_dim)
-                self._meta_set("bit_width", new_bit_width)
-                self._meta_set("store_gen", self._store_gen() + 1)
-                self._meta_set("embedder_identity", embedder_identity)
-                # Rebuilds from the uncommitted rows (store_gen advanced past
-                # tvim_gen, so the stale .tvim cache is ignored); raises on failure.
-                self._reload_index()
-                self._conn.commit()
-            except Exception:
-                self._conn.rollback()
-                self._dim = old_dim
-                self._bit_width = old_bit_width
-                self._index = None
-                self._seen_gen = -1
-                raise
-
-            self._seen_gen = self._store_gen()
-            self._dirty = True
-            self.flush()
-
-            elapsed = time.time() - start_time
-            return ReembedReport(total_docs, old_dim, new_dim, skipped, elapsed)
-
-    @property
-    def dim(self):
-        return self._dim
-
-    @property
-    def embedder_identity(self):
-        """The stored embedder identity string, or ``None`` if no embedder
-        has been recorded."""
-        return self._meta_get("embedder_identity")
+            return self._core.count()
 
     def health(self):
-        """Run an integrity check on the collection.
-
-        Returns:
-            HealthResult with SQLite quick_check result, store-gen counters,
-            cache coherence status, and document count.
-
-        Raises:
-            TurboVecError: If the SQLite quick_check reports corruption.
-        """
         with self._tlock:
-            qc = self._conn.execute("PRAGMA quick_check").fetchone()[0]
-            store_gen = self._store_gen()
-            tvim_gen = int(self._meta_get("tvim_gen", -1))
-            doc_count = int(self._conn.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
-            coherent = store_gen == tvim_gen
-            ok = qc == "ok"
-            if not ok:
-                from .errors import TurboVecError
-                raise TurboVecError(
-                    f"SQLite integrity check failed for {self.dir!r}: {qc}"
-                )
-            return HealthResult(
-                ok=ok,
-                quick_check=qc,
-                store_gen=store_gen,
-                tvim_gen=tvim_gen,
-                coherent=coherent,
-                doc_count=doc_count,
-            )
+            return self._core.health()
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def flush(self):
+        with self._locked():
+            self._core.flush()
+
+    def close(self):
+        with self._tlock:
+            self._core.close()
 
     def __enter__(self):
         return self
@@ -935,11 +186,24 @@ class Collection:
         self.flush()
         return False
 
-    def close(self):
-        with self._tlock:
-            try:
-                self.flush()
-            finally:
-                self._conn.commit()
-                self._checkpoint_wal()
-                self._conn.close()
+    @property
+    def dim(self):
+        return self._core.dim
+
+    @property
+    def _bit_width(self):
+        return self._core.bit_width
+
+    @property
+    def embedder_identity(self):
+        """The stored embedder identity string, or ``None`` if none recorded."""
+        return self._core.meta_get("embedder_identity")
+
+    # -- introspection shims (stable across the Rust flip) --------------------
+
+    def _meta_get(self, key, default=None):
+        v = self._core.meta_get(key)
+        return v if v is not None else default
+
+    def _store_gen(self):
+        return self._core.store_gen()

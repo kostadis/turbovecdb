@@ -3,21 +3,27 @@
 A ``Database`` is a lightweight handle over a directory; each collection is a
 subdirectory. Construction does no I/O — work is deferred to
 :meth:`Database.collection`.
+
+Name validation, path resolution, listing, and directory removal are handled
+by the Rust core (``_core.Database``). The collection-handle cache and its
+locking stay here: each cached ``Collection`` wrapper owns a cross-process
+``FileLock`` and must be identity-stable per name, so a second cache in Rust
+would be redundant and never actually used (see
+``docs/rust-core-database-plan.md``).
 """
 
 import logging
 import os
-import re
 import threading
 
 from filelock import FileLock, Timeout
 
+from ._core import Database as _CoreDatabase
 from .collection import Collection, _LOCK_TIMEOUT
 from .errors import CollectionNotFoundError, TurboVecError
 from .index import DEFAULT_BIT_WIDTH
 
 _log = logging.getLogger(__name__)
-_SAFE_NAME = re.compile(r"^[A-Za-z0-9_\-]{1,128}$")
 
 
 class Database:
@@ -25,6 +31,7 @@ class Database:
         self._path = path
         self._collections = {}
         self._lock = threading.Lock()
+        self._core = _CoreDatabase(path)
 
     @property
     def path(self):
@@ -40,18 +47,11 @@ class Database:
 
         ``name`` must match ``[A-Za-z0-9_-]{1,128}``.
         """
-        if not _SAFE_NAME.fullmatch(name):
-            raise ValueError(
-                f"invalid collection name {name!r}: must match [A-Za-z0-9_-]{{1,128}}"
-            )
         with self._lock:
             cached = self._collections.get(name)
             if cached is not None:
                 return cached
-            coll_dir = os.path.join(self._path, name)
-            base = os.path.abspath(self._path) + os.sep
-            if not os.path.abspath(coll_dir).startswith(base):
-                raise ValueError(f"collection name {name!r} escapes database root")
+            coll_dir = self._core.collection_dir(name)
             if not create and not os.path.isdir(coll_dir):
                 raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
             kwargs = dict(dim=dim, bit_width=bit_width,
@@ -63,14 +63,8 @@ class Database:
             return col
 
     def list_collections(self):
-        if not os.path.isdir(self._path):
-            return []
         with self._lock:
-            return sorted(
-                d for d in os.listdir(self._path)
-                if os.path.isdir(os.path.join(self._path, d, ""))
-                and os.path.exists(os.path.join(self._path, d, "store.sqlite3"))
-            )
+            return self._core.list_collections()
 
     def delete_collection(self, name):
         """Delete a collection and all its data.
@@ -86,15 +80,7 @@ class Database:
             CollectionNotFoundError: If the collection does not exist
             TurboVecError: If the write lock cannot be acquired
         """
-        if not _SAFE_NAME.fullmatch(name):
-            raise ValueError(
-                f"invalid collection name {name!r}: must match [A-Za-z0-9_-]{{1,128}}"
-            )
-        coll_dir = os.path.join(self._path, name)
-        if not os.path.isdir(coll_dir):
-            raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
-        if not os.path.exists(os.path.join(coll_dir, "store.sqlite3")):
-            raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
+        coll_dir = self._core.ensure_collection(name)
 
         # Close cached handle if present
         with self._lock:
@@ -129,8 +115,7 @@ class Database:
                 del self._collections[name]
 
         try:
-            import shutil
-            shutil.rmtree(coll_dir)
+            self._core.remove_collection_dir(name)
         finally:
             flock.release()
 

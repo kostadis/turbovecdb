@@ -1,0 +1,13 @@
+[package]
+name = "turbovecdb-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure Rust engine for turbovecdb (no PyO3/Python dependency)"
+license = "MIT"
+
+[dependencies]
+ndarray = "0.16"
+openblas-src = { version = "0.10.16", features = ["static"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde_json = "1.0.150"
+turbovec = "0.9"

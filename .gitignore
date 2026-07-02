@@ -11,3 +11,11 @@ venv/
 *.tvim
 *.sqlite3
 *.sqlite3-*
+
+# Rust / maturin build artifacts
+/target/
+*.abi3.so
+*.so
+
+# uv (maturin build tool) lockfile
+uv.lock

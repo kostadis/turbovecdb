@@ -1,6 +1,9 @@
 """Schema version: migration framework tracks on-disk format evolution."""
 
-import pytest
+import gc
+import os
+import sqlite3
+
 
 import turbovecdb
 
@@ -37,10 +40,15 @@ def test_legacy_collection_gets_schema_version(tmp_path):
     db = turbovecdb.connect(path)
     col = db.collection("c", dim=DIM, create=True)
     col.add(ids=["a"], documents=["hello"], vectors=[[1.0] + [0.0] * (DIM - 1)])
-    # Simulate a legacy collection by removing the schema_version
-    col._conn.execute("DELETE FROM meta WHERE key='schema_version'")
-    col._conn.commit()
     db.close()
+    del col, db
+    gc.collect()  # release the Rust engine's connection before touching the file
+
+    # Simulate a legacy collection by removing schema_version directly on disk.
+    conn = sqlite3.connect(os.path.join(path, "c", "store.sqlite3"))
+    conn.execute("DELETE FROM meta WHERE key='schema_version'")
+    conn.commit()
+    conn.close()
 
     db2 = turbovecdb.connect(path)
     col2 = db2.collection("c", create=False)

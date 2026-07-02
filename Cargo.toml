@@ -1,0 +1,7 @@
+[workspace]
+resolver = "2"
+members = ["crates/turbovecdb-core", "crates/turbovecdb-py"]
+
+[profile.release]
+opt-level = 3
+lto = true

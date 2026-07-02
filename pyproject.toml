@@ -1,6 +1,16 @@
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+# Mixed Python/Rust project: Python package lives in src/, the Rust core is
+# compiled into the extension module turbovecdb._core. The Rust side is a
+# Cargo workspace (see docs/rust-core-split-design.md): turbovecdb-core is
+# the pure engine, turbovecdb-py is the PyO3 adapter maturin actually builds.
+manifest-path = "crates/turbovecdb-py/Cargo.toml"
+python-source = "src"
+module-name = "turbovecdb._core"
+features = ["pyo3/extension-module"]
 
 [project]
 name = "turbovecdb"
@@ -11,8 +21,10 @@ requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "Kostadis Rousoss", email = "kostadis@gmail.com" }]
 keywords = ["vector-database", "embeddings", "ann", "turbovec", "quantization"]
+# The turbovec ANN engine is a native Rust dependency of the extension module
+# (statically linked, OpenBLAS included) — the turbovec PyPI wheel is NOT a
+# runtime dependency anymore.
 dependencies = [
-    "turbovec>=0.7",
     "numpy>=1.21",
     "filelock>=3.12",
 ]
@@ -27,9 +39,6 @@ turbovecdb-service = "turbovecdb.service:main"
 Homepage = "https://github.com/kostadis/turbovecdb"
 Repository = "https://github.com/kostadis/turbovecdb"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/turbovecdb"]
-
 [tool.ruff]
 line-length = 100
 target-version = "py39"
@@ -40,3 +49,6 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "perf: performance and scale tests (slower; run/skip with -m perf / -m 'not perf')",
+]

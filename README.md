@@ -6,6 +6,12 @@ sidecar that holds the documents, metadata, id map, and the exact float32
 vectors. Metadata filters, persistence, exact-cosine re-rank, and multi-process
 safety are built in.
 
+The engine is written in Rust (SQLite store, filter compiler, index lifecycle,
+reembed — with turbovec linked in natively as a Rust crate) and ships as a
+self-contained extension module behind a small Python API; see
+[docs/rust-core-plan.md](docs/rust-core-plan.md) and
+[docs/rust-core-split-design.md](docs/rust-core-split-design.md).
+
 It's the kind of thing you reach for when you want a local, CPU-resident vector
 store with a small footprint and no server to run — and you're happy to bring
 your own embedding model (or hand it one).
@@ -28,11 +34,17 @@ your own embedding model (or hand it one).
 ## Install
 
 ```bash
-pip install turbovecdb        # pulls turbovec, numpy, filelock
+pip install turbovecdb        # pulls numpy, filelock
 ```
 
 Requires Python ≥ 3.9. The vector dimension must be a positive multiple of 8
 (e.g. 384, 768) — a turbovec requirement.
+
+The wheel is self-contained: the turbovec ANN engine and OpenBLAS are compiled
+into the extension module (no `turbovec` PyPI wheel, no system BLAS). Building
+from source instead needs a Rust toolchain (`maturin` drives the build; the
+first compile vendors and statically links OpenBLAS, which takes a few
+minutes once, then is cached).
 
 ## Integrate with Mempalace
 
