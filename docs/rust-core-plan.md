@@ -45,7 +45,7 @@ Ordered; later slices build on earlier ones. Each is a GitHub issue (label `rust
 | 5. read paths | [#13](https://github.com/kostadis/turbovecdb/issues/13) | query (+ exact-cosine rerank), get, count |
 | 6. reembed (atomic) | [#14](https://github.com/kostadis/turbovecdb/issues/14) | atomic two-phase reembed; carry the drop/keep + bug-A/B fixes |
 | 7. concurrency & coherence | [#15](https://github.com/kostadis/turbovecdb/issues/15) | file lock, in-proc lock, generation cache reload, WAL checkpoint, health() |
-| 8. Database layer | [#16](https://github.com/kostadis/turbovecdb/issues/16) | `database.py`: connect, collection cache, list/delete_collection |
+| 8. Database layer | [#16](https://github.com/kostadis/turbovecdb/issues/16) (done) | `database.py`: connect, collection cache, list/delete_collection |
 | 9. cutover & cleanup | [#17](https://github.com/kostadis/turbovecdb/issues/17) | thin-shim/remove dead Python engine; full green; completion PR to `main` |
 
 Rust deps added along the way: `rusqlite` (bundled SQLite), `numpy`/`ndarray`, a file-lock crate (e.g. `fs2`).
@@ -87,6 +87,17 @@ via `_core.Collection` while the Python `Collection` still runs the suite), but
 the **Python-facing flip happens once, at parity** — Python `Collection`/`Database`
 become thin delegators to `_core` (folded into **#17**). Expect fewer, larger
 green commits than one-per-slice.
+
+**#16 landed differently than sketched above** (see
+`docs/rust-core-database-plan.md`): the collection-handle cache did **not**
+move into a Rust `Database` class. `Collection`'s Python wrapper owns the
+cross-process `FileLock` and must stay identity-stable per name, so the
+cache has to live in Python regardless — a second cache in Rust would need
+`Arc<Mutex<...>>` sharing just to exist and would never actually be read.
+What moved to Rust is the pure part: name validation, path resolution,
+listing, and directory removal (`turbovecdb_core::database::Database`, no
+generics, no cache), via a thin `_core.Database` adapter. `database.py`'s
+cache, locking, and the `delete_collection` race-guard dance are unchanged.
 
 ## Working agreement
 
