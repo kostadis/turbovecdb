@@ -22,6 +22,7 @@ use turbovecdb_core::filters;
 
 mod collection;
 mod convert;
+mod database;
 mod embedder;
 
 create_exception!(_core, FilterError, PyException);
@@ -159,5 +160,6 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(combined_sql, m)?)?;
     m.add_function(wrap_pyfunction!(l2_normalize, m)?)?;
     m.add_class::<collection::Collection>()?;
+    m.add_class::<database::Database>()?;
     Ok(())
 }
