@@ -610,7 +610,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             return Err(e.into());
         }
         let sg = self.store_gen_val()? + 1;
-        if self.meta_set("next_uid", "0").is_err() || self.meta_set("store_gen", &sg.to_string()).is_err() {
+        // Deliberately does NOT reset next_uid: uids are otherwise never
+        // reused, and a reader caught in the brief window between this
+        // commit and its own next reload (C3) could pair a stale index hit
+        // against a new row that reused a uid from before the clear (C4).
+        if self.meta_set("store_gen", &sg.to_string()).is_err() {
             self.rollback();
             return Err(CoreError::Runtime("clear: meta update failed".to_string()));
         }
@@ -625,7 +629,6 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             self.seen_gen = -1;
             return Err(e.into());
         }
-        self.next_uid = 0;
         self.seen_gen = sg;
         self.dirty = true;
         self.index = if self.dim.is_some() { Some(self.make_index()?) } else { None };
@@ -1374,6 +1377,37 @@ mod tests {
         c.clear().unwrap();
         assert_eq!(c.count().unwrap(), 0);
         assert_eq!(c.dim(), Some(8));
+    }
+
+    /// Regression for C4: clear() used to reset next_uid to 0. Uids are
+    /// otherwise never reused; resetting them lets a reader caught in the
+    /// brief window before its next reload (C3) pair a stale index hit
+    /// against a new row that reused a pre-clear uid.
+    #[test]
+    fn clear_keeps_next_uid_monotonic() {
+        let dir = temp_dir("clear_uid");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(
+            vec!["a".into(), "b".into()],
+            None,
+            None,
+            Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.], [0., 1., 0., 0., 0., 0., 0., 0.]])),
+        )
+        .unwrap();
+        let next_uid_before: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
+        assert_eq!(next_uid_before, 2);
+
+        c.clear().unwrap();
+        let next_uid_after_clear: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
+        assert_eq!(next_uid_after_clear, next_uid_before, "clear() must not reset next_uid");
+
+        c.add(vec!["c".into()], None, None, Some(vecs(&[[0., 0., 1., 0., 0., 0., 0., 0.]]))).unwrap();
+        let next_uid_after_readd: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
+        assert_eq!(
+            next_uid_after_readd,
+            next_uid_before + 1,
+            "uid allocation must stay monotonic across clear() + add()"
+        );
     }
 
     /// Force the next COMMIT to fail deterministically: SQLite converts a
