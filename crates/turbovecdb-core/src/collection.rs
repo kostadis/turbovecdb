@@ -173,8 +173,18 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         Ok(())
     }
 
+    /// `default` applies only when `key` is *absent* from meta. A present
+    /// but unparseable value is a corruption signal, not a missing one — it
+    /// errors rather than silently falling back to `default` (R4). Silently
+    /// defaulting a corrupted `next_uid` to 0, for instance, would start
+    /// reusing uids against live rows.
     fn meta_get_i64(&self, key: &str, default: i64) -> Result<i64, CoreError> {
-        Ok(self.meta_get(key)?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(default))
+        match self.meta_get(key)? {
+            None => Ok(default),
+            Some(s) => s.parse::<i64>().map_err(|_| {
+                CoreError::Other(format!("corrupt meta value for {key:?}: {s:?} is not a valid integer"))
+            }),
+        }
     }
 
     fn store_gen_val(&self) -> Result<i64, CoreError> {
@@ -1678,6 +1688,26 @@ mod tests {
         let h = c.health().unwrap();
         assert!(h.ok);
         assert_eq!(h.doc_count, 1);
+    }
+
+    /// Regression for R4: meta_get_i64 used to map any unparseable value
+    /// to the caller's default — a corrupted next_uid would silently
+    /// become 0, which would start reusing uids against live rows. A
+    /// present-but-corrupt meta value must error instead of defaulting.
+    #[test]
+    fn corrupt_next_uid_meta_errors_instead_of_silently_resetting() {
+        let dir = temp_dir("corrupt_next_uid");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+
+        c.conn
+            .execute("UPDATE meta SET value = 'not-a-number' WHERE key = 'next_uid'", [])
+            .unwrap();
+
+        match c.add(vec!["b".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]]))) {
+            Err(CoreError::Other(msg)) => assert!(msg.contains("next_uid"), "got {msg:?}"),
+            other => panic!("expected Err(CoreError::Other(_)), got {}", other.is_ok()),
+        }
     }
 
     #[test]
