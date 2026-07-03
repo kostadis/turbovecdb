@@ -681,6 +681,13 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         &self.tvim_path
     }
 
+    /// The cross-process write-lock acquisition timeout (seconds). Exposed
+    /// for introspection now that the lock lives in the core rather than the
+    /// Python wrapper's `FileLock` (whose `.timeout` tests used to read).
+    pub fn lock_timeout(&self) -> f64 {
+        self.lock_timeout
+    }
+
     pub fn count(&self) -> Result<i64, CoreError> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM docs", [], |r| r.get::<_, i64>(0))?)
     }

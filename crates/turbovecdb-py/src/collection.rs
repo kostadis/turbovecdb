@@ -1,13 +1,30 @@
 //! `Collection` — thin PyO3 wrapper around
 //! `turbovecdb_core::collection::Collection<PyEmbedder, TurbovecIndex>`.
 //!
-//! All business logic (SQLite reads/writes, generation bookkeeping, reembed)
-//! lives in `turbovecdb-core`; this file's only job is converting PyO3
-//! arguments into core types, calling core, and converting the result back
-//! (via `convert.rs`, the one place that touches Python objects by name).
+//! All business logic (SQLite reads/writes, generation bookkeeping, reembed,
+//! *and now all locking* — the cross-process flock and, via the `Mutex`
+//! below, the in-process serialization) lives in `turbovecdb-core`; this
+//! file's only job is converting PyO3 arguments into core types, calling
+//! core, and converting the result back (via `convert.rs`).
+//!
+//! ## Locking discipline (invariant I1 — GIL/Mutex ordering)
+//!
+//! The in-process lock is the `Mutex` wrapping the core collection. It must
+//! be acquired **only inside `py.allow_threads`**, never while holding the
+//! GIL. Otherwise: thread A takes the mutex inside `allow_threads` and, to
+//! run a Python embedder, re-acquires the GIL; thread B holds the GIL and
+//! blocks on the mutex — classic deadlock. Every `#[pymethods]` therefore
+//! (1) converts arguments while holding the GIL, (2) drops into
+//! `allow_threads`, locks the mutex, and calls core, then (3) converts the
+//! result back after `allow_threads` has re-acquired the GIL. The mutex is
+//! taken *before* the core's cross-process flock (invariant I2). Because the
+//! mutex is held across `allow_threads`, all methods can be `&self` — which
+//! also retires the PyO3 `&mut`-borrow-check hazard the old `_tlock` papered
+//! over.
 
 use numpy::ndarray::Array2;
 use pyo3::prelude::*;
+use std::sync::Mutex;
 use turbovecdb_core::collection::Collection as CoreCollection;
 use turbovecdb_core::error::CoreError;
 use turbovecdb_core::index::TurbovecIndex;
@@ -37,9 +54,18 @@ fn metadatas_to_json(py: Python<'_>, m: Option<Vec<PyObject>>) -> PyResult<Optio
         .transpose()
 }
 
+/// The CoreError raised when the in-process mutex is poisoned — i.e. a prior
+/// operation panicked while holding it. We never `.unwrap()` a poisoned lock
+/// (that would abort the interpreter); it maps to a `TurboVecError`.
+fn lock_poisoned() -> CoreError {
+    CoreError::Other(
+        "collection is unusable: a previous operation panicked while holding its lock".to_string(),
+    )
+}
+
 #[pyclass]
 pub struct Collection {
-    inner: CoreCollection<PyEmbedder, TurbovecIndex>,
+    inner: Mutex<CoreCollection<PyEmbedder, TurbovecIndex>>,
 }
 
 #[pymethods]
@@ -55,80 +81,98 @@ impl Collection {
         lock_timeout: f64,
     ) -> PyResult<Self> {
         Python::with_gil(|py| {
-            let inner = CoreCollection::new(
-                coll_dir,
-                dim,
-                bit_width,
-                metric,
-                embedder.map(PyEmbedder::new),
-                lock_timeout,
-            )
-            .map_err(|e| convert::core_err_to_py(py, e))?;
-            Ok(Collection { inner })
+            // Release the GIL: constructing a collection does SQLite I/O and,
+            // for a brand-new collection, may block on the cross-process
+            // write lock (C7). The embedder's identity() call inside core
+            // re-acquires the GIL itself (I1).
+            let inner = py
+                .allow_threads(|| {
+                    CoreCollection::new(coll_dir, dim, bit_width, metric, embedder.map(PyEmbedder::new), lock_timeout)
+                })
+                .map_err(|e| convert::core_err_to_py(py, e))?;
+            Ok(Collection { inner: Mutex::new(inner) })
         })
     }
 
     #[getter]
-    fn dir(&self) -> &str {
-        self.inner.dir()
+    fn dir(&self, py: Python<'_>) -> PyResult<String> {
+        let inner = &self.inner;
+        py.allow_threads(|| Ok::<_, CoreError>(inner.lock().map_err(|_| lock_poisoned())?.dir().to_string()))
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[getter]
-    fn dim(&self) -> Option<i64> {
-        self.inner.dim()
+    fn dim(&self, py: Python<'_>) -> PyResult<Option<i64>> {
+        let inner = &self.inner;
+        py.allow_threads(|| Ok::<_, CoreError>(inner.lock().map_err(|_| lock_poisoned())?.dim()))
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[getter]
-    fn bit_width(&self) -> i64 {
-        self.inner.bit_width()
+    fn bit_width(&self, py: Python<'_>) -> PyResult<i64> {
+        let inner = &self.inner;
+        py.allow_threads(|| Ok::<_, CoreError>(inner.lock().map_err(|_| lock_poisoned())?.bit_width()))
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[getter]
-    fn tvim_path(&self) -> &str {
-        self.inner.tvim_path()
+    fn tvim_path(&self, py: Python<'_>) -> PyResult<String> {
+        let inner = &self.inner;
+        py.allow_threads(|| Ok::<_, CoreError>(inner.lock().map_err(|_| lock_poisoned())?.tvim_path().to_string()))
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn count(&self) -> PyResult<i64> {
-        Python::with_gil(|py| self.inner.count().map_err(|e| convert::core_err_to_py(py, e)))
+    /// Introspection getter for the cross-process write-lock timeout — the
+    /// value tests used to read off the wrapper's `FileLock.timeout`.
+    #[getter]
+    fn lock_timeout(&self, py: Python<'_>) -> PyResult<f64> {
+        let inner = &self.inner;
+        py.allow_threads(|| Ok::<_, CoreError>(inner.lock().map_err(|_| lock_poisoned())?.lock_timeout()))
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn store_gen(&self) -> PyResult<i64> {
-        Python::with_gil(|py| self.inner.store_gen().map_err(|e| convert::core_err_to_py(py, e)))
+    fn count(&self, py: Python<'_>) -> PyResult<i64> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.count())
+            .map_err(|e| convert::core_err_to_py(py, e))
+    }
+
+    fn store_gen(&self, py: Python<'_>) -> PyResult<i64> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.store_gen())
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[pyo3(name = "meta_get")]
-    fn py_meta_get(&self, key: &str) -> PyResult<Option<String>> {
-        Python::with_gil(|py| self.inner.meta_get(key).map_err(|e| convert::core_err_to_py(py, e)))
+    fn py_meta_get(&self, py: Python<'_>, key: &str) -> PyResult<Option<String>> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.meta_get(key))
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
-        let inner = &mut self.inner;
-        py.allow_threads(|| inner.flush()).map_err(|e| convert::core_err_to_py(py, e))
+    fn flush(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.flush())
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        let inner = &mut self.inner;
-        py.allow_threads(|| inner.close()).map_err(|e| convert::core_err_to_py(py, e))
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.close())
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn health(&mut self, py: Python<'_>) -> PyResult<PyObject> {
-        // &mut, not &self: rusqlite::Connection holds RefCell-based statement
-        // caches that aren't Sync, so a shared reference can't cross the
-        // allow_threads boundary (health()'s core method only needs &self;
-        // this is purely about satisfying allow_threads' Send bound).
-        let inner = &mut self.inner;
-        // `move`: without it, Rust's disjoint-closure-capture analysis
-        // captures `*inner` by shared reference (since health() only needs
-        // &self), which would require Collection<..> to be Sync (it isn't —
-        // rusqlite::Connection's caches use RefCell). `move` forces
-        // capturing the outer `&mut` binding itself instead.
-        let r = py.allow_threads(move || inner.health()).map_err(|e| convert::core_err_to_py(py, e))?;
+    fn health(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let inner = &self.inner;
+        let r = py
+            .allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.health())
+            .map_err(|e| convert::core_err_to_py(py, e))?;
         convert::health_result_to_py(py, r)
     }
 
     #[pyo3(signature = (ids, documents=None, metadatas=None, vectors=None))]
     fn add(
-        &mut self,
+        &self,
         py: Python<'_>,
         ids: Vec<String>,
         documents: Option<Vec<String>>,
@@ -137,22 +181,17 @@ impl Collection {
     ) -> PyResult<()> {
         let metadatas = metadatas_to_json(py, metadatas)?;
         let vectors = vectors_to_array(py, &vectors)?;
-        // Release the GIL for the actual write: SQLite I/O + index
-        // quantization/mirroring don't touch Python, so holding the GIL for
-        // their duration needlessly blocks every other Python thread in the
-        // process (R3). The embedder itself now runs in the Python wrapper
-        // (collection.py) before this call, outside the cross-process write
-        // lock — if it were still invoked from here, PyEmbedder::embed's own
-        // Python::with_gil would simply re-acquire, which is sound but
-        // wasteful; add()/upsert() no longer take that path in practice.
-        let inner = &mut self.inner;
-        py.allow_threads(|| inner.add(ids, documents, metadatas, vectors))
+        // The embedder (for the documents= path) runs inside core, under
+        // allow_threads but *outside* the cross-process write lock (I5); its
+        // PyEmbedder::embed re-acquires the GIL itself.
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.add(ids, documents, metadatas, vectors))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[pyo3(signature = (ids, documents=None, metadatas=None, vectors=None))]
     fn upsert(
-        &mut self,
+        &self,
         py: Python<'_>,
         ids: Vec<String>,
         documents: Option<Vec<String>>,
@@ -161,25 +200,26 @@ impl Collection {
     ) -> PyResult<()> {
         let metadatas = metadatas_to_json(py, metadatas)?;
         let vectors = vectors_to_array(py, &vectors)?;
-        let inner = &mut self.inner;
-        py.allow_threads(|| inner.upsert(ids, documents, metadatas, vectors))
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.upsert(ids, documents, metadatas, vectors))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn clear(&mut self, py: Python<'_>) -> PyResult<()> {
-        let inner = &mut self.inner;
-        py.allow_threads(|| inner.clear()).map_err(|e| convert::core_err_to_py(py, e))
+    fn clear(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.clear())
+            .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[pyo3(signature = (ids=None, where_=None))]
-    fn delete(&mut self, py: Python<'_>, ids: Option<Vec<String>>, where_: Option<PyObject>) -> PyResult<()> {
+    fn delete(&self, py: Python<'_>, ids: Option<Vec<String>>, where_: Option<PyObject>) -> PyResult<()> {
         let where_json = where_to_json(py, &where_)?;
-        let inner = &mut self.inner;
-        py.allow_threads(|| inner.delete(ids, where_json.as_ref()))
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.delete(ids, where_json.as_ref()))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn update_metadata(&mut self, py: Python<'_>, ids: Vec<String>, metadatas: Vec<PyObject>) -> PyResult<()> {
+    fn update_metadata(&self, py: Python<'_>, ids: Vec<String>, metadatas: Vec<PyObject>) -> PyResult<()> {
         let dumped: PyResult<Vec<String>> = metadatas
             .iter()
             .map(|m| {
@@ -192,20 +232,20 @@ impl Collection {
             })
             .collect();
         let dumped = dumped?;
-        let inner = &mut self.inner;
-        py.allow_threads(|| inner.update_metadata(ids, dumped))
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.update_metadata(ids, dumped))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn update_documents(&mut self, py: Python<'_>, ids: Vec<String>, documents: Vec<String>) -> PyResult<()> {
-        let inner = &mut self.inner;
-        py.allow_threads(|| inner.update_documents(ids, documents))
+    fn update_documents(&self, py: Python<'_>, ids: Vec<String>, documents: Vec<String>) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.update_documents(ids, documents))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[pyo3(signature = (text=None, vector=None, k=10, where_=None, where_document=None, include=None))]
     fn query(
-        &mut self,
+        &self,
         py: Python<'_>,
         text: Option<String>,
         vector: Option<PyObject>,
@@ -218,12 +258,14 @@ impl Collection {
         let where_json = where_to_json(py, &where_)?;
         let wd_json = where_to_json(py, &where_document)?;
         // text queries still call the embedder internally (query() applies
-        // the GAP-1 guard itself, C5) — allow_threads is still sound here:
-        // PyEmbedder::embed re-acquires the GIL itself when it needs it.
-        let inner = &mut self.inner;
+        // the GAP-1 guard itself, C5); PyEmbedder::embed re-acquires the GIL.
+        let inner = &self.inner;
         let r = py
             .allow_threads(|| {
-                inner.query(text, vector_arr, k, where_json.as_ref(), wd_json.as_ref(), include.as_deref())
+                inner
+                    .lock()
+                    .map_err(|_| lock_poisoned())?
+                    .query(text, vector_arr, k, where_json.as_ref(), wd_json.as_ref(), include.as_deref())
             })
             .map_err(|e| convert::core_err_to_py(py, e))?;
         convert::query_result_to_py(py, r)
@@ -231,7 +273,7 @@ impl Collection {
 
     #[pyo3(signature = (ids=None, where_=None, where_document=None, limit=None, offset=None, include=None))]
     fn get(
-        &mut self,
+        &self,
         py: Python<'_>,
         ids: Option<Vec<String>>,
         where_: Option<PyObject>,
@@ -242,11 +284,13 @@ impl Collection {
     ) -> PyResult<PyObject> {
         let where_json = where_to_json(py, &where_)?;
         let wd_json = where_to_json(py, &where_document)?;
-        // &mut + `move`: see health() above for why.
-        let inner = &mut self.inner;
+        let inner = &self.inner;
         let r = py
-            .allow_threads(move || {
-                inner.get(ids, where_json.as_ref(), wd_json.as_ref(), limit, offset, include.as_deref())
+            .allow_threads(|| {
+                inner
+                    .lock()
+                    .map_err(|_| lock_poisoned())?
+                    .get(ids, where_json.as_ref(), wd_json.as_ref(), limit, offset, include.as_deref())
             })
             .map_err(|e| convert::core_err_to_py(py, e))?;
         convert::get_result_to_py(py, r)
@@ -254,7 +298,7 @@ impl Collection {
 
     #[pyo3(signature = (embedder, dim=None, bit_width=None, batch_size=256, on_progress=None, skip_empty=None))]
     fn reembed(
-        &mut self,
+        &self,
         py: Python<'_>,
         embedder: PyObject,
         dim: Option<i64>,
@@ -269,28 +313,34 @@ impl Collection {
         let skip_empty = skip_empty.unwrap_or_else(|| "error".to_string());
         let core_embedder = PyEmbedder::new(embedder);
 
+        // I1's forcing function: unlike the old reembed (which held the GIL
+        // throughout because the progress callback captured `py`), the whole
+        // reembed now runs inside allow_threads. The progress callback
+        // re-acquires the GIL itself via `Python::with_gil` on each tick. If
+        // the Python callback raises, we stash the exact PyErr and surface it
+        // (preserving the historical progress-error precedence) rather than
+        // the CoreError it collapses to for the core control flow.
+        let inner = &self.inner;
         let mut progress_err: Option<PyErr> = None;
-        let mut progress_cb = |processed: i64, total: i64| -> Result<(), CoreError> {
-            if let Some(cb) = &on_progress {
-                if let Err(e) = cb.bind(py).call1((processed, total)) {
-                    let msg = e.to_string();
-                    progress_err = Some(e);
-                    return Err(CoreError::Other(msg));
+        let result: Result<turbovecdb_core::types::ReembedReport, CoreError> = py.allow_threads(|| {
+            let mut guard = inner.lock().map_err(|_| lock_poisoned())?;
+            let mut progress_cb = |processed: i64, total: i64| -> Result<(), CoreError> {
+                match &on_progress {
+                    Some(cb) => Python::with_gil(|py| match cb.bind(py).call1((processed, total)) {
+                        Ok(_) => Ok(()),
+                        Err(e) => {
+                            let msg = e.to_string();
+                            progress_err = Some(e);
+                            Err(CoreError::Other(msg))
+                        }
+                    }),
+                    None => Ok(()),
                 }
-            }
-            Ok(())
-        };
-        let progress_ref: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>> =
-            Some(&mut progress_cb);
-
-        let result = self.inner.reembed(
-            core_embedder,
-            dim,
-            bit_width,
-            batch_size,
-            progress_ref,
-            &skip_empty,
-        );
+            };
+            let progress_ref: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>> =
+                Some(&mut progress_cb);
+            guard.reembed(core_embedder, dim, bit_width, batch_size, progress_ref, &skip_empty)
+        });
         match result {
             Ok(r) => convert::reembed_report_to_py(py, r),
             Err(_) if progress_err.is_some() => Err(progress_err.unwrap()),
