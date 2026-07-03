@@ -543,8 +543,13 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         let tmp = format!("{}.tmp", self.tvim_path);
         self.index.as_ref().unwrap().write(&tmp)?;
         std::fs::rename(&tmp, &self.tvim_path)?;
-        let sg = self.store_gen_val()?;
-        self.meta_set("tvim_gen", &sg.to_string())?; // autocommits
+        // Stamp tvim_gen from seen_gen — the generation the in-memory index
+        // actually reflects — not a fresh re-read of store_gen. Without the
+        // caller's file lock held, a concurrent writer can bump store_gen
+        // between the rename above and a re-read here, which would mark a
+        // stale .tvim as coherent (wrong query results) instead of merely
+        // stale (harmless rebuild on next open).
+        self.meta_set("tvim_gen", &self.seen_gen.to_string())?; // autocommits
         self.wal_checkpoint();
         self.dirty = false;
         Ok(())

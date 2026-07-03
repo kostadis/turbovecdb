@@ -176,7 +176,7 @@ class Collection:
             self._core.flush()
 
     def close(self):
-        with self._tlock:
+        with self._locked():
             self._core.close()
 
     def __enter__(self):

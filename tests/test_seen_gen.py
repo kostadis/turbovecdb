@@ -8,7 +8,10 @@ observable guarantees.)"""
 
 import os
 
+import pytest
+
 import turbovecdb
+from turbovecdb import TurboVecError
 
 DIM = 8
 
@@ -57,3 +60,24 @@ def test_second_handle_sees_committed_writes(tmp_path):
 
     db.close()
     db2.close()
+
+
+def test_close_takes_the_write_lock(tmp_path):
+    """close() must contend for the same cross-process write lock as flush()/
+    add() (regression for C1: close() used to flush index.tvim under only the
+    in-process lock, letting a concurrent writer bump store_gen between the
+    rename and the tvim_gen stamp — a stale .tvim silently marked coherent)."""
+    path = str(tmp_path / "db")
+    db1 = turbovecdb.connect(path)
+    col1 = db1.collection("c", dim=DIM, create=True, lock_timeout=0.5)
+    col1.add(ids=["a"], vectors=[_v(0)])
+
+    # A second, independent handle holds the write lock externally.
+    db2 = turbovecdb.connect(path)
+    col2 = db2.collection("c", dim=DIM, lock_timeout=0.5)
+    col2._flock.acquire()
+    try:
+        with pytest.raises(TurboVecError, match="could not acquire write lock"):
+            col1.close()
+    finally:
+        col2._flock.release()
