@@ -25,6 +25,21 @@ fn blob_to_f32(blob: &[u8]) -> impl Iterator<Item = f32> + '_ {
     blob.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
 }
 
+/// Validates a stored vector blob's length against `dim` before parsing it.
+/// `chunks_exact(4)` silently drops any trailing partial chunk, so an
+/// unchecked truncated or corrupted row would produce a short vector and a
+/// wrong-but-plausible dot product instead of a clear error (R5).
+fn blob_to_f32_checked(blob: &[u8], dim: i64) -> Result<impl Iterator<Item = f32> + '_, CoreError> {
+    let expected = dim as usize * 4;
+    if blob.len() != expected {
+        return Err(CoreError::Other(format!(
+            "corrupt vector blob: expected {expected} bytes for dim {dim}, got {}",
+            blob.len()
+        )));
+    }
+    Ok(blob_to_f32(blob))
+}
+
 fn f32_to_blob(row: impl Iterator<Item = f32>) -> Vec<u8> {
     row.flat_map(|x| x.to_ne_bytes()).collect()
 }
@@ -221,7 +236,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             while let Some(row) = rows.next() {
                 let (uid, blob) = row?;
                 uids.push(uid as u64);
-                flat.extend(blob_to_f32(&blob));
+                flat.extend(blob_to_f32_checked(&blob, self.dim.unwrap())?);
             }
             (uids, flat)
         };
@@ -932,7 +947,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             let mut scored: Vec<(f32, i64)> = Vec::new();
             for &uid in &cand_uids {
                 if let Some((_, _, _, vecb)) = map.get(&uid) {
-                    let dot: f32 = qrow.iter().zip(blob_to_f32(vecb)).map(|(a, b)| a * b).sum();
+                    let dot: f32 = qrow
+                        .iter()
+                        .zip(blob_to_f32_checked(vecb, self.dim.unwrap())?)
+                        .map(|(a, b)| a * b)
+                        .sum();
                     scored.push((1.0 - dot, uid));
                 }
             }
@@ -956,7 +975,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                     result.metadatas.push(meta.clone());
                 }
                 if inc.vectors {
-                    result.vectors.as_mut().unwrap().push(blob_to_f32(vecb).collect());
+                    result.vectors.as_mut().unwrap().push(blob_to_f32_checked(vecb, self.dim.unwrap())?.collect());
                 }
             }
             Ok(result)
@@ -1046,7 +1065,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 result.documents.push(if inc.documents { Some(doc) } else { None });
                 result.metadatas.push(if inc.metadatas { meta } else { String::new() });
                 if inc.vectors {
-                    result.vectors.as_mut().unwrap().push(blob_to_f32(&vecb).collect());
+                    // dim is only None for a still-empty collection, in
+                    // which case this loop never actually iterates — but
+                    // fall back to 0 rather than unwrap() so a corrupted
+                    // dim/docs pairing errors instead of panicking.
+                    result.vectors.as_mut().unwrap().push(blob_to_f32_checked(&vecb, self.dim.unwrap_or(0))?.collect());
                 }
             }
         }
@@ -1199,7 +1222,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
         // Retained docs keep their old vector (dims match new_dim here); re-normalize.
         for (uid, vecb) in &keep {
-            let v: Vec<f32> = blob_to_f32(vecb).collect();
+            let v: Vec<f32> = blob_to_f32_checked(vecb, old_dim)?.collect();
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let denom = if norm == 0.0 { 1.0 } else { norm };
             let bytes: Vec<u8> = v.iter().flat_map(|x| (x / denom).to_ne_bytes()).collect();
@@ -1366,6 +1389,30 @@ mod tests {
         let bad = Array2::from_shape_vec((1, 4), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
         let e = c.add(vec!["b".into()], None, None, Some(bad)).unwrap_err();
         assert!(matches!(e, CoreError::DimensionMismatch(_)));
+    }
+
+    /// Regression for R5: blob_to_f32 used chunks_exact(4), which silently
+    /// drops any trailing partial chunk — a truncated or corrupted vector
+    /// blob would produce a short vector and a wrong-but-plausible result
+    /// instead of an error. Directly corrupts a stored blob (bypassing the
+    /// normal write path) and asserts reads now error instead of silently
+    /// truncating.
+    #[test]
+    fn truncated_vector_blob_errors_on_read() {
+        let dir = temp_dir("truncated_blob");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+
+        // dim=8 needs 32 bytes; truncate to 4 (one float) instead.
+        c.conn
+            .execute("UPDATE docs SET vector = ?1 WHERE str_id = 'a'", params![vec![0u8; 4]])
+            .unwrap();
+
+        let include = ["vectors".to_string()];
+        match c.get(None, None, None, None, None, Some(&include)) {
+            Err(CoreError::Other(_)) => {}
+            other => panic!("expected Err(CoreError::Other(_)), got {}", other.is_ok()),
+        }
     }
 
     #[test]
