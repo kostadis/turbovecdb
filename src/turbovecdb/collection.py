@@ -32,7 +32,7 @@ from typing import Optional
 from filelock import FileLock, Timeout
 
 from ._core import Collection as _CoreCollection
-from .errors import TurboVecError
+from .errors import EmbedderIdentityMismatchError, TurboVecError
 from .index import DEFAULT_BIT_WIDTH
 
 _log = logging.getLogger(__name__)
@@ -126,6 +126,7 @@ class Collection:
         # brand-new database — FileLock can't create the lock file otherwise.
         os.makedirs(os.path.dirname(lock_path), exist_ok=True)
         self._flock = FileLock(lock_path, timeout=lock_timeout)
+        self._embedder = embedder
         self._has_embedder = embedder is not None
         # The Rust constructor does a read-then-write of bit_width/dim/
         # embedder_identity meta on first creation, with no locking of its
@@ -170,15 +171,52 @@ class Collection:
 
     # -- writes (serialized by the file lock) ---------------------------------
 
-    def add(self, *, ids, documents=None, metadatas=None, vectors=None):
+    def _check_embedder_identity_matches(self, current_identity):
+        """Raise EmbedderIdentityMismatchError if `current_identity` doesn't
+        match the collection's stored embedder identity. Mirrors the Rust
+        GAP-1 guard (``check_embedder_identity`` in collection.rs) — used
+        both as a fast, lock-free pre-check before embedding and as the
+        authoritative re-check right before the locked write (R3)."""
+        stored = self._core.meta_get("embedder_identity")
+        if stored is not None and current_identity != stored:
+            raise EmbedderIdentityMismatchError(
+                f"embedder identity mismatch: stored {stored!r} != current "
+                f"{current_identity!r}; use reembed() to change embedders"
+            )
+
+    def _write(self, ids, documents, metadatas, vectors, *, upsert):
         self._warn_vectors_bypass(vectors)
-        with self._locked():
-            self._core.add(ids, documents, metadatas, vectors)
+        core_method = self._core.upsert if upsert else self._core.add
+        if documents is not None and vectors is None and self._embedder is not None:
+            # Embed *before* acquiring the cross-process write lock. A slow
+            # (e.g. network-backed) embedder call used to run inside the
+            # locked section (the Rust core embeds internally as part of
+            # add/upsert), blocking every other writer in every other
+            # process for the whole embedding duration, not just the actual
+            # SQLite write (R3). The vectors-given branch of the Rust core's
+            # resolve_vectors() L2-normalizes on the way in (the same
+            # vecmath::l2_normalize the embedder path already used), so
+            # passing the raw embedder output through as vectors= here is
+            # equivalent to today's embed-inside-the-lock path.
+            current_identity = embedder_identity(self._embedder)
+            self._check_embedder_identity_matches(current_identity)  # fail fast, unlocked
+            computed_vectors = self._embedder(documents)
+            with self._locked():
+                # Re-check under the lock: a concurrent reembed() elsewhere
+                # could have changed the stored identity in the window
+                # between the unlocked pre-check/embed above and acquiring
+                # the lock here.
+                self._check_embedder_identity_matches(current_identity)
+                core_method(ids, documents, metadatas, computed_vectors)
+        else:
+            with self._locked():
+                core_method(ids, documents, metadatas, vectors)
+
+    def add(self, *, ids, documents=None, metadatas=None, vectors=None):
+        self._write(ids, documents, metadatas, vectors, upsert=False)
 
     def upsert(self, *, ids, documents=None, metadatas=None, vectors=None):
-        self._warn_vectors_bypass(vectors)
-        with self._locked():
-            self._core.upsert(ids, documents, metadatas, vectors)
+        self._write(ids, documents, metadatas, vectors, upsert=True)
 
     def delete(self, *, ids=None, where=None):
         with self._locked():

@@ -95,19 +95,29 @@ impl Collection {
         Python::with_gil(|py| self.inner.meta_get(key).map_err(|e| convert::core_err_to_py(py, e)))
     }
 
-    fn flush(&mut self) -> PyResult<()> {
-        Python::with_gil(|py| self.inner.flush().map_err(|e| convert::core_err_to_py(py, e)))
+    fn flush(&mut self, py: Python<'_>) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.allow_threads(|| inner.flush()).map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn close(&mut self) -> PyResult<()> {
-        Python::with_gil(|py| self.inner.close().map_err(|e| convert::core_err_to_py(py, e)))
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.allow_threads(|| inner.close()).map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn health(&self) -> PyResult<PyObject> {
-        Python::with_gil(|py| {
-            let r = self.inner.health().map_err(|e| convert::core_err_to_py(py, e))?;
-            convert::health_result_to_py(py, r)
-        })
+    fn health(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+        // &mut, not &self: rusqlite::Connection holds RefCell-based statement
+        // caches that aren't Sync, so a shared reference can't cross the
+        // allow_threads boundary (health()'s core method only needs &self;
+        // this is purely about satisfying allow_threads' Send bound).
+        let inner = &mut self.inner;
+        // `move`: without it, Rust's disjoint-closure-capture analysis
+        // captures `*inner` by shared reference (since health() only needs
+        // &self), which would require Collection<..> to be Sync (it isn't —
+        // rusqlite::Connection's caches use RefCell). `move` forces
+        // capturing the outer `&mut` binding itself instead.
+        let r = py.allow_threads(move || inner.health()).map_err(|e| convert::core_err_to_py(py, e))?;
+        convert::health_result_to_py(py, r)
     }
 
     #[pyo3(signature = (ids, documents=None, metadatas=None, vectors=None))]
@@ -121,8 +131,16 @@ impl Collection {
     ) -> PyResult<()> {
         let metadatas = metadatas_to_json(py, metadatas)?;
         let vectors = vectors_to_array(py, &vectors)?;
-        self.inner
-            .add(ids, documents, metadatas, vectors)
+        // Release the GIL for the actual write: SQLite I/O + index
+        // quantization/mirroring don't touch Python, so holding the GIL for
+        // their duration needlessly blocks every other Python thread in the
+        // process (R3). The embedder itself now runs in the Python wrapper
+        // (collection.py) before this call, outside the cross-process write
+        // lock — if it were still invoked from here, PyEmbedder::embed's own
+        // Python::with_gil would simply re-acquire, which is sound but
+        // wasteful; add()/upsert() no longer take that path in practice.
+        let inner = &mut self.inner;
+        py.allow_threads(|| inner.add(ids, documents, metadatas, vectors))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
@@ -137,20 +155,21 @@ impl Collection {
     ) -> PyResult<()> {
         let metadatas = metadatas_to_json(py, metadatas)?;
         let vectors = vectors_to_array(py, &vectors)?;
-        self.inner
-            .upsert(ids, documents, metadatas, vectors)
+        let inner = &mut self.inner;
+        py.allow_threads(|| inner.upsert(ids, documents, metadatas, vectors))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
-    fn clear(&mut self) -> PyResult<()> {
-        Python::with_gil(|py| self.inner.clear().map_err(|e| convert::core_err_to_py(py, e)))
+    fn clear(&mut self, py: Python<'_>) -> PyResult<()> {
+        let inner = &mut self.inner;
+        py.allow_threads(|| inner.clear()).map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[pyo3(signature = (ids=None, where_=None))]
     fn delete(&mut self, py: Python<'_>, ids: Option<Vec<String>>, where_: Option<PyObject>) -> PyResult<()> {
         let where_json = where_to_json(py, &where_)?;
-        self.inner
-            .delete(ids, where_json.as_ref())
+        let inner = &mut self.inner;
+        py.allow_threads(|| inner.delete(ids, where_json.as_ref()))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
@@ -166,14 +185,15 @@ impl Collection {
                 }
             })
             .collect();
-        self.inner
-            .update_metadata(ids, dumped?)
+        let dumped = dumped?;
+        let inner = &mut self.inner;
+        py.allow_threads(|| inner.update_metadata(ids, dumped))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     fn update_documents(&mut self, py: Python<'_>, ids: Vec<String>, documents: Vec<String>) -> PyResult<()> {
-        self.inner
-            .update_documents(ids, documents)
+        let inner = &mut self.inner;
+        py.allow_threads(|| inner.update_documents(ids, documents))
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
@@ -191,16 +211,21 @@ impl Collection {
         let vector_arr = vectors_to_array(py, &vector)?;
         let where_json = where_to_json(py, &where_)?;
         let wd_json = where_to_json(py, &where_document)?;
-        let r = self
-            .inner
-            .query(text, vector_arr, k, where_json.as_ref(), wd_json.as_ref(), include.as_deref())
+        // text queries still call the embedder internally (query() applies
+        // the GAP-1 guard itself, C5) — allow_threads is still sound here:
+        // PyEmbedder::embed re-acquires the GIL itself when it needs it.
+        let inner = &mut self.inner;
+        let r = py
+            .allow_threads(|| {
+                inner.query(text, vector_arr, k, where_json.as_ref(), wd_json.as_ref(), include.as_deref())
+            })
             .map_err(|e| convert::core_err_to_py(py, e))?;
         convert::query_result_to_py(py, r)
     }
 
     #[pyo3(signature = (ids=None, where_=None, where_document=None, limit=None, offset=None, include=None))]
     fn get(
-        &self,
+        &mut self,
         py: Python<'_>,
         ids: Option<Vec<String>>,
         where_: Option<PyObject>,
@@ -211,9 +236,12 @@ impl Collection {
     ) -> PyResult<PyObject> {
         let where_json = where_to_json(py, &where_)?;
         let wd_json = where_to_json(py, &where_document)?;
-        let r = self
-            .inner
-            .get(ids, where_json.as_ref(), wd_json.as_ref(), limit, offset, include.as_deref())
+        // &mut + `move`: see health() above for why.
+        let inner = &mut self.inner;
+        let r = py
+            .allow_threads(move || {
+                inner.get(ids, where_json.as_ref(), wd_json.as_ref(), limit, offset, include.as_deref())
+            })
             .map_err(|e| convert::core_err_to_py(py, e))?;
         convert::get_result_to_py(py, r)
     }
