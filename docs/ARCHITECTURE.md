@@ -122,7 +122,7 @@ The `docs` table *is* the bidirectional `str_id ↔ uid` map. New ids draw from 
 | Layer | File | Lines | Responsibility |
 |---|---|---|---|
 | Public API | [`__init__.py`](../src/turbovecdb/__init__.py) | 40 | Re-exports `connect`, `Database`, `Collection`, `QueryResult`, `GetResult`, the error types |
-| Collection factory | [`database.py`](../src/turbovecdb/database.py) | 67 | `Database` = handle over a directory; `connect()` does no I/O; `collection()` opens/creates a subdir and **caches the handle per name** (first call's options win) |
+| Collection factory | [`database.py`](../src/turbovecdb/database.py) | 67 | `Database` = handle over a directory; `connect()` does no I/O; `collection()` opens/creates a subdir and **caches the handle per name** (a later call requesting conflicting options raises rather than silently reusing the first call's handle) |
 | Engine | [`collection.py`](../src/turbovecdb/collection.py) | 435 | The read/write paths, index reload lifecycle, embedding hook, `QueryResult`/`GetResult` |
 | Index lifecycle | [`index.py`](../src/turbovecdb/index.py) | 51 | `turbovec.IdMapIndex` build/load/atomic-write + `l2_normalize` (with zero guard); `DEFAULT_BIT_WIDTH=4` |
 | Filters | [`filters.py`](../src/turbovecdb/filters.py) | 100 | filter dicts → parameterized SQL over the metadata JSON |

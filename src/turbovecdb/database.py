@@ -19,11 +19,17 @@ import threading
 from filelock import FileLock, Timeout
 
 from ._core import Database as _CoreDatabase
-from .collection import Collection, _LOCK_TIMEOUT, write_lock_path
+from .collection import Collection, _LOCK_TIMEOUT, embedder_identity, write_lock_path
 from .errors import CollectionNotFoundError, TurboVecError
 from .index import DEFAULT_BIT_WIDTH
 
 _log = logging.getLogger(__name__)
+
+# Sentinel distinguishing "caller didn't pass this option" from "caller
+# explicitly passed the default value" — needed so Database.collection()'s
+# conflicting-options check (C6) doesn't false-positive on a caller who
+# never had an opinion about bit_width/metric/embedder.
+_UNSET = object()
 
 
 class Database:
@@ -37,30 +43,65 @@ class Database:
     def path(self):
         return self._path
 
-    def collection(self, name, *, dim=None, bit_width=DEFAULT_BIT_WIDTH,
-                   metric="cosine", embedder=None, create=True, lock_timeout=None):
+    def collection(self, name, *, dim=None, bit_width=_UNSET,
+                   metric=_UNSET, embedder=_UNSET, create=True, lock_timeout=None):
         """Open (or create) a collection by name.
 
         With ``create=False`` a missing collection raises
-        :class:`CollectionNotFoundError`. Handles are cached per name; the first
-        call's options win for a cached handle.
+        :class:`CollectionNotFoundError`. Handles are cached per name; a
+        second call for an already-cached handle that explicitly requests a
+        different ``dim``/``bit_width``/``metric``/``embedder`` raises
+        :class:`TurboVecError` rather than silently reusing the first call's
+        handle with the caller's options ignored (C6).
 
         ``name`` must match ``[A-Za-z0-9_-]{1,128}``.
         """
         with self._lock:
             cached = self._collections.get(name)
             if cached is not None:
+                self._check_no_conflict(name, cached, dim, bit_width, metric, embedder)
                 return cached
             coll_dir = self._core.collection_dir(name)
             if not create and not os.path.isdir(coll_dir):
                 raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
-            kwargs = dict(dim=dim, bit_width=bit_width,
-                          metric=metric, embedder=embedder)
+            kwargs = dict(
+                dim=dim,
+                bit_width=DEFAULT_BIT_WIDTH if bit_width is _UNSET else bit_width,
+                metric="cosine" if metric is _UNSET else metric,
+                embedder=None if embedder is _UNSET else embedder,
+            )
             if lock_timeout is not None:
                 kwargs["lock_timeout"] = lock_timeout
             col = Collection(coll_dir, **kwargs)
             self._collections[name] = col
             return col
+
+    @staticmethod
+    def _check_no_conflict(name, cached, dim, bit_width, metric, embedder):
+        """Raise if any explicitly-requested option conflicts with the
+        cached handle's actual configuration. Options the caller didn't
+        specify (``None`` for dim, ``_UNSET`` for the rest) are never a
+        conflict — this only catches an explicit, differing request."""
+        conflicts = []
+        if dim is not None and cached.dim is not None and dim != cached.dim:
+            conflicts.append(f"dim={dim!r} (cached handle: {cached.dim!r})")
+        if bit_width is not _UNSET and bit_width != cached._bit_width:
+            conflicts.append(f"bit_width={bit_width!r} (cached handle: {cached._bit_width!r})")
+        if metric is not _UNSET:
+            cached_metric = cached._meta_get("metric", "cosine")
+            if metric != cached_metric:
+                conflicts.append(f"metric={metric!r} (cached handle: {cached_metric!r})")
+        if embedder is not _UNSET:
+            cached_identity = cached.embedder_identity
+            requested_identity = None if embedder is None else embedder_identity(embedder)
+            if requested_identity != cached_identity:
+                conflicts.append(
+                    f"embedder identity {requested_identity!r} (cached handle: {cached_identity!r})"
+                )
+        if conflicts:
+            raise TurboVecError(
+                f"collection {name!r} is already open with different options: {'; '.join(conflicts)}"
+            )
 
     def list_collections(self):
         with self._lock:

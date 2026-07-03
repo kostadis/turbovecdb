@@ -99,6 +99,21 @@ def write_lock_path(coll_dir):
     return os.path.join(root, name + ".lock")
 
 
+def embedder_identity(callable_):
+    """The identity string an embedder callable would be stored/checked
+    under — a Python-side mirror of ``PyEmbedder::identity()``
+    (``crates/turbovecdb-py/src/embedder.rs``): a plain function's
+    ``__name__``, else ``f"{module}.{qualname}"`` for its class. Used by
+    :meth:`Database.collection` to detect a conflicting embedder on an
+    already-cached handle (C6) before it ever reaches the Rust core's
+    authoritative GAP-1 guard."""
+    name = getattr(callable_, "__name__", None)
+    if isinstance(name, str):
+        return name
+    cls = type(callable_)
+    return f"{getattr(cls, '__module__', '') or ''}.{getattr(cls, '__name__', '') or ''}"
+
+
 class Collection:
     def __init__(self, coll_dir, *, dim=None, bit_width=DEFAULT_BIT_WIDTH,
                  metric="cosine", embedder=None, lock_timeout=_LOCK_TIMEOUT):
