@@ -54,10 +54,16 @@ impl Collection {
         embedder: Option<PyObject>,
         lock_timeout: f64,
     ) -> PyResult<Self> {
-        let _ = lock_timeout; // cross-process lock lives in the Python wrapper (collection.py), never used here
         Python::with_gil(|py| {
-            let inner = CoreCollection::new(coll_dir, dim, bit_width, metric, embedder.map(PyEmbedder::new))
-                .map_err(|e| convert::core_err_to_py(py, e))?;
+            let inner = CoreCollection::new(
+                coll_dir,
+                dim,
+                bit_width,
+                metric,
+                embedder.map(PyEmbedder::new),
+                lock_timeout,
+            )
+            .map_err(|e| convert::core_err_to_py(py, e))?;
             Ok(Collection { inner })
         })
     }
