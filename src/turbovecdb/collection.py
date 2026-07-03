@@ -121,9 +121,28 @@ class Collection:
         self._tlock = threading.RLock()  # in-process structure guard
         # Cross-process write lock. Held around every write; the Rust core does
         # not lock, so this wrapper is the sole serialization point.
-        self._flock = FileLock(write_lock_path(coll_dir), timeout=lock_timeout)
+        lock_path = write_lock_path(coll_dir)
+        # The lock file's parent (the database root) may not exist yet for a
+        # brand-new database — FileLock can't create the lock file otherwise.
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        self._flock = FileLock(lock_path, timeout=lock_timeout)
         self._has_embedder = embedder is not None
-        self._core = _CoreCollection(coll_dir, dim, bit_width, metric, embedder, lock_timeout)
+        # The Rust constructor does a read-then-write of bit_width/dim/
+        # embedder_identity meta on first creation, with no locking of its
+        # own (it runs before this wrapper exists to hold one). Without
+        # this, two processes racing to create the same new collection with
+        # different options could each proceed believing their own
+        # in-memory values won, while the meta table ends up with whichever
+        # wrote last (C7). Only pay the lock-acquire cost when the
+        # collection doesn't look already-created, so re-opening an
+        # existing collection — the common, hot case, e.g. service.py opens
+        # one per request — stays lock-free as before.
+        looks_new = not os.path.exists(os.path.join(coll_dir, "store.sqlite3"))
+        if looks_new:
+            with self._locked():
+                self._core = _CoreCollection(coll_dir, dim, bit_width, metric, embedder, lock_timeout)
+        else:
+            self._core = _CoreCollection(coll_dir, dim, bit_width, metric, embedder, lock_timeout)
 
     def _warn_vectors_bypass(self, vectors):
         if vectors is not None and self._has_embedder:
