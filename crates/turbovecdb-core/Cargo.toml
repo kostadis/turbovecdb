@@ -13,7 +13,10 @@ serde_json = "1.0.150"
 turbovec = "0.9"
 
 [dev-dependencies]
-# "hooks" (commit_hook) is test-only: resolver v2 keeps it out of the
-# production build, used to deterministically force a COMMIT failure in
-# collection.rs's C2 regression test.
-rusqlite = { version = "0.32", features = ["bundled", "hooks"] }
+# "hooks" (commit_hook) and "trace" (Connection::trace) are test-only:
+# resolver v2 keeps them out of the production build. commit_hook
+# deterministically forces a COMMIT failure (C2 regression test); trace
+# fires at statement boundaries, used to inject a concurrent writer's
+# commit exactly between query()'s allowlist and re-rank SELECTs (C3
+# regression test).
+rusqlite = { version = "0.32", features = ["bundled", "hooks", "trace"] }

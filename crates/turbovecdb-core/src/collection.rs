@@ -854,75 +854,100 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             return Ok(Self::empty_query_result(inc.vectors));
         }
 
-        let allow = self.query_allowlist(where_, where_document)?;
-        let allow_ids: Option<Vec<u64>> = match &allow {
-            Some(uids) => {
-                if uids.is_empty() {
-                    return Ok(Self::empty_query_result(inc.vectors));
-                }
-                Some(uids.iter().map(|&x| x as u64).collect())
-            }
-            None => None,
-        };
-
         let pool = std::cmp::max(k as i64, RERANK_FLOOR) as usize;
         let qrow: Vec<f32> = q.row(0).to_vec();
-        let (_, cand_uids_u64) = self.index.as_ref().unwrap().search(&qrow, pool, allow_ids.as_deref());
-        let cand_uids: Vec<i64> = cand_uids_u64.iter().map(|&x| x as i64).collect();
 
-        // Exact-cosine re-rank of the candidate pool.
-        let mut map: HashMap<i64, (String, String, String, Vec<u8>)> = HashMap::new();
-        if !cand_uids.is_empty() {
-            let qs = vec!["?"; cand_uids.len()].join(",");
-            let sql = format!(
-                "SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN ({qs})"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(cand_uids.iter()), |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    r.get::<_, Vec<u8>>(4)?,
-                ))
-            })?;
-            for row in rows {
-                let (u, sid, doc, meta, vec) = row?;
-                map.insert(u, (sid, doc, meta, vec));
-            }
-        }
-        let mut scored: Vec<(f32, i64)> = Vec::new();
-        for &uid in &cand_uids {
-            if let Some((_, _, _, vecb)) = map.get(&uid) {
-                let dot: f32 = qrow.iter().zip(blob_to_f32(vecb)).map(|(a, b)| a * b).sum();
-                scored.push((1.0 - dot, uid));
-            }
-        }
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
+        // Snapshot-consistent read: the filter-allowlist SELECT, the index
+        // search, and the candidate re-rank SELECT used to run as separate
+        // autocommit statements, so a writer's commit in between could
+        // return a candidate whose metadata no longer matches `where` (the
+        // allowlist was computed against the old snapshot), or drop a
+        // candidate deleted after the allowlist ran, yielding fewer than k
+        // results even when other matches exist (C3). WAL gives
+        // snapshot-consistent reads for free across statements enclosed in
+        // one deferred transaction.
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        let snapshot = (|| -> Result<QueryResult, CoreError> {
+            let allow = self.query_allowlist(where_, where_document)?;
+            let allow_ids: Option<Vec<u64>> = match &allow {
+                Some(uids) => {
+                    if uids.is_empty() {
+                        return Ok(Self::empty_query_result(inc.vectors));
+                    }
+                    Some(uids.iter().map(|&x| x as u64).collect())
+                }
+                None => None,
+            };
 
-        let mut result = QueryResult {
-            vectors: if inc.vectors { Some(Vec::new()) } else { None },
-            ..Default::default()
-        };
-        for (dist, uid) in &scored {
-            let (sid, doc, meta, vecb) = map.get(uid).unwrap();
-            result.ids.push(sid.clone());
-            if inc.distances {
-                result.distances.push(*dist as f64);
+            let (_, cand_uids_u64) =
+                self.index.as_ref().unwrap().search(&qrow, pool, allow_ids.as_deref());
+            let cand_uids: Vec<i64> = cand_uids_u64.iter().map(|&x| x as i64).collect();
+
+            // Exact-cosine re-rank of the candidate pool.
+            let mut map: HashMap<i64, (String, String, String, Vec<u8>)> = HashMap::new();
+            if !cand_uids.is_empty() {
+                let qs = vec!["?"; cand_uids.len()].join(",");
+                let sql = format!(
+                    "SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN ({qs})"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(cand_uids.iter()), |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        r.get::<_, Vec<u8>>(4)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (u, sid, doc, meta, vec) = row?;
+                    map.insert(u, (sid, doc, meta, vec));
+                }
             }
-            if inc.documents {
-                result.documents.push(doc.clone());
+            let mut scored: Vec<(f32, i64)> = Vec::new();
+            for &uid in &cand_uids {
+                if let Some((_, _, _, vecb)) = map.get(&uid) {
+                    let dot: f32 = qrow.iter().zip(blob_to_f32(vecb)).map(|(a, b)| a * b).sum();
+                    scored.push((1.0 - dot, uid));
+                }
             }
-            if inc.metadatas {
-                result.metadatas.push(meta.clone());
+            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(k);
+
+            let mut result = QueryResult {
+                vectors: if inc.vectors { Some(Vec::new()) } else { None },
+                ..Default::default()
+            };
+            for (dist, uid) in &scored {
+                let (sid, doc, meta, vecb) = map.get(uid).unwrap();
+                result.ids.push(sid.clone());
+                if inc.distances {
+                    result.distances.push(*dist as f64);
+                }
+                if inc.documents {
+                    result.documents.push(doc.clone());
+                }
+                if inc.metadatas {
+                    result.metadatas.push(meta.clone());
+                }
+                if inc.vectors {
+                    result.vectors.as_mut().unwrap().push(blob_to_f32(vecb).collect());
+                }
             }
-            if inc.vectors {
-                result.vectors.as_mut().unwrap().push(blob_to_f32(vecb).collect());
+            Ok(result)
+        })();
+
+        match &snapshot {
+            Ok(_) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    self.rollback();
+                    return Err(e.into());
+                }
             }
+            Err(_) => self.rollback(),
         }
-        Ok(result)
+        snapshot
     }
 
     pub fn get(
@@ -1462,6 +1487,79 @@ mod tests {
         let q = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
         let r = c.query(None, Some(q), 1, None, None, None).unwrap();
         assert_eq!(r.ids, vec!["a"]);
+    }
+
+    thread_local! {
+        // `Connection::trace` (rusqlite's "trace" feature) only accepts a
+        // bare `fn(&str)` pointer, not a capturing closure — state for the
+        // injected concurrent delete below has to live outside the closure.
+        static TRACE_FIRED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+        static TRACE_DB_PATH: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    }
+
+    /// Fires on every SQL statement query() is about to execute. The
+    /// re-rank SELECT (`SELECT uid, str_id, ... FROM docs WHERE uid IN
+    /// (...)`) is matched by text — not by position — since query() also
+    /// runs other statements first (ensure_current()'s store_gen check,
+    /// BEGIN DEFERRED, the allowlist SELECT); by the time this callback
+    /// fires for the re-rank SELECT, the allowlist SELECT has already
+    /// returned. Injects a concurrent delete + commit from a second,
+    /// independent connection to the same file, exactly once.
+    fn trace_inject_delete_before_rerank_select(sql: &str) {
+        if sql.starts_with("SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN")
+            && !TRACE_FIRED.with(|f| f.replace(true))
+        {
+            let path = TRACE_DB_PATH.with(|p| p.borrow().clone());
+            let conn2 = rusqlite::Connection::open(&path).unwrap();
+            conn2.execute("DELETE FROM docs WHERE str_id = 'b'", []).unwrap();
+        }
+    }
+
+    /// Regression for C3: query() used to run the allowlist SELECT and the
+    /// re-rank SELECT as separate autocommit statements, so a writer's
+    /// commit landing in between could yield fewer results than the index
+    /// actually holds (a candidate deleted after the allowlist ran would
+    /// vanish from the re-rank SELECT). A `where` filter forces a real
+    /// allowlist SELECT (statement 1); `Connection::trace` fires right as
+    /// each statement is about to execute, so counting to the second call
+    /// lands the injected concurrent delete exactly between the allowlist
+    /// SELECT and the re-rank SELECT.
+    #[test]
+    fn query_reads_are_snapshot_consistent_across_concurrent_delete() {
+        let dir = temp_dir("query_snapshot");
+        let db_path = format!("{dir}/store.sqlite3");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(
+            vec!["a".into(), "b".into()],
+            None,
+            Some(vec![r#"{"k":1}"#.into(), r#"{"k":1}"#.into()]),
+            Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.], [0., 1., 0., 0., 0., 0., 0., 0.]])),
+        )
+        .unwrap();
+
+        TRACE_FIRED.with(|f| f.set(false));
+        TRACE_DB_PATH.with(|p| *p.borrow_mut() = db_path.clone());
+        c.conn.trace(Some(trace_inject_delete_before_rerank_select));
+
+        let filter = serde_json::json!({"k": 1});
+        let q = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let r = c.query(None, Some(q), 10, Some(&filter), None, None).unwrap();
+        c.conn.trace(None);
+
+        assert!(TRACE_FIRED.with(|f| f.get()), "the concurrent delete never ran");
+        let mut ids = r.ids.clone();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["a".to_string(), "b".to_string()],
+            "query()'s own snapshot must still include \"b\", deleted after its read span started"
+        );
+
+        // The concurrent delete did commit — a fresh query (new transaction,
+        // new snapshot) must now see only "a".
+        let q2 = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let r2 = c.query(None, Some(q2), 10, Some(&filter), None, None).unwrap();
+        assert_eq!(r2.ids, vec!["a".to_string()]);
     }
 
     #[test]
