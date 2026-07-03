@@ -38,6 +38,9 @@ pub(crate) fn core_err_to_py(py: Python<'_>, e: CoreError) -> PyErr {
         CoreError::UnsupportedFilter(m) => turbovec_error(py, "UnsupportedFilterError", m),
         CoreError::CollectionNotFound(m) => turbovec_error(py, "CollectionNotFoundError", m),
         CoreError::Other(m) => turbovec_error(py, "TurboVecError", m),
+        // The cross-process write-lock timeout — historically a plain
+        // `TurboVecError` raised by the Python wrapper's `_locked()`.
+        CoreError::LockTimeout(m) => turbovec_error(py, "TurboVecError", m),
         CoreError::InvalidArgument(m) => PyValueError::new_err(m),
         CoreError::Runtime(m) => PyRuntimeError::new_err(m),
         CoreError::Sql(err) => PyRuntimeError::new_err(format!("sqlite error: {err}")),

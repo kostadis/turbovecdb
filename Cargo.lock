@@ -1583,6 +1583,7 @@ dependencies = [
 name = "turbovecdb-core"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "ndarray 0.16.1",
  "openblas-src",
  "rusqlite",

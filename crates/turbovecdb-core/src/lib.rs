@@ -9,6 +9,7 @@ pub mod database;
 pub mod embedder;
 pub mod error;
 pub mod filters;
+pub mod flock;
 pub mod index;
 pub mod types;
 pub mod vecmath;
