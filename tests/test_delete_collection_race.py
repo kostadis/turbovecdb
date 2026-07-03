@@ -109,71 +109,54 @@ def test_delete_collection_recreate_after_delete_is_usable(tmp_path):
 
 
 def test_delete_collection_race_no_data_loss(tmp_path):
-    """If a concurrent create wins after the initial checks, the post-lock
-    re-check should prevent rmtree from deleting the new collection."""
+    """A real concurrent create racing a delete must leave the collection in
+    a valid state. The delete holds the core's cross-process write lock across
+    the rmtree (in Rust now — no monkeypatchable Python ``FileLock`` seam), so
+    a racing create either finishes before the delete or is serialized against
+    it; the result is always either a clean delete or a usable recreation."""
     import os
     db_path = str(tmp_path / "db")
 
-    # Use a barrier/stub to control timing — we inject a sleep to widen
-    # the window between cache-close and flock-acquire.
-    original_acquire = None
-    from filelock import FileLock, Timeout
+    db = turbovecdb.connect(db_path)
+    c = db.collection("c", dim=8, create=True)
+    c.add(ids=["x"], vectors=[[1.0] + [0.0] * 7])
+    db.close()
 
-    class SlowFileLock(FileLock):
-        def acquire(self, timeout=None, *args, **kwargs):
-            # Simulate a slow acquire: give the creator a chance to run
-            time.sleep(0.05)
-            return super().acquire(timeout, *args, **kwargs)
+    results = []
 
-    import turbovecdb.database as dbmod
-    original_flock = dbmod.FileLock
-    dbmod.FileLock = SlowFileLock
+    def deleter():
+        db2 = turbovecdb.connect(db_path)
+        try:
+            db2.delete_collection("c")
+            results.append("deleted")
+        except Exception as e:
+            results.append(f"error: {e}")
+        finally:
+            db2.close()
 
-    try:
-        db = turbovecdb.connect(db_path)
-        c = db.collection("c", dim=8, create=True)
-        c.add(ids=["x"], vectors=[[1.0] + [0.0] * 7])
-        db.close()
+    def creator():
+        time.sleep(0.001)  # let the deleter get going
+        db3 = turbovecdb.connect(db_path)
+        try:
+            db3.collection("c", dim=8, create=True)
+            results.append("created")
+        except Exception as e:
+            results.append(f"creror: {e}")
+        finally:
+            db3.close()
 
-        results = []
+    t1 = threading.Thread(target=deleter)
+    t2 = threading.Thread(target=creator)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
 
-        def deleter():
-            db2 = turbovecdb.connect(db_path)
-            try:
-                db2.delete_collection("c")
-                results.append("deleted")
-            except Exception as e:
-                results.append(f"error: {e}")
-            finally:
-                db2.close()
-
-        def creator():
-            time.sleep(0.02)  # wait for deleter to close cache
-            db3 = turbovecdb.connect(db_path)
-            try:
-                db3.collection("c", dim=8, create=True)
-                results.append("created")
-            except Exception as e:
-                results.append(f"creror: {e}")
-            finally:
-                db3.close()
-
-        t1 = threading.Thread(target=deleter)
-        t2 = threading.Thread(target=creator)
-        t1.start()
-        t2.start()
-        t1.join()
-        t2.join()
-
-        # The collection directory should still exist (creator should not
-        # have lost its data) OR the collection is cleanly deleted and
-        # the creator's entry was evicted — either is acceptable.
-        coll_dir = os.path.join(db_path, "c")
-        if os.path.isdir(coll_dir):
-            db4 = turbovecdb.connect(db_path)
-            c4 = db4.collection("c", dim=8)
-            # Should be a valid collection (either original or recreated)
-            assert c4.count() >= 0
-            db4.close()
-    finally:
-        dbmod.FileLock = original_flock
+    # The collection directory should still exist (creator recreated it) OR
+    # be cleanly deleted — either is acceptable; it must be usable if present.
+    coll_dir = os.path.join(db_path, "c")
+    if os.path.isdir(coll_dir):
+        db4 = turbovecdb.connect(db_path)
+        c4 = db4.collection("c", dim=8)
+        assert c4.count() >= 0
+        db4.close()

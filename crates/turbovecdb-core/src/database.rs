@@ -13,11 +13,28 @@
 //! (`remove_collection_dir` assumes the caller already holds the write lock
 //! and has closed any cached handle).
 
+use crate::collection::write_lock_path;
 use crate::error::CoreError;
+use crate::flock::{py_repr_str, FlockGuard};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 const NAME_MAX_LEN: usize = 128;
+
+/// The delete-path lock-timeout message, byte-identical to `database.py`'s
+/// historical text (invariant I4): `could not acquire write lock on {dir!r}
+/// within {N}s to delete collection`. Unlike the write-path variant
+/// (`collection::write_lock_timeout_msg`, which formats `{:.1}` → `30.0s`),
+/// the delete path formats the timeout as a *bare integer* — Python used the
+/// int constant `_LOCK_TIMEOUT`, so `{_LOCK_TIMEOUT}s` rendered `30s`. Rust's
+/// `f64` `Display` renders `30.0` as `30`, reproducing that exactly.
+pub(crate) fn delete_lock_timeout_msg(dir: &str, timeout: f64) -> String {
+    format!(
+        "could not acquire write lock on {} within {}s to delete collection",
+        py_repr_str(dir),
+        timeout
+    )
+}
 
 fn is_name_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-'
@@ -126,6 +143,27 @@ impl Database {
         let dir = self.collection_dir(name)?;
         fs::remove_dir_all(&dir)?;
         Ok(())
+    }
+
+    /// Delete a collection's directory under the *same* cross-process write
+    /// lock the core takes for writes (I6/R1): acquire the sibling
+    /// `<name>.lock`, `remove_dir_all` the collection directory, release. The
+    /// lock file is a sibling of the directory precisely so holding it
+    /// survives the rmtree. Errors with `CollectionNotFound` if the
+    /// collection doesn't exist, or `LockTimeout` (the `to delete collection`
+    /// message variant) if the lock can't be acquired in `lock_timeout`
+    /// seconds. The caller (`database.py`) is responsible for evicting and
+    /// closing any cached Python handle *outside* this lock — a handle's
+    /// `close()` would acquire the same flock on a second file description
+    /// and self-deadlock against the guard held here.
+    pub fn delete_collection(&self, name: &str, lock_timeout: f64) -> Result<(), CoreError> {
+        let dir = self.ensure_collection(name)?;
+        let dir_str = dir.to_string_lossy().into_owned();
+        let lock_path = write_lock_path(&dir_str);
+        let _guard = FlockGuard::acquire(&lock_path, lock_timeout, || {
+            delete_lock_timeout_msg(&dir_str, lock_timeout)
+        })?;
+        self.remove_collection_dir(name)
     }
 }
 
@@ -240,5 +278,53 @@ mod tests {
         let db = Database::new(&root);
         let e = db.remove_collection_dir("../escape").unwrap_err();
         assert!(matches!(e, CoreError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn delete_collection_removes_dir_under_lock() {
+        let root = temp_root("delete-locked");
+        fs::create_dir_all(&root).unwrap();
+        make_collection_dir(&root, "gone");
+        let db = Database::new(&root);
+        db.delete_collection("gone", 30.0).unwrap();
+        assert!(!root.join("gone").exists());
+        // The sibling lock file must survive the rmtree (R1).
+        assert!(root.join("gone.lock").exists());
+    }
+
+    #[test]
+    fn delete_collection_missing_errors() {
+        let root = temp_root("delete-missing");
+        fs::create_dir_all(&root).unwrap();
+        let db = Database::new(&root);
+        let e = db.delete_collection("nope", 30.0).unwrap_err();
+        assert!(matches!(e, CoreError::CollectionNotFound(_)));
+    }
+
+    #[test]
+    fn delete_collection_times_out_with_delete_variant_message() {
+        let root = temp_root("delete-contended");
+        fs::create_dir_all(&root).unwrap();
+        make_collection_dir(&root, "held");
+        let db = Database::new(&root);
+        let dir_str = root.join("held").to_string_lossy().into_owned();
+        let held = FlockGuard::acquire(&write_lock_path(&dir_str), 5.0, || "x".into()).unwrap();
+        let e = db.delete_collection("held", 0.3).unwrap_err();
+        match e {
+            CoreError::LockTimeout(m) => assert_eq!(m, delete_lock_timeout_msg(&dir_str, 0.3)),
+            other => panic!("expected LockTimeout, got {other:?}"),
+        }
+        drop(held);
+    }
+
+    /// I4: the delete-variant message must be byte-identical to the Python
+    /// wrapper's text — note the *bare integer* `30s` (not `30.0s`), since
+    /// `database.py` formatted the int constant `_LOCK_TIMEOUT`.
+    #[test]
+    fn delete_lock_timeout_msg_is_byte_identical() {
+        assert_eq!(
+            delete_lock_timeout_msg("/x", 30.0),
+            "could not acquire write lock on '/x' within 30s to delete collection"
+        );
     }
 }
