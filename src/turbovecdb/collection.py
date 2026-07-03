@@ -25,14 +25,11 @@ lock too (see issue #35 / R1).
 import logging
 import os
 import threading
-from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
-from filelock import FileLock, Timeout
-
 from ._core import Collection as _CoreCollection
-from .errors import EmbedderIdentityMismatchError, TurboVecError
+from .errors import EmbedderIdentityMismatchError
 from .index import DEFAULT_BIT_WIDTH
 
 _log = logging.getLogger(__name__)
@@ -118,32 +115,16 @@ class Collection:
     def __init__(self, coll_dir, *, dim=None, bit_width=DEFAULT_BIT_WIDTH,
                  metric="cosine", embedder=None, lock_timeout=_LOCK_TIMEOUT):
         self.dir = coll_dir
-        self._tlock = threading.RLock()  # in-process structure guard
-        # Cross-process write lock. Held around every write; the Rust core does
-        # not lock, so this wrapper is the sole serialization point.
-        lock_path = write_lock_path(coll_dir)
-        # The lock file's parent (the database root) may not exist yet for a
-        # brand-new database — FileLock can't create the lock file otherwise.
-        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
-        self._flock = FileLock(lock_path, timeout=lock_timeout)
+        # In-process structure guard. The Rust core's Mutex is now the
+        # authoritative in-process serializer; this RLock is a thin,
+        # redundant wrapper-level guard slated for removal in the Phase 5
+        # strip-down. All cross-process and first-creation (C7) locking now
+        # lives in the Rust core (_CoreCollection acquires the same sibling
+        # <root>/<name>.lock via flock), so the wrapper holds no FileLock.
+        self._tlock = threading.RLock()
         self._embedder = embedder
         self._has_embedder = embedder is not None
-        # The Rust constructor does a read-then-write of bit_width/dim/
-        # embedder_identity meta on first creation, with no locking of its
-        # own (it runs before this wrapper exists to hold one). Without
-        # this, two processes racing to create the same new collection with
-        # different options could each proceed believing their own
-        # in-memory values won, while the meta table ends up with whichever
-        # wrote last (C7). Only pay the lock-acquire cost when the
-        # collection doesn't look already-created, so re-opening an
-        # existing collection — the common, hot case, e.g. service.py opens
-        # one per request — stays lock-free as before.
-        looks_new = not os.path.exists(os.path.join(coll_dir, "store.sqlite3"))
-        if looks_new:
-            with self._locked():
-                self._core = _CoreCollection(coll_dir, dim, bit_width, metric, embedder, lock_timeout)
-        else:
-            self._core = _CoreCollection(coll_dir, dim, bit_width, metric, embedder, lock_timeout)
+        self._core = _CoreCollection(coll_dir, dim, bit_width, metric, embedder, lock_timeout)
 
     def _warn_vectors_bypass(self, vectors):
         if vectors is not None and self._has_embedder:
@@ -152,24 +133,7 @@ class Collection:
                 "documents= to embed via the collection's embedder"
             )
 
-    @contextmanager
-    def _locked(self):
-        """Acquire the in-process lock and cross-process file lock.
-
-        Raises ``TurboVecError`` if the file lock cannot be acquired within the
-        configured timeout (prevents indefinite blocking when a writer crashes
-        while holding the lock)."""
-        with self._tlock:
-            try:
-                with self._flock:
-                    yield
-            except Timeout:
-                raise TurboVecError(
-                    f"could not acquire write lock on {self.dir!r} within "
-                    f"{self._flock.timeout:.1f}s"
-                )
-
-    # -- writes (serialized by the file lock) ---------------------------------
+    # -- writes (serialized by the Rust core's Mutex + flock) -----------------
 
     def _check_embedder_identity_matches(self, current_identity):
         """Raise EmbedderIdentityMismatchError if `current_identity` doesn't
@@ -185,32 +149,15 @@ class Collection:
             )
 
     def _write(self, ids, documents, metadatas, vectors, *, upsert):
+        # All embed-before-lock sequencing (identity pre-check → embed →
+        # acquire the write lock → under-lock identity re-check → write) now
+        # lives in the Rust core's write path (I5/R3); the wrapper just shapes
+        # arguments and delegates. The ``documents=`` case is passed straight
+        # through so the core embeds it under its own lock discipline.
         self._warn_vectors_bypass(vectors)
         core_method = self._core.upsert if upsert else self._core.add
-        if documents is not None and vectors is None and self._embedder is not None:
-            # Embed *before* acquiring the cross-process write lock. A slow
-            # (e.g. network-backed) embedder call used to run inside the
-            # locked section (the Rust core embeds internally as part of
-            # add/upsert), blocking every other writer in every other
-            # process for the whole embedding duration, not just the actual
-            # SQLite write (R3). The vectors-given branch of the Rust core's
-            # resolve_vectors() L2-normalizes on the way in (the same
-            # vecmath::l2_normalize the embedder path already used), so
-            # passing the raw embedder output through as vectors= here is
-            # equivalent to today's embed-inside-the-lock path.
-            current_identity = embedder_identity(self._embedder)
-            self._check_embedder_identity_matches(current_identity)  # fail fast, unlocked
-            computed_vectors = self._embedder(documents)
-            with self._locked():
-                # Re-check under the lock: a concurrent reembed() elsewhere
-                # could have changed the stored identity in the window
-                # between the unlocked pre-check/embed above and acquiring
-                # the lock here.
-                self._check_embedder_identity_matches(current_identity)
-                core_method(ids, documents, metadatas, computed_vectors)
-        else:
-            with self._locked():
-                core_method(ids, documents, metadatas, vectors)
+        with self._tlock:
+            core_method(ids, documents, metadatas, vectors)
 
     def add(self, *, ids, documents=None, metadatas=None, vectors=None):
         self._write(ids, documents, metadatas, vectors, upsert=False)
@@ -219,24 +166,24 @@ class Collection:
         self._write(ids, documents, metadatas, vectors, upsert=True)
 
     def delete(self, *, ids=None, where=None):
-        with self._locked():
+        with self._tlock:
             self._core.delete(ids, where)
 
     def update_metadata(self, *, ids, metadatas):
-        with self._locked():
+        with self._tlock:
             self._core.update_metadata(ids, metadatas)
 
     def update_documents(self, *, ids, documents):
-        with self._locked():
+        with self._tlock:
             self._core.update_documents(ids, documents)
 
     def clear(self):
-        with self._locked():
+        with self._tlock:
             self._core.clear()
 
     def reembed(self, embedder, *, dim=None, bit_width=None, batch_size=256,
                 on_progress=None, skip_empty="error"):
-        with self._locked():
+        with self._tlock:
             return self._core.reembed(embedder, dim, bit_width, batch_size, on_progress, skip_empty)
 
     # -- reads ----------------------------------------------------------------
@@ -262,11 +209,11 @@ class Collection:
     # -- lifecycle ------------------------------------------------------------
 
     def flush(self):
-        with self._locked():
+        with self._tlock:
             self._core.flush()
 
     def close(self):
-        with self._locked():
+        with self._tlock:
             self._core.close()
 
     def __enter__(self):
