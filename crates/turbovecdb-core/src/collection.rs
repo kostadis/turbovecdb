@@ -614,7 +614,17 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             self.rollback();
             return Err(CoreError::Runtime("clear: meta update failed".to_string()));
         }
-        self.conn.execute_batch("COMMIT")?;
+        if let Err(e) = self.conn.execute_batch("COMMIT") {
+            // A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction open
+            // in SQLite; roll it back explicitly so the next write doesn't
+            // fail with "cannot start a transaction within a transaction",
+            // and invalidate the index cache rather than risk a divergent
+            // in-memory view of an uncommitted clear.
+            self.rollback();
+            self.index = None;
+            self.seen_gen = -1;
+            return Err(e.into());
+        }
         self.next_uid = 0;
         self.seen_gen = sg;
         self.dirty = true;
@@ -743,7 +753,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             self.rollback();
             return Err(CoreError::Runtime("update_metadata: meta update failed".to_string()));
         }
-        self.conn.execute_batch("COMMIT")?;
+        if let Err(e) = self.conn.execute_batch("COMMIT") {
+            self.rollback();
+            self.index = None;
+            self.seen_gen = -1;
+            return Err(e.into());
+        }
         self.seen_gen = sg; // vectors unchanged → index stays valid
         Ok(())
     }
@@ -790,7 +805,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             self.rollback();
             return Err(CoreError::Runtime("update_documents: meta update failed".to_string()));
         }
-        self.conn.execute_batch("COMMIT")?;
+        if let Err(e) = self.conn.execute_batch("COMMIT") {
+            self.rollback();
+            self.index = None;
+            self.seen_gen = -1;
+            return Err(e.into());
+        }
         self.seen_gen = sg; // vectors unchanged → index stays valid
         Ok(())
     }
@@ -1329,6 +1349,77 @@ mod tests {
         c.clear().unwrap();
         assert_eq!(c.count().unwrap(), 0);
         assert_eq!(c.dim(), Some(8));
+    }
+
+    /// Force the next COMMIT to fail deterministically: SQLite converts a
+    /// commit_hook that returns `true` into a rollback, so `execute_batch
+    /// ("COMMIT")` itself returns an error. Regression for C2: clear() /
+    /// update_metadata() / update_documents() used to propagate that with a
+    /// bare `?`, leaving the transaction open on the connection so every
+    /// subsequent write failed with "cannot start a transaction within a
+    /// transaction".
+    fn fail_next_commit<E: Embedder, I: VectorIndex>(c: &mut Collection<E, I>) {
+        c.conn.commit_hook(Some(|| true));
+    }
+
+    #[test]
+    fn commit_failure_in_clear_rolls_back_and_recovers() {
+        let dir = temp_dir("commit_fail_clear");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+
+        fail_next_commit(&mut c);
+        let err = c.clear().unwrap_err();
+        assert!(matches!(err, CoreError::Sql(_)), "expected CoreError::Sql, got {err:?}");
+        c.conn.commit_hook(None::<fn() -> bool>);
+
+        // The rolled-back clear must not have removed the row...
+        assert_eq!(c.count().unwrap(), 1);
+        // ...and the connection must not be stuck mid-transaction.
+        c.add(vec!["b".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn commit_failure_in_update_metadata_rolls_back_and_recovers() {
+        let dir = temp_dir("commit_fail_update_metadata");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, Some(vec![r#"{"x":1}"#.into()]), Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+
+        fail_next_commit(&mut c);
+        let err = c.update_metadata(vec!["a".into()], vec![r#"{"x":2}"#.into()]).unwrap_err();
+        assert!(matches!(err, CoreError::Sql(_)), "expected CoreError::Sql, got {err:?}");
+        c.conn.commit_hook(None::<fn() -> bool>);
+
+        let include = ["metadatas".to_string()];
+        let r = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r.metadatas, vec![r#"{"x":1}"#.to_string()], "rolled-back update must not stick");
+
+        c.update_metadata(vec!["a".into()], vec![r#"{"x":3}"#.into()]).unwrap();
+        let r2 = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r2.metadatas, vec![r#"{"x":3}"#.to_string()]);
+    }
+
+    #[test]
+    fn commit_failure_in_update_documents_rolls_back_and_recovers() {
+        let dir = temp_dir("commit_fail_update_documents");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], Some(vec!["orig".into()]), None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+
+        fail_next_commit(&mut c);
+        let err = c.update_documents(vec!["a".into()], vec!["v2".into()]).unwrap_err();
+        assert!(matches!(err, CoreError::Sql(_)), "expected CoreError::Sql, got {err:?}");
+        c.conn.commit_hook(None::<fn() -> bool>);
+
+        let include = ["documents".to_string()];
+        let r = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r.documents, vec![Some("orig".to_string())], "rolled-back update must not stick");
+
+        c.update_documents(vec!["a".into()], vec!["v3".into()]).unwrap();
+        let r2 = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r2.documents, vec![Some("v3".to_string())]);
     }
 
     #[test]
