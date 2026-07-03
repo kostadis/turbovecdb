@@ -28,19 +28,15 @@ where
     /// `allowlist`, when `Some`, restricts results to those external ids.
     fn search(&self, queries: &[f32], k: usize, allowlist: Option<&[u64]>) -> (Vec<f32>, Vec<u64>);
     fn write(&self, path: &str) -> Result<(), CoreError>;
+    /// Used by `Collection::reload_index` to verify a loaded `.tvim` still
+    /// matches the collection's current dim/bit_width before trusting it
+    /// (a `tvim_gen` match only proves the file wasn't stale when written,
+    /// not that its shape still matches — e.g. after a reembed).
+    fn dim(&self) -> usize;
+    fn bit_width(&self) -> usize;
 }
 
 pub struct TurbovecIndex(turbovec::IdMapIndex);
-
-impl TurbovecIndex {
-    pub fn dim(&self) -> usize {
-        self.0.dim()
-    }
-
-    pub fn bit_width(&self) -> usize {
-        self.0.bit_width()
-    }
-}
 
 impl VectorIndex for TurbovecIndex {
     fn new(dim: usize, bit_width: usize) -> Result<Self, CoreError> {
@@ -70,24 +66,34 @@ impl VectorIndex for TurbovecIndex {
     fn write(&self, path: &str) -> Result<(), CoreError> {
         self.0.write(path).map_err(CoreError::from)
     }
+
+    fn dim(&self) -> usize {
+        self.0.dim()
+    }
+
+    fn bit_width(&self) -> usize {
+        self.0.bit_width()
+    }
 }
 
 #[cfg(test)]
 pub(crate) struct FakeIndex {
     dim: usize,
+    bit_width: usize,
     entries: Vec<(u64, Vec<f32>)>,
 }
 
 #[cfg(test)]
 impl VectorIndex for FakeIndex {
-    fn new(dim: usize, _bit_width: usize) -> Result<Self, CoreError> {
-        Ok(Self { dim, entries: Vec::new() })
+    fn new(dim: usize, bit_width: usize) -> Result<Self, CoreError> {
+        Ok(Self { dim, bit_width, entries: Vec::new() })
     }
 
     fn load(path: &str) -> Result<Self, CoreError> {
         let data = std::fs::read_to_string(path).map_err(CoreError::from)?;
         let mut lines = data.lines();
         let dim: usize = lines.next().unwrap_or("0").parse().unwrap_or(0);
+        let bit_width: usize = lines.next().unwrap_or("0").parse().unwrap_or(0);
         let mut entries = Vec::new();
         for line in lines {
             let mut parts = line.split(',');
@@ -95,7 +101,7 @@ impl VectorIndex for FakeIndex {
             let row: Vec<f32> = parts.map(|p| p.parse().unwrap()).collect();
             entries.push((id, row));
         }
-        Ok(Self { dim, entries })
+        Ok(Self { dim, bit_width, entries })
     }
 
     fn add_with_ids(&mut self, vectors: &[f32], ids: &[u64]) -> Result<(), CoreError> {
@@ -134,12 +140,20 @@ impl VectorIndex for FakeIndex {
     }
 
     fn write(&self, path: &str) -> Result<(), CoreError> {
-        let mut out = format!("{}\n", self.dim);
+        let mut out = format!("{}\n{}\n", self.dim, self.bit_width);
         for (id, row) in &self.entries {
             let row_str: Vec<String> = row.iter().map(|f| f.to_string()).collect();
             out.push_str(&format!("{},{}\n", id, row_str.join(",")));
         }
         std::fs::write(path, out).map_err(CoreError::from)
+    }
+
+    fn dim(&self) -> usize {
+        self.dim
+    }
+
+    fn bit_width(&self) -> usize {
+        self.bit_width
     }
 }
 

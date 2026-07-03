@@ -25,6 +25,21 @@ fn blob_to_f32(blob: &[u8]) -> impl Iterator<Item = f32> + '_ {
     blob.chunks_exact(4).map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
 }
 
+/// Validates a stored vector blob's length against `dim` before parsing it.
+/// `chunks_exact(4)` silently drops any trailing partial chunk, so an
+/// unchecked truncated or corrupted row would produce a short vector and a
+/// wrong-but-plausible dot product instead of a clear error (R5).
+fn blob_to_f32_checked(blob: &[u8], dim: i64) -> Result<impl Iterator<Item = f32> + '_, CoreError> {
+    let expected = dim as usize * 4;
+    if blob.len() != expected {
+        return Err(CoreError::Other(format!(
+            "corrupt vector blob: expected {expected} bytes for dim {dim}, got {}",
+            blob.len()
+        )));
+    }
+    Ok(blob_to_f32(blob))
+}
+
 fn f32_to_blob(row: impl Iterator<Item = f32>) -> Vec<u8> {
     row.flat_map(|x| x.to_ne_bytes()).collect()
 }
@@ -158,8 +173,18 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         Ok(())
     }
 
+    /// `default` applies only when `key` is *absent* from meta. A present
+    /// but unparseable value is a corruption signal, not a missing one — it
+    /// errors rather than silently falling back to `default` (R4). Silently
+    /// defaulting a corrupted `next_uid` to 0, for instance, would start
+    /// reusing uids against live rows.
     fn meta_get_i64(&self, key: &str, default: i64) -> Result<i64, CoreError> {
-        Ok(self.meta_get(key)?.and_then(|s| s.parse::<i64>().ok()).unwrap_or(default))
+        match self.meta_get(key)? {
+            None => Ok(default),
+            Some(s) => s.parse::<i64>().map_err(|_| {
+                CoreError::Other(format!("corrupt meta value for {key:?}: {s:?} is not a valid integer"))
+            }),
+        }
     }
 
     fn store_gen_val(&self) -> Result<i64, CoreError> {
@@ -198,9 +223,17 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         let tvim_gen = self.meta_get_i64("tvim_gen", -1)?;
         if std::path::Path::new(&self.tvim_path).exists() && tvim_gen == store_gen {
             if let Ok(idx) = I::load(&self.tvim_path) {
-                self.index = Some(idx);
-                self.seen_gen = store_gen;
-                return Ok(());
+                // A tvim_gen match only proves the file wasn't stale at
+                // write time; it says nothing about corruption or a
+                // mismatched shape (e.g. a .tvim from a since-reembedded
+                // dim/bit_width). Verify before trusting it (R2) — a
+                // silently wrong-shaped cache would produce a wrong-but-
+                // plausible search, not an error.
+                if idx.dim() as i64 == self.dim.unwrap() && idx.bit_width() as i64 == self.bit_width {
+                    self.index = Some(idx);
+                    self.seen_gen = store_gen;
+                    return Ok(());
+                }
             }
         }
         // Rebuild from the SQLite vectors (source of truth).
@@ -213,7 +246,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             while let Some(row) = rows.next() {
                 let (uid, blob) = row?;
                 uids.push(uid as u64);
-                flat.extend(blob_to_f32(&blob));
+                flat.extend(blob_to_f32_checked(&blob, self.dim.unwrap())?);
             }
             (uids, flat)
         };
@@ -258,7 +291,16 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                     .to_string(),
             )
         })?;
-        // GAP-1 guard: prevent accidental embedder swap on the write path.
+        self.check_embedder_identity(emb)?;
+        emb.embed(docs)
+    }
+
+    /// GAP-1 guard: prevent accidental embedder swap. Originally the
+    /// write path only (add/upsert, via resolve_vectors above); query
+    /// (text=...) skipped it (C5) — opening a collection with the wrong
+    /// embedder silently produced garbage rankings on every text query,
+    /// with nothing ever erroring.
+    fn check_embedder_identity(&self, emb: &E) -> Result<(), CoreError> {
         if let Some(stored) = self.meta_get("embedder_identity")? {
             let current = emb.identity();
             if current != stored {
@@ -268,7 +310,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 )));
             }
         }
-        emb.embed(docs)
+        Ok(())
     }
 
     fn rollback(&self) {
@@ -542,9 +584,27 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
         let tmp = format!("{}.tmp", self.tvim_path);
         self.index.as_ref().unwrap().write(&tmp)?;
+        // fsync the temp file before renaming: without this, a crash can
+        // leave a torn .tvim on disk whose tvim_gen (stamped right after
+        // the rename) still claims coherence (R2).
+        std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &self.tvim_path)?;
-        let sg = self.store_gen_val()?;
-        self.meta_set("tvim_gen", &sg.to_string())?; // autocommits
+        // Best-effort: fsync the parent directory too, since the rename's
+        // directory-entry update isn't durable until the directory itself
+        // is synced. Opening a directory as a File doesn't work on Windows,
+        // so this is deliberately best-effort rather than propagated.
+        if let Some(parent) = std::path::Path::new(&self.tvim_path).parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
+        // Stamp tvim_gen from seen_gen — the generation the in-memory index
+        // actually reflects — not a fresh re-read of store_gen. Without the
+        // caller's file lock held, a concurrent writer can bump store_gen
+        // between the rename above and a re-read here, which would mark a
+        // stale .tvim as coherent (wrong query results) instead of merely
+        // stale (harmless rebuild on next open).
+        self.meta_set("tvim_gen", &self.seen_gen.to_string())?; // autocommits
         self.wal_checkpoint();
         self.dirty = false;
         Ok(())
@@ -605,12 +665,25 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             return Err(e.into());
         }
         let sg = self.store_gen_val()? + 1;
-        if self.meta_set("next_uid", "0").is_err() || self.meta_set("store_gen", &sg.to_string()).is_err() {
+        // Deliberately does NOT reset next_uid: uids are otherwise never
+        // reused, and a reader caught in the brief window between this
+        // commit and its own next reload (C3) could pair a stale index hit
+        // against a new row that reused a uid from before the clear (C4).
+        if self.meta_set("store_gen", &sg.to_string()).is_err() {
             self.rollback();
             return Err(CoreError::Runtime("clear: meta update failed".to_string()));
         }
-        self.conn.execute_batch("COMMIT")?;
-        self.next_uid = 0;
+        if let Err(e) = self.conn.execute_batch("COMMIT") {
+            // A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction open
+            // in SQLite; roll it back explicitly so the next write doesn't
+            // fail with "cannot start a transaction within a transaction",
+            // and invalidate the index cache rather than risk a divergent
+            // in-memory view of an uncommitted clear.
+            self.rollback();
+            self.index = None;
+            self.seen_gen = -1;
+            return Err(e.into());
+        }
         self.seen_gen = sg;
         self.dirty = true;
         self.index = if self.dim.is_some() { Some(self.make_index()?) } else { None };
@@ -738,7 +811,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             self.rollback();
             return Err(CoreError::Runtime("update_metadata: meta update failed".to_string()));
         }
-        self.conn.execute_batch("COMMIT")?;
+        if let Err(e) = self.conn.execute_batch("COMMIT") {
+            self.rollback();
+            self.index = None;
+            self.seen_gen = -1;
+            return Err(e.into());
+        }
         self.seen_gen = sg; // vectors unchanged → index stays valid
         Ok(())
     }
@@ -785,7 +863,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             self.rollback();
             return Err(CoreError::Runtime("update_documents: meta update failed".to_string()));
         }
-        self.conn.execute_batch("COMMIT")?;
+        if let Err(e) = self.conn.execute_batch("COMMIT") {
+            self.rollback();
+            self.index = None;
+            self.seen_gen = -1;
+            return Err(e.into());
+        }
         self.seen_gen = sg; // vectors unchanged → index stays valid
         Ok(())
     }
@@ -804,11 +887,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
         let inc = Include::resolve(include, true);
 
-        // Normalized query vector, shape (1, dim). Note: unlike
-        // resolve_vectors (add/upsert), this does NOT apply the GAP-1
-        // embedder-identity guard — matches the historical query() path,
-        // which called the embedder directly rather than through
-        // resolve_vectors.
+        // Normalized query vector, shape (1, dim).
         let q: Array2<f32> = if let Some(t) = text {
             let emb = self.embedder.as_ref().ok_or_else(|| {
                 CoreError::EmbedderRequired(
@@ -817,6 +896,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                         .to_string(),
                 )
             })?;
+            self.check_embedder_identity(emb)?;
             emb.embed(std::slice::from_ref(&t))?
         } else {
             let mut v = vector.unwrap();
@@ -829,75 +909,104 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             return Ok(Self::empty_query_result(inc.vectors));
         }
 
-        let allow = self.query_allowlist(where_, where_document)?;
-        let allow_ids: Option<Vec<u64>> = match &allow {
-            Some(uids) => {
-                if uids.is_empty() {
-                    return Ok(Self::empty_query_result(inc.vectors));
-                }
-                Some(uids.iter().map(|&x| x as u64).collect())
-            }
-            None => None,
-        };
-
         let pool = std::cmp::max(k as i64, RERANK_FLOOR) as usize;
         let qrow: Vec<f32> = q.row(0).to_vec();
-        let (_, cand_uids_u64) = self.index.as_ref().unwrap().search(&qrow, pool, allow_ids.as_deref());
-        let cand_uids: Vec<i64> = cand_uids_u64.iter().map(|&x| x as i64).collect();
 
-        // Exact-cosine re-rank of the candidate pool.
-        let mut map: HashMap<i64, (String, String, String, Vec<u8>)> = HashMap::new();
-        if !cand_uids.is_empty() {
-            let qs = vec!["?"; cand_uids.len()].join(",");
-            let sql = format!(
-                "SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN ({qs})"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(cand_uids.iter()), |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    r.get::<_, Vec<u8>>(4)?,
-                ))
-            })?;
-            for row in rows {
-                let (u, sid, doc, meta, vec) = row?;
-                map.insert(u, (sid, doc, meta, vec));
-            }
-        }
-        let mut scored: Vec<(f32, i64)> = Vec::new();
-        for &uid in &cand_uids {
-            if let Some((_, _, _, vecb)) = map.get(&uid) {
-                let dot: f32 = qrow.iter().zip(blob_to_f32(vecb)).map(|(a, b)| a * b).sum();
-                scored.push((1.0 - dot, uid));
-            }
-        }
-        scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.truncate(k);
+        // Snapshot-consistent read: the filter-allowlist SELECT, the index
+        // search, and the candidate re-rank SELECT used to run as separate
+        // autocommit statements, so a writer's commit in between could
+        // return a candidate whose metadata no longer matches `where` (the
+        // allowlist was computed against the old snapshot), or drop a
+        // candidate deleted after the allowlist ran, yielding fewer than k
+        // results even when other matches exist (C3). WAL gives
+        // snapshot-consistent reads for free across statements enclosed in
+        // one deferred transaction.
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        let snapshot = (|| -> Result<QueryResult, CoreError> {
+            let allow = self.query_allowlist(where_, where_document)?;
+            let allow_ids: Option<Vec<u64>> = match &allow {
+                Some(uids) => {
+                    if uids.is_empty() {
+                        return Ok(Self::empty_query_result(inc.vectors));
+                    }
+                    Some(uids.iter().map(|&x| x as u64).collect())
+                }
+                None => None,
+            };
 
-        let mut result = QueryResult {
-            vectors: if inc.vectors { Some(Vec::new()) } else { None },
-            ..Default::default()
-        };
-        for (dist, uid) in &scored {
-            let (sid, doc, meta, vecb) = map.get(uid).unwrap();
-            result.ids.push(sid.clone());
-            if inc.distances {
-                result.distances.push(*dist as f64);
+            let (_, cand_uids_u64) =
+                self.index.as_ref().unwrap().search(&qrow, pool, allow_ids.as_deref());
+            let cand_uids: Vec<i64> = cand_uids_u64.iter().map(|&x| x as i64).collect();
+
+            // Exact-cosine re-rank of the candidate pool.
+            let mut map: HashMap<i64, (String, String, String, Vec<u8>)> = HashMap::new();
+            if !cand_uids.is_empty() {
+                let qs = vec!["?"; cand_uids.len()].join(",");
+                let sql = format!(
+                    "SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN ({qs})"
+                );
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map(rusqlite::params_from_iter(cand_uids.iter()), |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                        r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        r.get::<_, Vec<u8>>(4)?,
+                    ))
+                })?;
+                for row in rows {
+                    let (u, sid, doc, meta, vec) = row?;
+                    map.insert(u, (sid, doc, meta, vec));
+                }
             }
-            if inc.documents {
-                result.documents.push(doc.clone());
+            let mut scored: Vec<(f32, i64)> = Vec::new();
+            for &uid in &cand_uids {
+                if let Some((_, _, _, vecb)) = map.get(&uid) {
+                    let dot: f32 = qrow
+                        .iter()
+                        .zip(blob_to_f32_checked(vecb, self.dim.unwrap())?)
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    scored.push((1.0 - dot, uid));
+                }
             }
-            if inc.metadatas {
-                result.metadatas.push(meta.clone());
+            scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.truncate(k);
+
+            let mut result = QueryResult {
+                vectors: if inc.vectors { Some(Vec::new()) } else { None },
+                ..Default::default()
+            };
+            for (dist, uid) in &scored {
+                let (sid, doc, meta, vecb) = map.get(uid).unwrap();
+                result.ids.push(sid.clone());
+                if inc.distances {
+                    result.distances.push(*dist as f64);
+                }
+                if inc.documents {
+                    result.documents.push(doc.clone());
+                }
+                if inc.metadatas {
+                    result.metadatas.push(meta.clone());
+                }
+                if inc.vectors {
+                    result.vectors.as_mut().unwrap().push(blob_to_f32_checked(vecb, self.dim.unwrap())?.collect());
+                }
             }
-            if inc.vectors {
-                result.vectors.as_mut().unwrap().push(blob_to_f32(vecb).collect());
+            Ok(result)
+        })();
+
+        match &snapshot {
+            Ok(_) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    self.rollback();
+                    return Err(e.into());
+                }
             }
+            Err(_) => self.rollback(),
         }
-        Ok(result)
+        snapshot
     }
 
     pub fn get(
@@ -972,7 +1081,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 result.documents.push(if inc.documents { Some(doc) } else { None });
                 result.metadatas.push(if inc.metadatas { meta } else { String::new() });
                 if inc.vectors {
-                    result.vectors.as_mut().unwrap().push(blob_to_f32(&vecb).collect());
+                    // dim is only None for a still-empty collection, in
+                    // which case this loop never actually iterates — but
+                    // fall back to 0 rather than unwrap() so a corrupted
+                    // dim/docs pairing errors instead of panicking.
+                    result.vectors.as_mut().unwrap().push(blob_to_f32_checked(&vecb, self.dim.unwrap_or(0))?.collect());
                 }
             }
         }
@@ -1125,7 +1238,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
         // Retained docs keep their old vector (dims match new_dim here); re-normalize.
         for (uid, vecb) in &keep {
-            let v: Vec<f32> = blob_to_f32(vecb).collect();
+            let v: Vec<f32> = blob_to_f32_checked(vecb, old_dim)?.collect();
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let denom = if norm == 0.0 { 1.0 } else { norm };
             let bytes: Vec<u8> = v.iter().flat_map(|x| (x / denom).to_ne_bytes()).collect();
@@ -1294,6 +1407,30 @@ mod tests {
         assert!(matches!(e, CoreError::DimensionMismatch(_)));
     }
 
+    /// Regression for R5: blob_to_f32 used chunks_exact(4), which silently
+    /// drops any trailing partial chunk — a truncated or corrupted vector
+    /// blob would produce a short vector and a wrong-but-plausible result
+    /// instead of an error. Directly corrupts a stored blob (bypassing the
+    /// normal write path) and asserts reads now error instead of silently
+    /// truncating.
+    #[test]
+    fn truncated_vector_blob_errors_on_read() {
+        let dir = temp_dir("truncated_blob");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+
+        // dim=8 needs 32 bytes; truncate to 4 (one float) instead.
+        c.conn
+            .execute("UPDATE docs SET vector = ?1 WHERE str_id = 'a'", params![vec![0u8; 4]])
+            .unwrap();
+
+        let include = ["vectors".to_string()];
+        match c.get(None, None, None, None, None, Some(&include)) {
+            Err(CoreError::Other(_)) => {}
+            other => panic!("expected Err(CoreError::Other(_)), got {}", other.is_ok()),
+        }
+    }
+
     #[test]
     fn delete_by_ids_and_where() {
         let dir = temp_dir("delete");
@@ -1324,6 +1461,108 @@ mod tests {
         c.clear().unwrap();
         assert_eq!(c.count().unwrap(), 0);
         assert_eq!(c.dim(), Some(8));
+    }
+
+    /// Regression for C4: clear() used to reset next_uid to 0. Uids are
+    /// otherwise never reused; resetting them lets a reader caught in the
+    /// brief window before its next reload (C3) pair a stale index hit
+    /// against a new row that reused a pre-clear uid.
+    #[test]
+    fn clear_keeps_next_uid_monotonic() {
+        let dir = temp_dir("clear_uid");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(
+            vec!["a".into(), "b".into()],
+            None,
+            None,
+            Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.], [0., 1., 0., 0., 0., 0., 0., 0.]])),
+        )
+        .unwrap();
+        let next_uid_before: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
+        assert_eq!(next_uid_before, 2);
+
+        c.clear().unwrap();
+        let next_uid_after_clear: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
+        assert_eq!(next_uid_after_clear, next_uid_before, "clear() must not reset next_uid");
+
+        c.add(vec!["c".into()], None, None, Some(vecs(&[[0., 0., 1., 0., 0., 0., 0., 0.]]))).unwrap();
+        let next_uid_after_readd: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
+        assert_eq!(
+            next_uid_after_readd,
+            next_uid_before + 1,
+            "uid allocation must stay monotonic across clear() + add()"
+        );
+    }
+
+    /// Force the next COMMIT to fail deterministically: SQLite converts a
+    /// commit_hook that returns `true` into a rollback, so `execute_batch
+    /// ("COMMIT")` itself returns an error. Regression for C2: clear() /
+    /// update_metadata() / update_documents() used to propagate that with a
+    /// bare `?`, leaving the transaction open on the connection so every
+    /// subsequent write failed with "cannot start a transaction within a
+    /// transaction".
+    fn fail_next_commit<E: Embedder, I: VectorIndex>(c: &mut Collection<E, I>) {
+        c.conn.commit_hook(Some(|| true));
+    }
+
+    #[test]
+    fn commit_failure_in_clear_rolls_back_and_recovers() {
+        let dir = temp_dir("commit_fail_clear");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+
+        fail_next_commit(&mut c);
+        let err = c.clear().unwrap_err();
+        assert!(matches!(err, CoreError::Sql(_)), "expected CoreError::Sql, got {err:?}");
+        c.conn.commit_hook(None::<fn() -> bool>);
+
+        // The rolled-back clear must not have removed the row...
+        assert_eq!(c.count().unwrap(), 1);
+        // ...and the connection must not be stuck mid-transaction.
+        c.add(vec!["b".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn commit_failure_in_update_metadata_rolls_back_and_recovers() {
+        let dir = temp_dir("commit_fail_update_metadata");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, Some(vec![r#"{"x":1}"#.into()]), Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+
+        fail_next_commit(&mut c);
+        let err = c.update_metadata(vec!["a".into()], vec![r#"{"x":2}"#.into()]).unwrap_err();
+        assert!(matches!(err, CoreError::Sql(_)), "expected CoreError::Sql, got {err:?}");
+        c.conn.commit_hook(None::<fn() -> bool>);
+
+        let include = ["metadatas".to_string()];
+        let r = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r.metadatas, vec![r#"{"x":1}"#.to_string()], "rolled-back update must not stick");
+
+        c.update_metadata(vec!["a".into()], vec![r#"{"x":3}"#.into()]).unwrap();
+        let r2 = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r2.metadatas, vec![r#"{"x":3}"#.to_string()]);
+    }
+
+    #[test]
+    fn commit_failure_in_update_documents_rolls_back_and_recovers() {
+        let dir = temp_dir("commit_fail_update_documents");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], Some(vec!["orig".into()]), None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+
+        fail_next_commit(&mut c);
+        let err = c.update_documents(vec!["a".into()], vec!["v2".into()]).unwrap_err();
+        assert!(matches!(err, CoreError::Sql(_)), "expected CoreError::Sql, got {err:?}");
+        c.conn.commit_hook(None::<fn() -> bool>);
+
+        let include = ["documents".to_string()];
+        let r = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r.documents, vec![Some("orig".to_string())], "rolled-back update must not stick");
+
+        c.update_documents(vec!["a".into()], vec!["v3".into()]).unwrap();
+        let r2 = c.get(None, None, None, None, None, Some(&include)).unwrap();
+        assert_eq!(r2.documents, vec![Some("v3".to_string())]);
     }
 
     #[test]
@@ -1368,6 +1607,79 @@ mod tests {
         assert_eq!(r.ids, vec!["a"]);
     }
 
+    thread_local! {
+        // `Connection::trace` (rusqlite's "trace" feature) only accepts a
+        // bare `fn(&str)` pointer, not a capturing closure — state for the
+        // injected concurrent delete below has to live outside the closure.
+        static TRACE_FIRED: std::cell::Cell<bool> = std::cell::Cell::new(false);
+        static TRACE_DB_PATH: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+    }
+
+    /// Fires on every SQL statement query() is about to execute. The
+    /// re-rank SELECT (`SELECT uid, str_id, ... FROM docs WHERE uid IN
+    /// (...)`) is matched by text — not by position — since query() also
+    /// runs other statements first (ensure_current()'s store_gen check,
+    /// BEGIN DEFERRED, the allowlist SELECT); by the time this callback
+    /// fires for the re-rank SELECT, the allowlist SELECT has already
+    /// returned. Injects a concurrent delete + commit from a second,
+    /// independent connection to the same file, exactly once.
+    fn trace_inject_delete_before_rerank_select(sql: &str) {
+        if sql.starts_with("SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN")
+            && !TRACE_FIRED.with(|f| f.replace(true))
+        {
+            let path = TRACE_DB_PATH.with(|p| p.borrow().clone());
+            let conn2 = rusqlite::Connection::open(&path).unwrap();
+            conn2.execute("DELETE FROM docs WHERE str_id = 'b'", []).unwrap();
+        }
+    }
+
+    /// Regression for C3: query() used to run the allowlist SELECT and the
+    /// re-rank SELECT as separate autocommit statements, so a writer's
+    /// commit landing in between could yield fewer results than the index
+    /// actually holds (a candidate deleted after the allowlist ran would
+    /// vanish from the re-rank SELECT). A `where` filter forces a real
+    /// allowlist SELECT (statement 1); `Connection::trace` fires right as
+    /// each statement is about to execute, so counting to the second call
+    /// lands the injected concurrent delete exactly between the allowlist
+    /// SELECT and the re-rank SELECT.
+    #[test]
+    fn query_reads_are_snapshot_consistent_across_concurrent_delete() {
+        let dir = temp_dir("query_snapshot");
+        let db_path = format!("{dir}/store.sqlite3");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(
+            vec!["a".into(), "b".into()],
+            None,
+            Some(vec![r#"{"k":1}"#.into(), r#"{"k":1}"#.into()]),
+            Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.], [0., 1., 0., 0., 0., 0., 0., 0.]])),
+        )
+        .unwrap();
+
+        TRACE_FIRED.with(|f| f.set(false));
+        TRACE_DB_PATH.with(|p| *p.borrow_mut() = db_path.clone());
+        c.conn.trace(Some(trace_inject_delete_before_rerank_select));
+
+        let filter = serde_json::json!({"k": 1});
+        let q = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let r = c.query(None, Some(q), 10, Some(&filter), None, None).unwrap();
+        c.conn.trace(None);
+
+        assert!(TRACE_FIRED.with(|f| f.get()), "the concurrent delete never ran");
+        let mut ids = r.ids.clone();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["a".to_string(), "b".to_string()],
+            "query()'s own snapshot must still include \"b\", deleted after its read span started"
+        );
+
+        // The concurrent delete did commit — a fresh query (new transaction,
+        // new snapshot) must now see only "a".
+        let q2 = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let r2 = c.query(None, Some(q2), 10, Some(&filter), None, None).unwrap();
+        assert_eq!(r2.ids, vec!["a".to_string()]);
+    }
+
     #[test]
     fn health_reports_ok_and_coherence() {
         let dir = temp_dir("health");
@@ -1376,6 +1688,26 @@ mod tests {
         let h = c.health().unwrap();
         assert!(h.ok);
         assert_eq!(h.doc_count, 1);
+    }
+
+    /// Regression for R4: meta_get_i64 used to map any unparseable value
+    /// to the caller's default — a corrupted next_uid would silently
+    /// become 0, which would start reusing uids against live rows. A
+    /// present-but-corrupt meta value must error instead of defaulting.
+    #[test]
+    fn corrupt_next_uid_meta_errors_instead_of_silently_resetting() {
+        let dir = temp_dir("corrupt_next_uid");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+
+        c.conn
+            .execute("UPDATE meta SET value = 'not-a-number' WHERE key = 'next_uid'", [])
+            .unwrap();
+
+        match c.add(vec!["b".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]]))) {
+            Err(CoreError::Other(msg)) => assert!(msg.contains("next_uid"), "got {msg:?}"),
+            other => panic!("expected Err(CoreError::Other(_)), got {}", other.is_ok()),
+        }
     }
 
     #[test]
@@ -1391,6 +1723,35 @@ mod tests {
         assert_eq!(c2.count().unwrap(), 1);
         let h = c2.health().unwrap();
         assert!(h.coherent);
+    }
+
+    /// Regression for R2: reload_index() used to trust any .tvim whose
+    /// tvim_gen matched store_gen, without checking that the loaded
+    /// index's shape still matches the collection's meta. A tvim_gen match
+    /// only proves the file wasn't stale when written — it says nothing
+    /// about corruption or a mismatched dim/bit_width (e.g. a leftover
+    /// .tvim from before a reembed). This simulates that: a same-tvim_gen
+    /// file that parses successfully but has the wrong dim must be
+    /// rejected in favor of a rebuild from SQLite.
+    #[test]
+    fn reload_index_rebuilds_when_loaded_dim_mismatches_meta() {
+        let dir = temp_dir("index_mismatch");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        c.flush().unwrap(); // .tvim written, tvim_gen == store_gen
+
+        let wrong = FakeIndex::new(4, 4).unwrap();
+        wrong.write(&c.tvim_path).unwrap();
+
+        c.reload_index().unwrap();
+
+        assert_eq!(
+            c.index.as_ref().unwrap().dim(),
+            8,
+            "must have rebuilt from SQLite (dim 8), not trusted the mismatched (dim 4) .tvim"
+        );
+        let r = c.get(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.ids, vec!["a".to_string()]);
     }
 
     #[test]
@@ -1443,5 +1804,37 @@ mod tests {
         .unwrap();
         let e = c2.add(vec!["b".into()], Some(vec!["y".into()]), None, None).unwrap_err();
         assert!(matches!(e, CoreError::EmbedderIdentityMismatch(_)));
+    }
+
+    /// Regression for C5: query(text=...) skipped the GAP-1 embedder-
+    /// identity guard that the write path already applied. Opening a
+    /// collection with the wrong embedder used to silently produce
+    /// garbage rankings on every text query instead of erroring.
+    #[test]
+    fn embedder_identity_mismatch_blocks_text_query() {
+        let dir = temp_dir("identity_query");
+        let mut c: Collection<NamedEmbedder, FakeIndex> = Collection::new(
+            dir.clone(),
+            Some(8),
+            4,
+            None,
+            Some(NamedEmbedder { name: "embedder-a".into(), dim: 8 }),
+        )
+        .unwrap();
+        c.add(vec!["a".into()], Some(vec!["x".into()]), None, None).unwrap();
+        drop(c);
+
+        let mut c2: Collection<NamedEmbedder, FakeIndex> = Collection::new(
+            dir,
+            Some(8),
+            4,
+            None,
+            Some(NamedEmbedder { name: "embedder-b".into(), dim: 8 }),
+        )
+        .unwrap();
+        match c2.query(Some("z".into()), None, 5, None, None, None) {
+            Err(CoreError::EmbedderIdentityMismatch(_)) => {}
+            other => panic!("expected Err(CoreError::EmbedderIdentityMismatch(_)), got {}", other.is_ok()),
+        }
     }
 }

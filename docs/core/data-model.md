@@ -2,16 +2,20 @@
 
 ## On-disk layout
 
-A `Database` is a directory; each collection is a subdirectory under it:
+A `Database` is a directory; each collection is a subdirectory under it. The
+write lock is a *sibling* of that subdirectory, not a file inside it — see
+[`docs/core/concurrency.md`](concurrency.md) for why (R1: a lock file inside
+the directory `delete_collection` is about to remove would let a concurrent
+opener recreate a new lock at the same path mid-delete):
 
 ```
 <db_path>/
+├── <collection_name>.lock  # cross-process write lock (filelock)
 └── <collection_name>/
     ├── store.sqlite3     # durable source of truth (WAL mode)
     ├── store.sqlite3-wal # WAL sidecar (SQLite-managed)
     ├── store.sqlite3-shm # shared-memory index (SQLite-managed)
-    ├── index.tvim        # turbovec index — rebuildable cache
-    └── write.lock        # cross-process write lock (filelock)
+    └── index.tvim        # turbovec index — rebuildable cache
 ```
 
 `connect(path)` does no I/O; `Database.collection(name, create=...)` creates or
