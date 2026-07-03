@@ -19,7 +19,7 @@ import threading
 from filelock import FileLock, Timeout
 
 from ._core import Database as _CoreDatabase
-from .collection import Collection, _LOCK_TIMEOUT
+from .collection import Collection, _LOCK_TIMEOUT, write_lock_path
 from .errors import CollectionNotFoundError, TurboVecError
 from .index import DEFAULT_BIT_WIDTH
 
@@ -70,7 +70,12 @@ class Database:
         """Delete a collection and all its data.
 
         Acquires the collection's write lock before removing the directory
-        to prevent races with concurrent writers in other processes.
+        to prevent races with concurrent writers in other processes. The lock
+        file lives outside the collection directory (see
+        ``collection.write_lock_path``) precisely so that holding it survives
+        the ``rmtree`` below — a lock file inside the directory being deleted
+        would let a concurrent opener recreate a new lock file at the same
+        path and believe it holds the lock too (R1).
 
         Args:
             name: Name of the collection to delete
@@ -92,7 +97,7 @@ class Database:
                 del self._collections[name]
 
         # Acquire the write lock to serialize with concurrent writers.
-        lock_path = os.path.join(coll_dir, "write.lock")
+        lock_path = write_lock_path(coll_dir)
         flock = FileLock(lock_path, timeout=_LOCK_TIMEOUT)
         try:
             flock.acquire()

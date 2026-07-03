@@ -15,10 +15,15 @@ source of truth; the in-memory turbovec index is a cache keyed by `store_gen`.**
 
 ## Writers — serialized by a file lock
 
-Every `add` / `upsert` / `delete` (and `flush`) takes a
+Every `add` / `upsert` / `delete` (and `flush` / `close`) takes a
 [`filelock`](https://py-filelock.readthedocs.io/) lock on
-`<collection>/write.lock` (cross-platform: Linux, macOS, Windows). Under the
-lock a writer:
+`<db_path>/<collection_name>.lock` (cross-platform: Linux, macOS, Windows).
+The lock file is deliberately a *sibling* of the collection directory, not a
+file inside it: `delete_collection` holds this lock while removing the
+collection directory, and a lock file living inside that directory would let
+a concurrent opener recreate a *new* lock file at the same path mid-delete —
+two processes then both believe they hold the collection's write lock, one of
+them writing into a directory being torn down. Under the lock a writer:
 
 1. re-reads `meta` (`next_uid`, `dim`, `store_gen`);
 2. if `store_gen` advanced past what this handle last applied, **reloads the
@@ -90,7 +95,8 @@ leaves only committed SQLite rows behind, and the next open rebuilds.
 - Refresh does a **full** index reload when stale; an *incremental* reload (apply
   only the changed rows) is on the backlog — relevant if writes are very frequent
   against a very large collection.
-- The write lock is **per collection** (`write.lock` lives in the collection
-  directory). Different collections write independently.
+- The write lock is **per collection** (`<name>.lock` lives in the database
+  root, alongside the collection directory it guards). Different collections
+  write independently.
 - `busy_timeout` is set as insurance, but correct use shouldn't rely on it since
   writers are already serialized by the file lock.

@@ -47,7 +47,10 @@ flowchart TB
     subgraph Store["Per-collection directory"]
         SQLITE["store.sqlite3 (WAL)<br/>docs + meta — SOURCE OF TRUTH"]
         TVIM["index.tvim<br/>turbovec 4-bit — REBUILDABLE CACHE"]
-        LOCK["write.lock (filelock)"]
+    end
+
+    subgraph Root["Database root (sibling of the collection dir)"]
+        LOCK["<name>.lock (filelock)"]
     end
 
     subgraph Helpers["Support modules"]
@@ -76,13 +79,16 @@ flowchart TB
 
 ## The data model (read once, recognize forever)
 
-A `Database` is a directory; each collection is a subdirectory holding three files:
+A `Database` is a directory; each collection is a subdirectory:
 
 ```
-<db_path>/<collection_name>/
-  store.sqlite3   durable source of truth (WAL; +.sqlite3-wal/-shm sidecars)
-  index.tvim      turbovec serialized index — rebuildable cache
-  write.lock      cross-process write lock (filelock)
+<db_path>/
+  <collection_name>.lock          cross-process write lock (filelock; sibling
+                                   of the dir so it survives delete_collection's
+                                   rmtree — see docs/core/concurrency.md)
+  <collection_name>/
+    store.sqlite3   durable source of truth (WAL; +.sqlite3-wal/-shm sidecars)
+    index.tvim      turbovec serialized index — rebuildable cache
 ```
 
 SQLite schema ([`collection.py:109`](../src/turbovecdb/collection.py)):
@@ -162,7 +168,7 @@ Operator set is the Chroma/Mongo subset MemPalace's backend abstraction expects.
 
 Designed for several processes on one directory — typically one writer (ingest) + N readers (server/CLI). Two mechanisms, both keyed on the `store_gen` invariant:
 
-- **Writers serialized by a file lock.** Every `add`/`upsert`/`delete`/`flush` takes `<collection>/write.lock` (cross-platform via `filelock`). Exactly one writer at a time → no lost updates, no `uid` collisions. In-process, a re-entrant `RLock` guards the connection and index. `uid`s come from persisted `next_uid`, never an in-memory guess.
+- **Writers serialized by a file lock.** Every `add`/`upsert`/`delete`/`flush`/`close` takes `<db_path>/<collection_name>.lock` (cross-platform via `filelock`; a sibling of the collection directory, not inside it — see [`docs/core/concurrency.md`](core/concurrency.md)). Exactly one writer at a time → no lost updates, no `uid` collisions. In-process, a re-entrant `RLock` guards the connection and index. `uid`s come from persisted `next_uid`, never an in-memory guess.
 - **Readers lock-free, coherent via `store_gen`.** Each `query`/`get` does a cheap `SELECT store_gen`; if it advanced, the reader reloads (loads a current `.tvim`, else sub-second rebuild from SQLite). A reader open for hours transparently picks up another process's writes on its next call. Refresh granularity is per-query, and reload is currently full (incremental reload is on the backlog).
 
 There is no shared mutable index to corrupt — the contrast with HNSW-based stores that need single-writer daemons and corruption-recovery code. Full treatment + the tests that assert these guarantees: [`docs/core/concurrency.md`](core/concurrency.md).

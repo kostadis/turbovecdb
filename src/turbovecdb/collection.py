@@ -9,11 +9,17 @@ around every write) and the in-process lock, exposes the historical
 The result dataclasses live here because the Rust core constructs them by name
 (``turbovecdb.collection.QueryResult`` etc.).
 
-Storage layout (one directory per collection) is unchanged::
+Storage layout (one directory per collection)::
 
-    <dir>/store.sqlite3     durable source of truth (WAL)
-    <dir>/index.tvim        rebuildable turbovec cache
-    <dir>/write.lock        cross-process write lock (filelock)
+    <dir>/store.sqlite3           durable source of truth (WAL)
+    <dir>/index.tvim              rebuildable turbovec cache
+    <dir>/../<name>.lock          cross-process write lock (filelock)
+
+The write lock is deliberately a *sibling* of the collection directory, not
+inside it: ``delete_collection`` holds this lock while removing ``<dir>``, and
+a lock file living inside the directory being deleted would let a concurrent
+opener recreate a *new* lock file at the same path and believe it holds the
+lock too (see issue #35 / R1).
 """
 
 import logging
@@ -81,6 +87,18 @@ def _inc(include):
     return list(include) if include is not None else None
 
 
+def write_lock_path(coll_dir):
+    """Path to a collection's cross-process write lock.
+
+    Deliberately a *sibling* of ``coll_dir`` (``<root>/<name>.lock``), not a
+    file inside it — ``Database.delete_collection`` holds this lock while
+    ``rmtree``-ing ``coll_dir``, and a lock file inside the directory being
+    deleted would let a concurrent opener recreate a new lock file at the
+    same path and believe it holds the collection's lock too (R1)."""
+    root, name = os.path.split(coll_dir)
+    return os.path.join(root, name + ".lock")
+
+
 class Collection:
     def __init__(self, coll_dir, *, dim=None, bit_width=DEFAULT_BIT_WIDTH,
                  metric="cosine", embedder=None, lock_timeout=_LOCK_TIMEOUT):
@@ -88,7 +106,7 @@ class Collection:
         self._tlock = threading.RLock()  # in-process structure guard
         # Cross-process write lock. Held around every write; the Rust core does
         # not lock, so this wrapper is the sole serialization point.
-        self._flock = FileLock(os.path.join(coll_dir, "write.lock"), timeout=lock_timeout)
+        self._flock = FileLock(write_lock_path(coll_dir), timeout=lock_timeout)
         self._has_embedder = embedder is not None
         self._core = _CoreCollection(coll_dir, dim, bit_width, metric, embedder, lock_timeout)
 
