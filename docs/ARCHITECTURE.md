@@ -11,7 +11,7 @@
 > code pointers see [rust-core-plan.md](rust-core-plan.md) and
 > [rust-core-split-design.md](rust-core-split-design.md).
 
-System map for turbovecdb (v0.2.0). Read this first; drill into the per-area docs in [Detailed docs](#detailed-docs) when you need depth.
+System map for turbovecdb (v0.5.0). Read this first; drill into the per-area docs in [Detailed docs](#detailed-docs) when you need depth.
 
 ## What this system is
 
