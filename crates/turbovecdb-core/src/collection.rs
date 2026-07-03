@@ -198,9 +198,17 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         let tvim_gen = self.meta_get_i64("tvim_gen", -1)?;
         if std::path::Path::new(&self.tvim_path).exists() && tvim_gen == store_gen {
             if let Ok(idx) = I::load(&self.tvim_path) {
-                self.index = Some(idx);
-                self.seen_gen = store_gen;
-                return Ok(());
+                // A tvim_gen match only proves the file wasn't stale at
+                // write time; it says nothing about corruption or a
+                // mismatched shape (e.g. a .tvim from a since-reembedded
+                // dim/bit_width). Verify before trusting it (R2) — a
+                // silently wrong-shaped cache would produce a wrong-but-
+                // plausible search, not an error.
+                if idx.dim() as i64 == self.dim.unwrap() && idx.bit_width() as i64 == self.bit_width {
+                    self.index = Some(idx);
+                    self.seen_gen = store_gen;
+                    return Ok(());
+                }
             }
         }
         // Rebuild from the SQLite vectors (source of truth).
@@ -542,7 +550,20 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
         let tmp = format!("{}.tmp", self.tvim_path);
         self.index.as_ref().unwrap().write(&tmp)?;
+        // fsync the temp file before renaming: without this, a crash can
+        // leave a torn .tvim on disk whose tvim_gen (stamped right after
+        // the rename) still claims coherence (R2).
+        std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &self.tvim_path)?;
+        // Best-effort: fsync the parent directory too, since the rename's
+        // directory-entry update isn't durable until the directory itself
+        // is synced. Opening a directory as a File doesn't work on Windows,
+        // so this is deliberately best-effort rather than propagated.
+        if let Some(parent) = std::path::Path::new(&self.tvim_path).parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         // Stamp tvim_gen from seen_gen — the generation the in-memory index
         // actually reflects — not a fresh re-read of store_gen. Without the
         // caller's file lock held, a concurrent writer can bump store_gen
@@ -1619,6 +1640,35 @@ mod tests {
         assert_eq!(c2.count().unwrap(), 1);
         let h = c2.health().unwrap();
         assert!(h.coherent);
+    }
+
+    /// Regression for R2: reload_index() used to trust any .tvim whose
+    /// tvim_gen matched store_gen, without checking that the loaded
+    /// index's shape still matches the collection's meta. A tvim_gen match
+    /// only proves the file wasn't stale when written — it says nothing
+    /// about corruption or a mismatched dim/bit_width (e.g. a leftover
+    /// .tvim from before a reembed). This simulates that: a same-tvim_gen
+    /// file that parses successfully but has the wrong dim must be
+    /// rejected in favor of a rebuild from SQLite.
+    #[test]
+    fn reload_index_rebuilds_when_loaded_dim_mismatches_meta() {
+        let dir = temp_dir("index_mismatch");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        c.flush().unwrap(); // .tvim written, tvim_gen == store_gen
+
+        let wrong = FakeIndex::new(4, 4).unwrap();
+        wrong.write(&c.tvim_path).unwrap();
+
+        c.reload_index().unwrap();
+
+        assert_eq!(
+            c.index.as_ref().unwrap().dim(),
+            8,
+            "must have rebuilt from SQLite (dim 8), not trusted the mismatched (dim 4) .tvim"
+        );
+        let r = c.get(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.ids, vec!["a".to_string()]);
     }
 
     #[test]
