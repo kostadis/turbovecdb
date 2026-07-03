@@ -281,7 +281,16 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                     .to_string(),
             )
         })?;
-        // GAP-1 guard: prevent accidental embedder swap on the write path.
+        self.check_embedder_identity(emb)?;
+        emb.embed(docs)
+    }
+
+    /// GAP-1 guard: prevent accidental embedder swap. Originally the
+    /// write path only (add/upsert, via resolve_vectors above); query
+    /// (text=...) skipped it (C5) — opening a collection with the wrong
+    /// embedder silently produced garbage rankings on every text query,
+    /// with nothing ever erroring.
+    fn check_embedder_identity(&self, emb: &E) -> Result<(), CoreError> {
         if let Some(stored) = self.meta_get("embedder_identity")? {
             let current = emb.identity();
             if current != stored {
@@ -291,7 +300,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 )));
             }
         }
-        emb.embed(docs)
+        Ok(())
     }
 
     fn rollback(&self) {
@@ -868,11 +877,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
         let inc = Include::resolve(include, true);
 
-        // Normalized query vector, shape (1, dim). Note: unlike
-        // resolve_vectors (add/upsert), this does NOT apply the GAP-1
-        // embedder-identity guard — matches the historical query() path,
-        // which called the embedder directly rather than through
-        // resolve_vectors.
+        // Normalized query vector, shape (1, dim).
         let q: Array2<f32> = if let Some(t) = text {
             let emb = self.embedder.as_ref().ok_or_else(|| {
                 CoreError::EmbedderRequired(
@@ -881,6 +886,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                         .to_string(),
                 )
             })?;
+            self.check_embedder_identity(emb)?;
             emb.embed(std::slice::from_ref(&t))?
         } else {
             let mut v = vector.unwrap();
@@ -1768,5 +1774,37 @@ mod tests {
         .unwrap();
         let e = c2.add(vec!["b".into()], Some(vec!["y".into()]), None, None).unwrap_err();
         assert!(matches!(e, CoreError::EmbedderIdentityMismatch(_)));
+    }
+
+    /// Regression for C5: query(text=...) skipped the GAP-1 embedder-
+    /// identity guard that the write path already applied. Opening a
+    /// collection with the wrong embedder used to silently produce
+    /// garbage rankings on every text query instead of erroring.
+    #[test]
+    fn embedder_identity_mismatch_blocks_text_query() {
+        let dir = temp_dir("identity_query");
+        let mut c: Collection<NamedEmbedder, FakeIndex> = Collection::new(
+            dir.clone(),
+            Some(8),
+            4,
+            None,
+            Some(NamedEmbedder { name: "embedder-a".into(), dim: 8 }),
+        )
+        .unwrap();
+        c.add(vec!["a".into()], Some(vec!["x".into()]), None, None).unwrap();
+        drop(c);
+
+        let mut c2: Collection<NamedEmbedder, FakeIndex> = Collection::new(
+            dir,
+            Some(8),
+            4,
+            None,
+            Some(NamedEmbedder { name: "embedder-b".into(), dim: 8 }),
+        )
+        .unwrap();
+        match c2.query(Some("z".into()), None, 5, None, None, None) {
+            Err(CoreError::EmbedderIdentityMismatch(_)) => {}
+            other => panic!("expected Err(CoreError::EmbedderIdentityMismatch(_)), got {}", other.is_ok()),
+        }
     }
 }
