@@ -111,6 +111,8 @@ dataclasses with flat lists.
 - [docs/core/data-model.md](docs/core/data-model.md) — on-disk layout, SQLite
   schema, the `.tvim` cache, generation counters
 - [docs/core/concurrency.md](docs/core/concurrency.md) — the multi-process model
+  (requires a local filesystem — see its "Filesystem requirements" section
+  before deploying on NFS, Docker volumes, or WSL2 `/mnt/*` mounts)
 - [docs/performance/](docs/performance/) — benchmark harness + measured results
 
 ## License

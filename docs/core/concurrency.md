@@ -100,3 +100,28 @@ leaves only committed SQLite rows behind, and the next open rebuilds.
   write independently.
 - `busy_timeout` is set as insurance, but correct use shouldn't rely on it since
   writers are already serialized by the file lock.
+
+## Filesystem requirements
+
+Every guarantee above assumes the database directory lives on a **local
+POSIX filesystem** (ext4, APFS, NTFS, etc.). Both mechanisms this document
+relies on degrade or silently break on networked/virtualized filesystems:
+
+- [`filelock`](https://py-filelock.readthedocs.io/) uses OS-level advisory
+  locking (`flock`/`fcntl` on POSIX, equivalent APIs on Windows). NFS's
+  locking support is notoriously unreliable (client-side caching can let two
+  clients both believe they hold the same lock, especially on NFSv3 or with
+  `nolock` mounted); many Docker volume drivers and bind-mount configurations
+  don't propagate advisory locks correctly across containers either.
+- SQLite's WAL mode explicitly documents that it **does not work reliably
+  over network filesystems** — the shared-memory (`-shm`) file WAL uses for
+  coordination generally requires `mmap` semantics that NFS and similar don't
+  provide correctly.
+
+Concretely unsafe or unsupported for concurrent multi-process use:
+NFS-mounted database directories, most Docker named-volume / bind-mount
+setups spanning multiple containers or hosts, and WSL2's `/mnt/c`-style 9p
+mounts into the Windows filesystem. A single-process, single-machine setup
+(no concurrent access) is unaffected by any of this even on these
+filesystems — the risk is specifically about the cross-process guarantees
+this document describes.
