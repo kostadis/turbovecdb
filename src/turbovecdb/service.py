@@ -31,6 +31,14 @@ COLLECTION = "pages"
 
 # One lock per db_path: turbovecdb is multi-process safe, but we serialize
 # same-DB access within this process to avoid concurrent-writer surprises.
+#
+# Follow-up (lock migration): this is now HTTP-request serialization, not a
+# correctness requirement. The Rust core already serializes in-process (its
+# Mutex) and cross-process (its flock), so concurrent handlers can no longer
+# corrupt state without it. It may still be worth keeping to smooth latency
+# under same-DB write bursts (avoids piling handlers on the core Mutex /
+# flock poll loop), but it is no longer load-bearing for correctness and
+# could be removed if request-level parallelism is preferred.
 _locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 _locks_guard = threading.Lock()
 

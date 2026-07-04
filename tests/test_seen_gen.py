@@ -9,9 +9,11 @@ observable guarantees.)"""
 import os
 
 import pytest
+from filelock import FileLock
 
 import turbovecdb
 from turbovecdb import TurboVecError
+from turbovecdb.collection import write_lock_path
 
 DIM = 8
 
@@ -72,12 +74,15 @@ def test_close_takes_the_write_lock(tmp_path):
     col1 = db1.collection("c", dim=DIM, create=True, lock_timeout=0.5)
     col1.add(ids=["a"], vectors=[_v(0)])
 
-    # A second, independent handle holds the write lock externally.
+    # A second, independent holder takes the write lock externally, via a
+    # Python filelock on the same sibling <name>.lock path the Rust core uses
+    # (I3). col1.close() must contend for that same lock and time out.
     db2 = turbovecdb.connect(path)
     col2 = db2.collection("c", dim=DIM, lock_timeout=0.5)
-    col2._flock.acquire()
+    holder = FileLock(write_lock_path(col2.dir))
+    holder.acquire()
     try:
         with pytest.raises(TurboVecError, match="could not acquire write lock"):
             col1.close()
     finally:
-        col2._flock.release()
+        holder.release()

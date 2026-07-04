@@ -40,6 +40,12 @@ pub enum CoreError {
     Other(String),
     /// -> `turbovecdb.errors.CollectionNotFoundError`.
     CollectionNotFound(String),
+    /// -> `turbovecdb.errors.TurboVecError` (the root class, matching the
+    /// historical Python wrapper, which raised a plain `TurboVecError` when
+    /// the cross-process write lock could not be acquired within the
+    /// timeout). Carries the already-formatted, `repr()`-quoted message so
+    /// `Display` stays a passthrough (invariant I4).
+    LockTimeout(String),
 }
 
 impl fmt::Display for CoreError {
@@ -52,7 +58,8 @@ impl fmt::Display for CoreError {
             | CoreError::InvalidArgument(m)
             | CoreError::Runtime(m)
             | CoreError::Other(m)
-            | CoreError::CollectionNotFound(m) => write!(f, "{m}"),
+            | CoreError::CollectionNotFound(m)
+            | CoreError::LockTimeout(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),
         }

@@ -38,8 +38,8 @@ flowchart TB
         DB["Database.collection(name, …) → Collection<br/>(database.py — handle cache, no I/O on connect)"]
     end
 
-    subgraph Engine["Collection engine (collection.py)"]
-        WRITE["write path: add / upsert / delete<br/>(filelock-serialized)"]
+    subgraph Engine["Collection engine (turbovecdb-core, Rust)"]
+        WRITE["write path: add / upsert / delete<br/>(serialized by the core: Mutex + flock)"]
         READ["read path: query / get<br/>(lock-free, store_gen-coherent)"]
         RERANK["exact-cosine re-rank"]
     end
@@ -50,7 +50,7 @@ flowchart TB
     end
 
     subgraph Root["Database root (sibling of the collection dir)"]
-        LOCK["<name>.lock (filelock)"]
+        LOCK["<name>.lock (Rust flock)"]
     end
 
     subgraph Helpers["Support modules"]
@@ -83,9 +83,10 @@ A `Database` is a directory; each collection is a subdirectory:
 
 ```
 <db_path>/
-  <collection_name>.lock          cross-process write lock (filelock; sibling
-                                   of the dir so it survives delete_collection's
-                                   rmtree — see docs/core/concurrency.md)
+  <collection_name>.lock          cross-process write lock (Rust core flock;
+                                   sibling of the dir so it survives
+                                   delete_collection's rmtree — see
+                                   docs/core/concurrency.md)
   <collection_name>/
     store.sqlite3   durable source of truth (WAL; +.sqlite3-wal/-shm sidecars)
     index.tvim      turbovec serialized index — rebuildable cache
@@ -130,10 +131,10 @@ The `docs` table *is* the bidirectional `str_id ↔ uid` map. New ids draw from 
 
 ## The write path — `add` / `upsert` / `delete`
 
-All in `Collection._write` ([`collection.py:225`](../src/turbovecdb/collection.py)) / `delete` ([`collection.py:282`](../src/turbovecdb/collection.py)), under both the in-process `RLock` and the cross-process `FileLock`:
+All in the Rust core's `write` path (`crates/turbovecdb-core/src/collection.rs`), under the in-process `Mutex` (taken by the PyO3 layer inside `allow_threads`) and then the cross-process `flock`:
 
-1. **Resolve vectors** (`_resolve_vectors`, [`collection.py:218`](../src/turbovecdb/collection.py)): use caller's `vectors=`, or embed `documents=` via the collection's `embedder` (raises `EmbedderRequiredError` if none). All vectors are **L2-normalized** so cosine = dot product.
-2. **Take the write lock**, then under it re-read `meta` (`next_uid`) and `_ensure_current()` — so a second writer sees the first's committed rows before allocating ids.
+1. **Resolve vectors** (`resolve_vectors`): use caller's `vectors=`, or embed `documents=` via the collection's `embedder` (raises `EmbedderRequiredError` if none). All vectors are **L2-normalized** so cosine = dot product. This — and the fast embedder-identity pre-check — happen **before** the flock is taken (I5/R3), so a slow embedder never blocks other processes' writers; the identity is re-checked under the lock.
+2. **Take the write lock**, then under it re-read `meta` (`next_uid`) and `ensure_current()` — so a second writer sees the first's committed rows before allocating ids.
 3. **Commit dim on first write** (`_commit_dim`, [`collection.py:147`](../src/turbovecdb/collection.py)) — enforces `dim > 0 and dim % 8 == 0` (a turbovec requirement) or raises `DimensionMismatchError`.
 4. **Allocate a `uid` per new `str_id`** from persisted `next_uid`; write the row to SQLite (durable step) and mirror it into the in-memory index (`add_with_ids`, or `remove`+re-add for upsert).
 5. **Bump `store_gen`, commit.** The `.tvim` is **not** rewritten per call (that would be O(N) per batch) — it's flushed only on `flush()`/`close()`, marking `_dirty`.
@@ -168,7 +169,7 @@ Operator set is the Chroma/Mongo subset MemPalace's backend abstraction expects.
 
 Designed for several processes on one directory — typically one writer (ingest) + N readers (server/CLI). Two mechanisms, both keyed on the `store_gen` invariant:
 
-- **Writers serialized by a file lock.** Every `add`/`upsert`/`delete`/`flush`/`close` takes `<db_path>/<collection_name>.lock` (cross-platform via `filelock`; a sibling of the collection directory, not inside it — see [`docs/core/concurrency.md`](core/concurrency.md)). Exactly one writer at a time → no lost updates, no `uid` collisions. In-process, a re-entrant `RLock` guards the connection and index. `uid`s come from persisted `next_uid`, never an in-memory guess.
+- **Writers serialized by a file lock.** Every `add`/`upsert`/`delete`/`flush`/`close` takes `<db_path>/<collection_name>.lock` — an `flock(2)` acquired by the Rust core (a sibling of the collection directory, not inside it — see [`docs/core/concurrency.md`](core/concurrency.md)). On Unix this is the same primitive Python `filelock` uses, so old-wheel and new-wheel processes still exclude each other (Windows interop is lost — `filelock` uses `msvcrt.locking` there; CI is Linux/WSL). Exactly one writer at a time → no lost updates, no `uid` collisions. In-process, a `Mutex` around the core (acquired inside `allow_threads`, never under the GIL) guards the connection and index. `uid`s come from persisted `next_uid`, never an in-memory guess.
 - **Readers lock-free, coherent via `store_gen`.** Each `query`/`get` does a cheap `SELECT store_gen`; if it advanced, the reader reloads (loads a current `.tvim`, else sub-second rebuild from SQLite). A reader open for hours transparently picks up another process's writes on its next call. Refresh granularity is per-query, and reload is currently full (incremental reload is on the backlog).
 
 There is no shared mutable index to corrupt — the contrast with HNSW-based stores that need single-writer daemons and corruption-recovery code. Full treatment + the tests that assert these guarantees: [`docs/core/concurrency.md`](core/concurrency.md).
@@ -187,7 +188,7 @@ There is no shared mutable index to corrupt — the contrast with HNSW-based sto
 - **Generation counter as the clock.** `store_gen` (committed-write counter) + `tvim_gen` (what the cache reflects) drive both cold-start loading and live reader coherence.
 - **Approximate find, exact rank.** turbovec narrows to a candidate pool; SQLite float32 vectors decide the order and the reported distance.
 - **Fail loud on filters.** Unsupported operators raise, never silently widen the match set.
-- **Lock for writes, counter for reads.** Writers serialize on a file lock; readers never lock and instead poll one integer.
+- **Lock for writes, counter for reads.** Writers serialize on the core's `flock` (cross-process) + `Mutex` (in-process); readers never take either and instead poll one integer.
 
 ## Common task → start here
 

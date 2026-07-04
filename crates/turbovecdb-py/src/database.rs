@@ -62,4 +62,22 @@ impl Database {
             })
         })
     }
+
+    /// Delete a collection's directory under the core's cross-process write
+    /// lock (I6). The GIL is released for the duration: this may block on the
+    /// flock for up to `lock_timeout` seconds, and it touches no Python
+    /// objects. `database.py` evicts and closes any cached wrapper *before*
+    /// calling this — a handle's `close()` would deadlock against the guard
+    /// held here (second file description on the same lock). rmtree I/O
+    /// failures surface as the raw `OSError` subclass (e.g. `PermissionError`)
+    /// rather than a generic `RuntimeError`, matching the historical
+    /// `delete_collection`, which never wrapped `rmtree`'s exceptions.
+    #[pyo3(signature = (name, lock_timeout=30.0))]
+    fn delete_collection(&self, py: Python<'_>, name: &str, lock_timeout: f64) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.delete_collection(name, lock_timeout)).map_err(|e| match e {
+            CoreError::Io(io_err) => PyErr::from(io_err),
+            other => convert::core_err_to_py(py, other),
+        })
+    }
 }

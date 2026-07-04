@@ -4,22 +4,21 @@ A ``Database`` is a lightweight handle over a directory; each collection is a
 subdirectory. Construction does no I/O — work is deferred to
 :meth:`Database.collection`.
 
-Name validation, path resolution, listing, and directory removal are handled
-by the Rust core (``_core.Database``). The collection-handle cache and its
-locking stay here: each cached ``Collection`` wrapper owns a cross-process
-``FileLock`` and must be identity-stable per name, so a second cache in Rust
-would be redundant and never actually used (see
-``docs/rust-core-database-plan.md``).
+Name validation, path resolution, listing, and — under the cross-process
+write lock — directory removal are handled by the Rust core
+(``_core.Database``). This wrapper keeps only the in-process name ->
+``Collection`` handle cache, which must be identity-stable per name. That
+cache needs no lock of its own: creation is serialized on disk by the core's
+first-creation flock (C7), and handle identity is kept with a GIL-atomic
+``dict.setdefault`` install (a concurrent creator's redundant handle is
+simply closed and discarded).
 """
 
 import logging
 import os
-import threading
-
-from filelock import FileLock, Timeout
 
 from ._core import Database as _CoreDatabase
-from .collection import Collection, _LOCK_TIMEOUT, embedder_identity, write_lock_path
+from .collection import Collection, _LOCK_TIMEOUT, embedder_identity
 from .errors import CollectionNotFoundError, TurboVecError
 from .index import DEFAULT_BIT_WIDTH
 
@@ -36,7 +35,6 @@ class Database:
     def __init__(self, path):
         self._path = path
         self._collections = {}
-        self._lock = threading.Lock()
         self._core = _CoreDatabase(path)
 
     @property
@@ -56,25 +54,37 @@ class Database:
 
         ``name`` must match ``[A-Za-z0-9_-]{1,128}``.
         """
-        with self._lock:
-            cached = self._collections.get(name)
-            if cached is not None:
-                self._check_no_conflict(name, cached, dim, bit_width, metric, embedder)
-                return cached
-            coll_dir = self._core.collection_dir(name)
-            if not create and not os.path.isdir(coll_dir):
-                raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
-            kwargs = dict(
-                dim=dim,
-                bit_width=DEFAULT_BIT_WIDTH if bit_width is _UNSET else bit_width,
-                metric="cosine" if metric is _UNSET else metric,
-                embedder=None if embedder is _UNSET else embedder,
-            )
-            if lock_timeout is not None:
-                kwargs["lock_timeout"] = lock_timeout
-            col = Collection(coll_dir, **kwargs)
-            self._collections[name] = col
-            return col
+        cached = self._collections.get(name)  # GIL-atomic
+        if cached is not None:
+            self._check_no_conflict(name, cached, dim, bit_width, metric, embedder)
+            return cached
+        coll_dir = self._core.collection_dir(name)
+        if not create and not os.path.isdir(coll_dir):
+            raise CollectionNotFoundError(f"collection {name!r} not found at {coll_dir}")
+        kwargs = dict(
+            dim=dim,
+            bit_width=DEFAULT_BIT_WIDTH if bit_width is _UNSET else bit_width,
+            metric="cosine" if metric is _UNSET else metric,
+            embedder=None if embedder is _UNSET else embedder,
+        )
+        if lock_timeout is not None:
+            kwargs["lock_timeout"] = lock_timeout
+        # The actual on-disk creation is serialized by the core's
+        # first-creation flock (C7); the cache only needs identity stability.
+        # ``dict.setdefault`` is a single GIL-atomic op: if a concurrent
+        # caller installed a handle for this name while we were constructing
+        # ours, we adopt theirs and close our now-redundant one — no lock
+        # required, and callers always get the same object per name.
+        col = Collection(coll_dir, **kwargs)
+        installed = self._collections.setdefault(name, col)
+        if installed is not col:
+            try:
+                col.close()
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("error closing redundant handle for %r: %s", name, exc)
+            self._check_no_conflict(name, installed, dim, bit_width, metric, embedder)
+            return installed
+        return col
 
     @staticmethod
     def _check_no_conflict(name, cached, dim, bit_width, metric, embedder):
@@ -104,19 +114,31 @@ class Database:
             )
 
     def list_collections(self):
-        with self._lock:
-            return self._core.list_collections()
+        return self._core.list_collections()
+
+    def _evict_and_close(self, name):
+        """Pop a cached handle (GIL-atomic) and close it. Used outside the
+        delete flock only — a ``close()`` acquires the collection's flock, so
+        calling it while the Rust ``delete_collection`` holds that same lock
+        would self-deadlock (second file description on the same lock file)."""
+        col = self._collections.pop(name, None)
+        if col is not None:
+            try:
+                col.close()
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("error closing collection %r during delete: %s", name, exc)
 
     def delete_collection(self, name):
         """Delete a collection and all its data.
 
-        Acquires the collection's write lock before removing the directory
-        to prevent races with concurrent writers in other processes. The lock
-        file lives outside the collection directory (see
-        ``collection.write_lock_path``) precisely so that holding it survives
-        the ``rmtree`` below — a lock file inside the directory being deleted
-        would let a concurrent opener recreate a new lock file at the same
-        path and believe it holds the lock too (R1).
+        The Rust core acquires the collection's cross-process write lock and
+        removes the directory under it, serializing with concurrent writers
+        in any process. The lock file lives *outside* the collection
+        directory so holding it survives the ``rmtree`` (R1). This wrapper
+        evicts and closes any cached handle *before* the delete (a handle's
+        ``close()`` takes the same flock, so it must not run while the delete
+        holds it), then re-evicts anything a racing ``collection(create=True)``
+        re-installed while the delete ran.
 
         Args:
             name: Name of the collection to delete
@@ -126,44 +148,15 @@ class Database:
             CollectionNotFoundError: If the collection does not exist
             TurboVecError: If the write lock cannot be acquired
         """
-        coll_dir = self._core.ensure_collection(name)
-
-        # Close cached handle if present
-        with self._lock:
-            if name in self._collections:
-                try:
-                    self._collections[name].close()
-                except Exception as exc:
-                    _log.warning("error closing collection %r during delete: %s", name, exc)
-                del self._collections[name]
-
-        # Acquire the write lock to serialize with concurrent writers.
-        lock_path = write_lock_path(coll_dir)
-        flock = FileLock(lock_path, timeout=_LOCK_TIMEOUT)
-        try:
-            flock.acquire()
-        except Timeout:
-            raise TurboVecError(
-                f"could not acquire write lock on {coll_dir!r} within "
-                f"{_LOCK_TIMEOUT}s to delete collection"
-            )
-
-        # Re-check cache under lock — a concurrent collection(create=True)
-        # may have recreated the collection between the initial checks and
-        # the lock acquisition. Close and evict the new handle so rmtree
-        # does not delete a just-created collection out from under someone.
-        with self._lock:
-            if name in self._collections:
-                try:
-                    self._collections[name].close()
-                except Exception as exc:
-                    _log.warning("error closing collection %r during delete: %s", name, exc)
-                del self._collections[name]
-
-        try:
-            self._core.remove_collection_dir(name)
-        finally:
-            flock.release()
+        # Validate + raise CollectionNotFoundError before touching the cache.
+        self._core.ensure_collection(name)
+        # Evict + close the cached handle outside the delete flock.
+        self._evict_and_close(name)
+        # Rust: acquire the flock, rmtree, release (I6). Uses the fixed
+        # _LOCK_TIMEOUT with the "to delete collection" message variant (I4).
+        self._core.delete_collection(name, _LOCK_TIMEOUT)
+        # Re-evict anything a concurrent create re-installed during the delete.
+        self._evict_and_close(name)
 
     def __enter__(self):
         return self
@@ -173,13 +166,12 @@ class Database:
         return False  # don't suppress exceptions
 
     def close(self):
-        with self._lock:
-            for name, col in list(self._collections.items()):
-                try:
-                    col.close()
-                except Exception as exc:
-                    _log.warning("error closing collection %r: %s", name, exc)
-            self._collections.clear()
+        for name, col in list(self._collections.items()):
+            try:
+                col.close()
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("error closing collection %r: %s", name, exc)
+        self._collections.clear()
 
 
 def connect(path):

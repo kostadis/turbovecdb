@@ -9,13 +9,40 @@
 use ndarray::Array2;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::embedder::Embedder;
 use crate::error::CoreError;
 use crate::filters;
+use crate::flock::{py_repr_str, FlockGuard};
 use crate::index::VectorIndex;
 use crate::types::{GetResult, HealthResult, Include, QueryResult, ReembedReport};
 use crate::vecmath::l2_normalize;
+
+/// The write-path cross-process lock-timeout message, byte-identical to the
+/// text the Python wrapper raised (`collection.py`'s `_locked()`):
+/// `could not acquire write lock on {dir!r} within {timeout:.1f}s`. The
+/// `{dir!r}` reproduces Python `repr()` via `py_repr_str` (invariant I4).
+pub(crate) fn write_lock_timeout_msg(dir: &str, timeout: f64) -> String {
+    format!("could not acquire write lock on {} within {:.1}s", py_repr_str(dir), timeout)
+}
+
+/// A collection's cross-process write lock path — deliberately a *sibling*
+/// of `coll_dir` (`<root>/<name>.lock`), not a file inside it, so
+/// `delete_collection`'s rmtree can hold it across the teardown without a
+/// concurrent opener recreating a fresh lock inode at the same path (R1).
+/// Ports `collection.py`'s `write_lock_path` (`os.path.split` + `name +
+/// ".lock"`).
+pub fn write_lock_path(coll_dir: &str) -> PathBuf {
+    let dir = Path::new(coll_dir);
+    let name = dir.file_name().map(|n| n.to_owned()).unwrap_or_default();
+    let mut lock_name = name;
+    lock_name.push(".lock");
+    match dir.parent() {
+        Some(p) => p.join(lock_name),
+        None => PathBuf::from(lock_name),
+    }
+}
 
 const RERANK_FLOOR: i64 = 50;
 const SCHEMA_VERSION: i64 = 1;
@@ -80,6 +107,11 @@ pub struct Collection<E: Embedder, I: VectorIndex> {
     index: Option<I>,
     seen_gen: i64,
     dirty: bool,
+    /// Cross-process write-lock acquisition timeout (seconds). The core is
+    /// now the sole serialization point — in-process (the PyO3 mutex) and
+    /// cross-process (this flock) — so this is a real field, not the value
+    /// the PyO3 constructor used to discard.
+    lock_timeout: f64,
 }
 
 impl<E: Embedder, I: VectorIndex> Collection<E, I> {
@@ -89,6 +121,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         bit_width: i64,
         metric: Option<String>,
         embedder: Option<E>,
+        lock_timeout: f64,
     ) -> Result<Self, CoreError> {
         let metric = metric.unwrap_or_else(|| "cosine".to_string());
         if metric != "cosine" {
@@ -96,9 +129,30 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 "unsupported metric {metric:?} (only 'cosine' for now)"
             )));
         }
-        std::fs::create_dir_all(&coll_dir)?;
         let db_path = format!("{coll_dir}/store.sqlite3");
         let tvim_path = format!("{coll_dir}/index.tvim");
+
+        // C7: first-creation of a brand-new collection must serialize its
+        // meta read-then-write (bit_width/dim/embedder_identity) against
+        // concurrent creators. Compute `looks_new` BEFORE opening the
+        // connection — `Connection::open` *creates* store.sqlite3, so a check
+        // afterward would always read false and the guard would never fire.
+        // Only the create path pays the lock cost; re-opening an existing
+        // collection (the hot path, e.g. service.py per-request) stays
+        // lock-free.
+        let looks_new = !Path::new(&db_path).exists();
+        std::fs::create_dir_all(&coll_dir)?;
+        // Scope the guard to meta-init only: it must be released before `new`
+        // returns, or the first write on the returned handle would self-
+        // conflict on a second, independent file description (flock is
+        // per-open-description, not per-process).
+        let _create_guard = if looks_new {
+            Some(FlockGuard::acquire(&write_lock_path(&coll_dir), lock_timeout, || {
+                write_lock_timeout_msg(&coll_dir, lock_timeout)
+            })?)
+        } else {
+            None
+        };
 
         let conn = Connection::open(&db_path)?;
         // Set the busy timeout FIRST — before the WAL-mode switch and DDL
@@ -124,6 +178,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             index: None,
             seen_gen: -1,
             dirty: false,
+            lock_timeout,
         };
 
         c.bit_width = c.meta_get_i64("bit_width", bit_width)?;
@@ -317,6 +372,19 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         let _ = self.conn.execute_batch("ROLLBACK");
     }
 
+    /// Acquire the cross-process write lock guarding this collection's store.
+    /// The core is now the sole serialization point (I2: the PyO3 in-process
+    /// mutex is taken first, then this flock). Held for the duration of the
+    /// store mutation and released when the returned guard drops. A method
+    /// that holds this guard must not call another method that acquires it
+    /// again on the same file (flock is per-open-description) — hence the
+    /// `*_impl` split for `close`/`flush`.
+    fn acquire_write_lock(&self) -> Result<FlockGuard, CoreError> {
+        FlockGuard::acquire(&write_lock_path(&self.dir), self.lock_timeout, || {
+            write_lock_timeout_msg(&self.dir, self.lock_timeout)
+        })
+    }
+
     /// Truncate the WAL to bound its growth (best-effort).
     fn wal_checkpoint(&self) {
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -449,10 +517,57 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             return Ok(());
         }
 
+        // I5/R3: resolve vectors *outside* the cross-process write lock. For
+        // the vectors= path this is only an L2 normalize; for the documents=
+        // path it is the fast, unlocked embedder-identity pre-check followed
+        // by the (potentially slow, e.g. network-backed) embedder call. A
+        // slow embedder must not hold every other process's writer hostage
+        // for its whole duration — only the actual store mutation below is
+        // serialized.
+        let embedded = vectors.is_none() && documents.is_some() && self.embedder.is_some();
         let vecs = self.resolve_vectors(documents.as_deref(), vectors)?;
+        // For the embedder path, the vectors= pre-check above never ran;
+        // validate the resolved row count uniformly (a misbehaving embedder
+        // that returns the wrong number of rows must error, not panic in the
+        // per-row loop below).
+        let vlen = vecs.nrows();
+        if vlen != n {
+            return Err(CoreError::InvalidArgument(format!(
+                "vectors length {vlen} != ids length {n}"
+            )));
+        }
+
+        // Acquire the cross-process write lock for the store mutation only.
+        let _guard = self.acquire_write_lock()?;
+
+        // Re-check the embedder identity under the lock: a concurrent
+        // reembed() elsewhere could have changed the stored identity in the
+        // window between the unlocked pre-check/embed above and acquiring the
+        // lock here (R3). No-op for the vectors= path.
+        if embedded {
+            let emb = self.embedder.as_ref().unwrap();
+            self.check_embedder_identity(emb)?;
+        }
+
+        self.write_locked(ids, documents, metadatas, vecs, replace)
+    }
+
+    /// The store-mutating half of `write`, run under the cross-process write
+    /// lock with `vecs` already resolved (embedded/normalized) and length-
+    /// validated by the caller outside the lock (I5). `vecs.nrows()` equals
+    /// `ids.len()`.
+    fn write_locked(
+        &mut self,
+        ids: Vec<String>,
+        documents: Option<Vec<String>>,
+        metadatas: Option<Vec<String>>,
+        vecs: Array2<f32>,
+        replace: bool,
+    ) -> Result<(), CoreError> {
+        let n = ids.len();
         let docs: Vec<String> = documents.unwrap_or_else(|| vec![String::new(); n]);
 
-        // Refresh next_uid + index staleness under (eventual) lock.
+        // Refresh next_uid + index staleness under the lock.
         self.next_uid = self.meta_get_i64("next_uid", 0)?;
         self.ensure_current()?;
 
@@ -566,6 +681,13 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         &self.tvim_path
     }
 
+    /// The cross-process write-lock acquisition timeout (seconds). Exposed
+    /// for introspection now that the lock lives in the core rather than the
+    /// Python wrapper's `FileLock` (whose `.timeout` tests used to read).
+    pub fn lock_timeout(&self) -> f64 {
+        self.lock_timeout
+    }
+
     pub fn count(&self) -> Result<i64, CoreError> {
         Ok(self.conn.query_row("SELECT COUNT(*) FROM docs", [], |r| r.get::<_, i64>(0))?)
     }
@@ -575,9 +697,20 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     /// Persist the in-memory index to `index.tvim` (a cold-start cache) and
-    /// checkpoint the WAL. The cross-process write lock is held by the
-    /// Python wrapper around this call.
+    /// checkpoint the WAL, under the cross-process write lock (C1: a stale
+    /// .tvim must not be marked coherent by a concurrent writer bumping
+    /// store_gen between the rename and the tvim_gen stamp).
     pub fn flush(&mut self) -> Result<(), CoreError> {
+        let _guard = self.acquire_write_lock()?;
+        self.flush_impl()
+    }
+
+    /// The lock-free body of `flush`. Split out so `close` (which flushes)
+    /// can hold a *single* write-lock guard across the whole operation:
+    /// flock is per-open-file-description, so a `close` that acquired the
+    /// guard and then called the public `flush` (which acquires again on a
+    /// second description) would deadlock against itself until the timeout.
+    fn flush_impl(&mut self) -> Result<(), CoreError> {
         self.ensure_current()?;
         if self.index.is_none() || !self.dirty {
             return Ok(());
@@ -611,7 +744,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     pub fn close(&mut self) -> Result<(), CoreError> {
-        self.flush()?;
+        // One guard for the whole close: acquire, then call the lock-free
+        // flush body (not the public `flush`, which would re-acquire on a
+        // second file description and self-deadlock).
+        let _guard = self.acquire_write_lock()?;
+        self.flush_impl()?;
         self.wal_checkpoint();
         Ok(())
     }
@@ -655,6 +792,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
 
     /// Remove all documents; keeps configuration.
     pub fn clear(&mut self) -> Result<(), CoreError> {
+        let _guard = self.acquire_write_lock()?;
         self.ensure_current()?;
         if self.count()? == 0 {
             return Ok(());
@@ -696,6 +834,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         where_: Option<&serde_json::Value>,
     ) -> Result<(), CoreError> {
         use rusqlite::types::Value;
+        let _guard = self.acquire_write_lock()?;
         let mut frags: Vec<String> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
         if let Some(idlist) = &ids {
@@ -780,6 +919,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         if ids.is_empty() {
             return Ok(());
         }
+        let _guard = self.acquire_write_lock()?;
         self.ensure_current()?;
         self.conn.execute_batch("BEGIN")?;
         for i in 0..ids.len() {
@@ -832,6 +972,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         if ids.is_empty() {
             return Ok(());
         }
+        let _guard = self.acquire_write_lock()?;
         self.ensure_current()?;
         self.conn.execute_batch("BEGIN")?;
         for i in 0..ids.len() {
@@ -1102,6 +1243,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         mut on_progress: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>>,
         skip_empty: &str,
     ) -> Result<ReembedReport, CoreError> {
+        // reembed re-embeds and rewrites every row; hold the cross-process
+        // write lock for its whole duration (mirrors the wrapper's historical
+        // `with self._locked(): self._core.reembed(...)`). The embedder here
+        // runs *under* the lock by design — unlike add/upsert (I5), reembed
+        // is a bulk maintenance op, not a hot write path.
+        let _guard = self.acquire_write_lock()?;
         if !matches!(skip_empty, "error" | "keep" | "drop") {
             return Err(CoreError::InvalidArgument(format!(
                 "skip_empty must be 'error', 'keep', or 'drop', got {skip_empty:?}"
@@ -1345,7 +1492,7 @@ mod tests {
     }
 
     fn new_collection(dir: &str, dim: Option<i64>) -> Collection<ConstantEmbedder, FakeIndex> {
-        Collection::new(dir.to_string(), dim, 4, None, Some(ConstantEmbedder { dim: 8 })).unwrap()
+        Collection::new(dir.to_string(), dim, 4, None, Some(ConstantEmbedder { dim: 8 }), 30.0).unwrap()
     }
 
     fn vecs(rows: &[[f32; 8]]) -> Array2<f32> {
@@ -1763,6 +1910,7 @@ mod tests {
             4,
             None,
             Some(NamedEmbedder { name: "old-embedder".into(), dim: 8 }),
+            30.0,
         )
         .unwrap();
         c.add(
@@ -1789,6 +1937,7 @@ mod tests {
             4,
             None,
             Some(NamedEmbedder { name: "embedder-a".into(), dim: 8 }),
+            30.0,
         )
         .unwrap();
         c.add(vec!["a".into()], Some(vec!["x".into()]), None, None).unwrap();
@@ -1800,9 +1949,62 @@ mod tests {
             4,
             None,
             Some(NamedEmbedder { name: "embedder-b".into(), dim: 8 }),
+            30.0,
         )
         .unwrap();
         let e = c2.add(vec!["b".into()], Some(vec!["y".into()]), None, None).unwrap_err();
+        assert!(matches!(e, CoreError::EmbedderIdentityMismatch(_)));
+    }
+
+    /// Phase 2: a write on one handle must time out (with the byte-identical
+    /// I4 message) while another file description holds the collection's
+    /// cross-process write lock — the core is now the serialization point.
+    #[test]
+    fn write_times_out_when_lock_held_by_another_open() {
+        let dir = temp_dir("core_contention");
+        let mut c = new_collection(&dir, Some(8));
+        // Give this handle a short timeout so the test is fast.
+        c.lock_timeout = 0.3;
+
+        // A separate open of the same lock file (independent description)
+        // stands in for a concurrent writer holding the lock.
+        let held = FlockGuard::acquire(&write_lock_path(&dir), 5.0, || "unexpected".into()).unwrap();
+
+        let err = c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap_err();
+        match err {
+            CoreError::LockTimeout(m) => assert_eq!(m, write_lock_timeout_msg(&dir, 0.3)),
+            other => panic!("expected LockTimeout, got {other:?}"),
+        }
+        drop(held);
+        // Once released, the same write succeeds.
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
+        assert_eq!(c.count().unwrap(), 1);
+    }
+
+    /// Phase 2: the write path's under-lock embedder-identity re-check (I5).
+    /// A reembed() that swaps the stored identity out from under a handle
+    /// still configured with the old embedder must make the next add() fail,
+    /// not silently write vectors from a stale embedder.
+    #[test]
+    fn reembed_identity_swap_blocks_later_add() {
+        let dir = temp_dir("core_reembed_swap");
+        let mut c: Collection<NamedEmbedder, FakeIndex> = Collection::new(
+            dir,
+            Some(8),
+            4,
+            None,
+            Some(NamedEmbedder { name: "embedder-a".into(), dim: 8 }),
+            30.0,
+        )
+        .unwrap();
+        c.add(vec!["a".into()], Some(vec!["x".into()]), None, None).unwrap();
+        // Swap the stored identity to embedder-b via reembed.
+        c.reembed(NamedEmbedder { name: "embedder-b".into(), dim: 8 }, None, None, 10, None, "error")
+            .unwrap();
+        // c is still configured with embedder-a; a documents= add must be
+        // rejected by the identity guard (pre-check and the under-lock
+        // re-check both compare against the now-embedder-b stored identity).
+        let e = c.add(vec!["b".into()], Some(vec!["y".into()]), None, None).unwrap_err();
         assert!(matches!(e, CoreError::EmbedderIdentityMismatch(_)));
     }
 
@@ -1819,6 +2021,7 @@ mod tests {
             4,
             None,
             Some(NamedEmbedder { name: "embedder-a".into(), dim: 8 }),
+            30.0,
         )
         .unwrap();
         c.add(vec!["a".into()], Some(vec!["x".into()]), None, None).unwrap();
@@ -1830,6 +2033,7 @@ mod tests {
             4,
             None,
             Some(NamedEmbedder { name: "embedder-b".into(), dim: 8 }),
+            30.0,
         )
         .unwrap();
         match c2.query(Some("z".into()), None, 5, None, None, None) {

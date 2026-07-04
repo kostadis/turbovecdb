@@ -4,6 +4,52 @@ All notable changes to turbovecdb are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **All locking moved from the Python wrapper into the Rust core.**
+  `_core.Collection` now owns both the in-process lock (a `Mutex` around the
+  core, acquired inside `allow_threads` so a thread never blocks on it while
+  holding the GIL) and the cross-process write lock (an `flock` on the same
+  sibling `<root>/<name>.lock`, held for every write, for `delete_collection`'s
+  rmtree, and for a brand-new collection's first-creation meta init).
+  `delete_collection`'s lock-and-remove moved into the Rust `Database`. The
+  Python `src/turbovecdb/*.py` is now a lock-free shim. Observable behavior is
+  unchanged: same lock file path, same timeout semantics, same exception types
+  with byte-identical messages, same crash-safety.
+- **Embedding stays outside the write lock.** `add`/`upsert` embed (and run the
+  identity pre-check) before acquiring the flock, then re-check the embedder
+  identity under the lock — a slow embedder no longer blocks other processes'
+  writers.
+
+### Removed
+
+- **`filelock` is no longer a runtime dependency** — it moved to the test/dev
+  group. The cross-process lock is now the Rust core's `flock`; the test suite
+  keeps using Python `filelock` as the *opposing* lock holder to prove the two
+  implementations exclude each other (old-wheel/new-wheel interop).
+
+### Notes
+
+- On Unix the core uses the same `flock(2)` primitive on the same path as
+  Python `filelock`, so a process on the old wheel and one on the new wheel
+  still exclude each other. On Windows this interop is lost (Python `filelock`
+  uses `msvcrt.locking`, a different primitive); CI is Linux/WSL.
+- **Two behavioral exceptions to "unchanged," both from embedding now running
+  under the in-process `Mutex` (previously it ran in Python outside the lock):**
+  (1) an embedder — or a `reembed` `on_progress` callback — that *re-enters the
+  same collection* (e.g. calls `count()`) now deadlocks the non-reentrant
+  `Mutex`; embedders are expected to map text→vectors without touching the
+  collection. (2) A slow `documents=` embed now holds the in-process `Mutex`
+  for its whole duration, so other *in-process* reads/writes on that collection
+  wait for it (they could overlap it before). The cross-process guarantee is
+  unchanged and better — the embed still runs *outside* the cross-process
+  `flock`, so it never blocks writers in *other* processes (R3). Multi-threaded
+  same-process callers of a slow embedder (e.g. the HTTP service) may want to
+  keep `service.py`'s per-db lock or shard collections; a follow-up may revisit
+  in-process embed concurrency.
+
 ## [0.5.0] - 2026-07-03
 
 The engine moved from a pure-Python implementation to a native Rust core. The

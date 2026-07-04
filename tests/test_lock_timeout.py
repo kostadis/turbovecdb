@@ -11,13 +11,19 @@ from turbovecdb import TurboVecError
 
 DIM = 8
 
-# A subprocess that acquires the write lock and holds it indefinitely.
+# A subprocess that creates the collection, then holds its cross-process
+# write lock via an *external* Python ``filelock`` — the same primitive/path
+# the Rust core now uses (I3). This doubles as an old-wheel/new-wheel interop
+# proof: a Python-filelock holder must exclude a Rust-flock acquirer.
 _HOLDER = """
 import time, sys, turbovecdb
+from filelock import FileLock
+from turbovecdb.collection import write_lock_path
 path = sys.argv[1]
 db = turbovecdb.connect(path)
-col = db.collection("c", dim={DIM}, create=True)
-col._flock.acquire()  # hold the lock
+col = db.collection("c", dim={DIM}, create=True)  # store.sqlite3 now exists
+lock = FileLock(write_lock_path(col.dir))
+lock.acquire()  # hold the collection's write lock
 print("LOCKED", flush=True)
 time.sleep(60)  # hold until killed
 """
@@ -38,7 +44,7 @@ def test_lock_timeout_custom(tmp_path):
     col = db.collection("c", dim=DIM, create=True, lock_timeout=10)
     col.add(ids=["a"], documents=["hello"], vectors=[[1.0] + [0.0] * (DIM - 1)])
     assert col.count() == 1
-    assert col._flock.timeout == 10
+    assert col._core.lock_timeout == 10
     db.close()
 
 
@@ -46,7 +52,7 @@ def test_lock_timeout_default_value(tmp_path):
     """Default lock_timeout is 30 seconds."""
     db = turbovecdb.connect(str(tmp_path / "db"))
     col = db.collection("c", dim=DIM, create=True)
-    assert col._flock.timeout == 30
+    assert col._core.lock_timeout == 30
     db.close()
 
 
@@ -54,7 +60,7 @@ def test_lock_timeout_via_database(tmp_path):
     """Can pass lock_timeout through Database.collection()."""
     db = turbovecdb.connect(str(tmp_path / "db"))
     col = db.collection("c", dim=DIM, create=True, lock_timeout=5)
-    assert col._flock.timeout == 5
+    assert col._core.lock_timeout == 5
     db.close()
 
 
