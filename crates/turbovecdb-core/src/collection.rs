@@ -829,6 +829,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
 
     /// SQLite integrity + cache-coherence report.
     pub fn health(&self) -> Result<HealthResult, CoreError> {
+        if !self.conn_is_alive() {
+            return Err(CoreError::ConnectionClosed(format!(
+                "SQLite connection is closed for {:?}", self.dir
+            )));
+        }
         let qc: String = self.conn.query_row("PRAGMA quick_check", [], |r| r.get(0))?;
         let store_gen = self.store_gen_val()?;
         let tvim_gen = self.meta_get_i64("tvim_gen", -1)?;
@@ -2179,5 +2184,41 @@ mod tests {
             .unwrap();
         let next_uid2: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
         assert_eq!(next_uid2, 2, "uid allocation must be monotonic after reconnect");
+    }
+
+    #[test]
+    fn health_succeeds_on_healthy_connection() {
+        let dir = temp_dir("health_ok");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        let h = c.health().unwrap();
+        assert!(h.ok);
+        assert_eq!(h.doc_count, 1);
+    }
+
+    #[test]
+    fn health_flushed_connection_is_coherent() {
+        let dir = temp_dir("health_coherent");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.flush().unwrap();
+        let h = c.health().unwrap();
+        assert!(h.coherent, "after flush, store_gen must equal tvim_gen");
+    }
+
+    #[test]
+    fn health_recovers_after_reconnect() {
+        let dir = temp_dir("health_recover");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        assert!(c.health().is_ok());
+
+        c.reconnect().unwrap();
+        let h = c.health().unwrap();
+        assert!(h.ok);
+        assert_eq!(h.doc_count, 1);
     }
 }
