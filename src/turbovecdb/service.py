@@ -55,16 +55,18 @@ def _open(db_path: str, dim: int | None = None, create: bool = False):
 
 def _close_db(db, col):
     """Close database connection and collection properly."""
+    import logging
+    _log = logging.getLogger(__name__)
     try:
         if col is not None:
             col.close()
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("error closing collection: %s", e)
     try:
         if db is not None:
             db.close()
-    except Exception:
-        pass
+    except Exception as e:
+        _log.warning("error closing database: %s", e)
 
 
 def op_upsert(req: dict) -> dict:

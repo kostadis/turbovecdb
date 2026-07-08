@@ -162,6 +162,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         conn.busy_timeout(std::time::Duration::from_millis(5000))?;
         conn.execute_batch(
             "PRAGMA journal_mode=WAL; \
+             PRAGMA wal_autocheckpoint=100; \
              CREATE TABLE IF NOT EXISTS docs (uid INTEGER PRIMARY KEY, str_id TEXT UNIQUE NOT NULL, document TEXT, metadata TEXT, vector BLOB); \
              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
         )?;
@@ -369,7 +370,9 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     fn rollback(&self) {
-        let _ = self.conn.execute_batch("ROLLBACK");
+        if let Err(e) = self.conn.execute_batch("ROLLBACK") {
+            log::warn!("rollback failed: {e}");
+        }
     }
 
     /// Acquire the cross-process write lock guarding this collection's store.
@@ -387,7 +390,9 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
 
     /// Truncate the WAL to bound its growth (best-effort).
     fn wal_checkpoint(&self) {
-        let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+            log::warn!("WAL checkpoint failed: {e}");
+        }
     }
 
     /// Mirror a write into the in-memory index: drop the replaced uids, then
