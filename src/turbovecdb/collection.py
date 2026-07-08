@@ -73,6 +73,7 @@ class HealthResult:
     tvim_gen: int
     coherent: bool
     doc_count: int
+    wal_size_bytes: Optional[int] = None
 
 
 @dataclass
