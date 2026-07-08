@@ -198,7 +198,12 @@ class Collection:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self.flush()
+        try:
+            self.flush()
+        except Exception as e:
+            if exc_type is None:
+                raise
+            _log.warning("flush failed during context manager exit: %s", e)
         return False
 
     @property

@@ -6,6 +6,8 @@ description = "Pure Rust engine for turbovecdb (no PyO3/Python dependency)"
 license = "MIT"
 
 [dependencies]
+log = "0.4"
+rand = "0.8"
 libc = "0.2"
 ndarray = "0.16"
 openblas-src = { version = "0.10.16", features = ["static"] }
