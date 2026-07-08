@@ -5,3 +5,6 @@ members = ["crates/turbovecdb-core", "crates/turbovecdb-py"]
 [profile.release]
 opt-level = 3
 lto = true
+
+[patch.crates-io]
+flate2 = { git = "https://github.com/rust-lang/flate2-rs", tag = "1.1.0" }

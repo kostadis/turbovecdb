@@ -46,6 +46,11 @@ pub enum CoreError {
     /// timeout). Carries the already-formatted, `repr()`-quoted message so
     /// `Display` stays a passthrough (invariant I4).
     LockTimeout(String),
+    /// -> `turbovecdb.errors.TurboVecError`. The SQLite connection died
+    /// (filesystem error, NFS hiccup, Docker volume remount) and needs a
+    /// `reconnect()` before any further I/O. Carries the already-formatted
+    /// message so `Display` stays a passthrough.
+    ConnectionClosed(String),
 }
 
 impl fmt::Display for CoreError {
@@ -59,7 +64,8 @@ impl fmt::Display for CoreError {
             | CoreError::Runtime(m)
             | CoreError::Other(m)
             | CoreError::CollectionNotFound(m)
-            | CoreError::LockTimeout(m) => write!(f, "{m}"),
+            | CoreError::LockTimeout(m)
+            | CoreError::ConnectionClosed(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),
         }
@@ -108,6 +114,12 @@ mod tests {
             .unwrap_err();
         let msg = CoreError::from(e).to_string();
         assert!(msg.starts_with("sqlite error: "), "got {msg:?}");
+    }
+
+    #[test]
+    fn connection_closed_is_passthrough_display() {
+        let msg = "SQLite connection is closed; call reconnect()";
+        assert_eq!(CoreError::ConnectionClosed(msg.to_string()).to_string(), msg);
     }
 
     #[test]

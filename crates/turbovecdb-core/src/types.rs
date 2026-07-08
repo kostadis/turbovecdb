@@ -68,6 +68,7 @@ pub struct GetResult {
     pub vectors: Option<Vec<Vec<f32>>>,
 }
 
+#[derive(Debug)]
 pub struct HealthResult {
     pub ok: bool,
     pub quick_check: String,
