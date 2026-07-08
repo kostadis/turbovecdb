@@ -768,62 +768,49 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         self.store_gen_val()
     }
 
-    /// Persist the in-memory index to `index.tvim` (a cold-start cache) and
-    /// checkpoint the WAL, under the cross-process write lock (C1: a stale
-    /// .tvim must not be marked coherent by a concurrent writer bumping
-    /// store_gen between the rename and the tvim_gen stamp).
+    /// Persist the in-memory index to `index.tvim` (a cold-start cache).
+    /// The cross-process write lock is narrowed to cover only the SQLite
+    /// coherence stamp + WAL checkpoint (fast), not the file I/O (slow).
     pub fn flush(&mut self) -> Result<(), CoreError> {
         self.check_conn_or_reconnect()?;
+        self.flush_file_io()?;
         let _guard = self.acquire_write_lock()?;
-        self.flush_impl()
+        self.meta_set("tvim_gen", &self.seen_gen.to_string())?;
+        self.wal_checkpoint();
+        self.dirty = false;
+        Ok(())
     }
 
-    /// The lock-free body of `flush`. Split out so `close` (which flushes)
-    /// can hold a *single* write-lock guard across the whole operation:
-    /// flock is per-open-file-description, so a `close` that acquired the
-    /// guard and then called the public `flush` (which acquires again on a
-    /// second description) would deadlock against itself until the timeout.
-    fn flush_impl(&mut self) -> Result<(), CoreError> {
+    /// Lock-free file I/O: write .tmp, fsync, rename, parent-dir fsync.
+    /// Does NOT touch SQLite or hold any cross-process lock — other writers
+    /// can proceed in parallel. If a concurrent writer bumps store_gen
+    /// between our rename and the lock-protected meta_set, the worst case
+    /// is tvim_gen < store_gen -> stale .tvim -> harmless rebuild on next
+    /// open. The .tvim is a cache; staleness is self-healing.
+    fn flush_file_io(&mut self) -> Result<(), CoreError> {
         self.ensure_current()?;
         if self.index.is_none() || !self.dirty {
             return Ok(());
         }
         let tmp = format!("{}.tmp", self.tvim_path);
         self.index.as_ref().unwrap().write(&tmp)?;
-        // fsync the temp file before renaming: without this, a crash can
-        // leave a torn .tvim on disk whose tvim_gen (stamped right after
-        // the rename) still claims coherence (R2).
         std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &self.tvim_path)?;
-        // Best-effort: fsync the parent directory too, since the rename's
-        // directory-entry update isn't durable until the directory itself
-        // is synced. Opening a directory as a File doesn't work on Windows,
-        // so this is deliberately best-effort rather than propagated.
         if let Some(parent) = std::path::Path::new(&self.tvim_path).parent() {
             if let Ok(dir) = std::fs::File::open(parent) {
                 let _ = dir.sync_all();
             }
         }
-        // Stamp tvim_gen from seen_gen — the generation the in-memory index
-        // actually reflects — not a fresh re-read of store_gen. Without the
-        // caller's file lock held, a concurrent writer can bump store_gen
-        // between the rename above and a re-read here, which would mark a
-        // stale .tvim as coherent (wrong query results) instead of merely
-        // stale (harmless rebuild on next open).
-        self.meta_set("tvim_gen", &self.seen_gen.to_string())?; // autocommits
-        self.wal_checkpoint();
-        self.dirty = false;
         Ok(())
     }
 
     pub fn close(&mut self) -> Result<(), CoreError> {
         self.check_conn_or_reconnect()?;
-        // One guard for the whole close: acquire, then call the lock-free
-        // flush body (not the public `flush`, which would re-acquire on a
-        // second file description and self-deadlock).
+        self.flush_file_io()?;
         let _guard = self.acquire_write_lock()?;
-        self.flush_impl()?;
+        self.meta_set("tvim_gen", &self.seen_gen.to_string())?;
         self.wal_checkpoint();
+        self.dirty = false;
         Ok(())
     }
 
