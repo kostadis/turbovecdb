@@ -1121,14 +1121,6 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             v
         };
 
-        self.ensure_current()?;
-        if self.index.is_none() || self.dim.is_none() {
-            return Ok(Self::empty_query_result(inc.vectors));
-        }
-
-        let pool = std::cmp::max(k as i64, RERANK_FLOOR) as usize;
-        let qrow: Vec<f32> = q.row(0).to_vec();
-
         // Snapshot-consistent read: the filter-allowlist SELECT, the index
         // search, and the candidate re-rank SELECT used to run as separate
         // autocommit statements, so a writer's commit in between could
@@ -1138,8 +1130,21 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         // results even when other matches exist (C3). WAL gives
         // snapshot-consistent reads for free across statements enclosed in
         // one deferred transaction.
+        //
+        // #43: `ensure_current()` must be inside the transaction so the
+        // index is loaded from the same SQL snapshot the allowlist and
+        // re-rank SELECT see.  Previously it ran before BEGIN DEFERRED, so
+        // a concurrent writer could delete docs between the index load and
+        // the snapshot establishment, and the stale index would return
+        // deleted candidates that the re-rank could not find.
         self.conn.execute_batch("BEGIN DEFERRED")?;
         let snapshot = (|| -> Result<QueryResult, CoreError> {
+            self.ensure_current()?;
+            if self.index.is_none() || self.dim.is_none() {
+                return Ok(Self::empty_query_result(inc.vectors));
+            }
+            let pool = std::cmp::max(k as i64, RERANK_FLOOR) as usize;
+            let qrow: Vec<f32> = q.row(0).to_vec();
             let allow = self.query_allowlist(where_, where_document)?;
             let allow_ids: Option<Vec<u64>> = match &allow {
                 Some(uids) => {
@@ -1857,6 +1862,29 @@ mod tests {
         }
     }
 
+    /// Fires on `BEGIN DEFERRED` — after `ensure_current()` has loaded
+    /// the index but before the deferred-transaction snapshot is
+    /// established. Injects a concurrent delete + commit from a second
+    /// connection so that the delete lands between `ensure_current()`
+    /// (outside the tx) and the first read inside the tx. Reproduces
+    /// issue #43: the index snapshot lags behind the SQL snapshot.
+    fn trace_inject_delete_before_begin(sql: &str) {
+        if sql.starts_with("BEGIN") && !TRACE_FIRED.with(|f| f.replace(true)) {
+            let path = TRACE_DB_PATH.with(|p| p.borrow().clone());
+            let conn2 = rusqlite::Connection::open(&path).unwrap();
+            conn2.execute("DELETE FROM docs WHERE str_id LIKE 'close%'", []).unwrap();
+            // A real write (through write_locked) bumps store_gen.
+            // Simulate that so the reader's ensure_current can detect
+            // the index is stale and trigger a reload.
+            conn2.execute(
+                "UPDATE meta SET value = CAST(CAST(value AS INTEGER) + 1 AS TEXT) \
+                 WHERE key = 'store_gen'",
+                [],
+            )
+            .unwrap();
+        }
+    }
+
     /// Regression for C3: query() used to run the allowlist SELECT and the
     /// re-rank SELECT as separate autocommit statements, so a writer's
     /// commit landing in between could yield fewer results than the index
@@ -1902,6 +1930,63 @@ mod tests {
         let q2 = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
         let r2 = c.query(None, Some(q2), 10, Some(&filter), None, None).unwrap();
         assert_eq!(r2.ids, vec!["a".to_string()]);
+    }
+
+    /// Regression for #43: query()'s `self.ensure_current()` ran outside
+    /// the snapshot transaction (before BEGIN DEFERRED), so a concurrent
+    /// writer that committed between `ensure_current` and the first read
+    /// inside the tx could delete docs that the index still treated as
+    /// candidates. The re-rank SELECT would then find fewer entries than
+    /// the index returned, silently dropping results. The fix moves
+    /// `ensure_current()` inside the tx (after BEGIN DEFERRED) so the
+    /// index is reloaded from the same SQL snapshot the rest of the
+    /// query sees.
+    #[test]
+    fn query_reloads_index_inside_snapshot_tx() {
+        let dir = temp_dir("query_index_reload");
+        let db_path = format!("{dir}/store.sqlite3");
+        let mut c = new_collection(&dir, Some(8));
+
+        // Insert 51 docs: 50 close to the query vector (will be
+        // concurrently deleted) and 1 far from the query vector (the
+        // sole survivor).  The deleted docs fill the candidate pool
+        // (max(k, RERANK_FLOOR=50) = 50), so a stale index returns
+        // *only* deleted candidates — the survivor is excluded.
+        let n_close = 50_i64;
+        let mut ids: Vec<String> = Vec::new();
+        let mut rows: Vec<[f32; 8]> = Vec::new();
+        for i in 0..n_close {
+            ids.push(format!("close_{i}"));
+            rows.push([1., 0., 0., 0., 0., 0., 0., 0.]);
+        }
+        ids.push("far_0".into());
+        rows.push([0., 1., 0., 0., 0., 0., 0., 0.]);
+
+        let vecs = {
+            let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+            Array2::from_shape_vec((rows.len(), 8), flat).unwrap()
+        };
+        c.add(ids, None, None, Some(vecs)).unwrap();
+
+        TRACE_FIRED.with(|f| f.set(false));
+        TRACE_DB_PATH.with(|p| *p.borrow_mut() = db_path);
+        c.conn.trace(Some(trace_inject_delete_before_begin));
+
+        let q = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let r = c.query(None, Some(q), 2, None, None, None).unwrap();
+        c.conn.trace(None);
+
+        assert!(TRACE_FIRED.with(|f| f.get()), "the concurrent delete never ran");
+
+        // With the fix, ensure_current() runs inside the snapshot tx
+        // and reloads the index from the same state the re-rank SELECT
+        // sees — only "far_0" exists.
+        assert_eq!(r.ids, vec!["far_0"]);
+
+        // A second query (no concurrent activity) also sees the survivor.
+        let q2 = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let r2 = c.query(None, Some(q2), 2, None, None, None).unwrap();
+        assert_eq!(r2.ids, vec!["far_0"]);
     }
 
     #[test]
