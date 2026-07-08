@@ -251,8 +251,67 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
     }
 
+    fn db_path(&self) -> String {
+        format!("{}/store.sqlite3", self.dir)
+    }
+
     fn store_gen_val(&self) -> Result<i64, CoreError> {
         self.meta_get_i64("store_gen", 0)
+    }
+
+    /// Lightweight connection liveness check: runs `SELECT 1` and returns
+    /// `true` if the connection is still alive, `false` otherwise.
+    pub fn conn_is_alive(&self) -> bool {
+        self.conn.query_row("SELECT 1", [], |_| Ok(())).is_ok()
+    }
+
+    /// Open a fresh SQLite connection to the same store file, re-applying
+    /// the WAL journal mode and busy timeout. Re-reads `next_uid` from meta
+    /// (the only mutable in-memory field that changes across writes) and
+    /// invalidates the in-memory index (will rebuild from store on next
+    /// use via `ensure_current`).
+    pub fn reconnect(&mut self) -> Result<(), CoreError> {
+        use std::time::Duration;
+        let new_conn = Connection::open(&self.db_path())?;
+        new_conn.busy_timeout(Duration::from_millis(5000))?;
+        new_conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=100;",
+        )?;
+        self.conn = new_conn;
+        self.next_uid = self.meta_get_i64("next_uid", 0)?;
+        self.index = None;
+        self.seen_gen = -1;
+        Ok(())
+    }
+
+    /// Check connection liveness before a write operation. If the
+    /// connection is dead, attempt a single reconnect. Callers should
+    /// invoke this at the start of every public write method so that a
+    /// stale connection is recovered transparently.
+    fn check_conn_or_reconnect(&mut self) -> Result<(), CoreError> {
+        if !self.conn_is_alive() {
+            log::warn!("connection not alive, attempting reconnect");
+            self.reconnect()?;
+        }
+        Ok(())
+    }
+
+    /// Returns `true` for SQLite errors that indicate a dead or
+    /// unrecoverable connection, where reconnecting may help.
+    fn is_fatal_sqlite_error(e: &rusqlite::Error) -> bool {
+        use rusqlite::ffi;
+        match e {
+            rusqlite::Error::SqliteFailure(err, _) => match err.extended_code {
+                ffi::SQLITE_CORRUPT
+                | ffi::SQLITE_CANTOPEN
+                | ffi::SQLITE_IOERR
+                | ffi::SQLITE_PROTOCOL
+                | ffi::SQLITE_INTERNAL
+                | ffi::SQLITE_NOTADB => true,
+                _ => false,
+            },
+            _ => false,
+        }
     }
 
     fn commit_dim(&mut self, dim: i64) -> Result<(), CoreError> {
@@ -714,6 +773,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     /// .tvim must not be marked coherent by a concurrent writer bumping
     /// store_gen between the rename and the tvim_gen stamp).
     pub fn flush(&mut self) -> Result<(), CoreError> {
+        self.check_conn_or_reconnect()?;
         let _guard = self.acquire_write_lock()?;
         self.flush_impl()
     }
@@ -757,6 +817,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     pub fn close(&mut self) -> Result<(), CoreError> {
+        self.check_conn_or_reconnect()?;
         // One guard for the whole close: acquire, then call the lock-free
         // flush body (not the public `flush`, which would re-acquire on a
         // second file description and self-deadlock).
@@ -790,6 +851,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         metadatas: Option<Vec<String>>,
         vectors: Option<Array2<f32>>,
     ) -> Result<(), CoreError> {
+        self.check_conn_or_reconnect()?;
         self.write(ids, documents, metadatas, vectors, false)
     }
 
@@ -800,11 +862,13 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         metadatas: Option<Vec<String>>,
         vectors: Option<Array2<f32>>,
     ) -> Result<(), CoreError> {
+        self.check_conn_or_reconnect()?;
         self.write(ids, documents, metadatas, vectors, true)
     }
 
     /// Remove all documents; keeps configuration.
     pub fn clear(&mut self) -> Result<(), CoreError> {
+        self.check_conn_or_reconnect()?;
         let _guard = self.acquire_write_lock()?;
         self.ensure_current()?;
         if self.count()? == 0 {
@@ -846,6 +910,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         ids: Option<Vec<String>>,
         where_: Option<&serde_json::Value>,
     ) -> Result<(), CoreError> {
+        self.check_conn_or_reconnect()?;
         use rusqlite::types::Value;
         let _guard = self.acquire_write_lock()?;
         let mut frags: Vec<String> = Vec::new();
@@ -922,6 +987,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     pub fn update_metadata(&mut self, ids: Vec<String>, metadatas: Vec<String>) -> Result<(), CoreError> {
+        self.check_conn_or_reconnect()?;
         if metadatas.len() != ids.len() {
             return Err(CoreError::InvalidArgument(format!(
                 "metadatas length {} != ids length {}",
@@ -975,6 +1041,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     pub fn update_documents(&mut self, ids: Vec<String>, documents: Vec<String>) -> Result<(), CoreError> {
+        self.check_conn_or_reconnect()?;
         if documents.len() != ids.len() {
             return Err(CoreError::InvalidArgument(format!(
                 "documents length {} != ids length {}",
@@ -1256,6 +1323,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         mut on_progress: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>>,
         skip_empty: &str,
     ) -> Result<ReembedReport, CoreError> {
+        self.check_conn_or_reconnect()?;
         // reembed re-embeds and rewrites every row; hold the cross-process
         // write lock for its whole duration (mirrors the wrapper's historical
         // `with self._locked(): self._core.reembed(...)`). The embedder here
@@ -2053,5 +2121,63 @@ mod tests {
             Err(CoreError::EmbedderIdentityMismatch(_)) => {}
             other => panic!("expected Err(CoreError::EmbedderIdentityMismatch(_)), got {}", other.is_ok()),
         }
+    }
+
+    #[test]
+    fn conn_is_alive_returns_true_for_healthy_connection() {
+        let dir = temp_dir("alive_healthy");
+        let c = new_collection(&dir, Some(8));
+        assert!(c.conn_is_alive(), "fresh connection should be alive");
+    }
+
+    #[test]
+    fn reconnect_restores_read_capability() {
+        let dir = temp_dir("reconnect_restore");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(
+            vec!["a".into(), "b".into()],
+            Some(vec!["x".into(), "y".into()]),
+            None,
+            Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.], [0., 1., 0., 0., 0., 0., 0., 0.]])),
+        )
+        .unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+
+        // reconnect() to a fresh connection should preserve data.
+        c.reconnect().unwrap();
+        assert!(c.conn_is_alive());
+        assert_eq!(c.count().unwrap(), 2);
+        assert_eq!(c.dim(), Some(8));
+    }
+
+    #[test]
+    fn reconnect_rewrites_wal_pragma() {
+        let dir = temp_dir("reconnect_wal");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.reconnect().unwrap();
+        // A write after reconnect must still succeed — the WAL pragma was
+        // re-applied and the index was rebuilt on first use.
+        c.add(vec!["b".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        assert_eq!(c.count().unwrap(), 2);
+    }
+
+    #[test]
+    fn reconnect_reloads_next_uid() {
+        let dir = temp_dir("reconnect_next_uid");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        let next_uid: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
+        assert_eq!(next_uid, 1);
+
+        c.reconnect().unwrap();
+        // next_uid was re-read from meta during reconnect.
+        c.add(vec!["b".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        let next_uid2: i64 = c.meta_get("next_uid").unwrap().unwrap().parse().unwrap();
+        assert_eq!(next_uid2, 2, "uid allocation must be monotonic after reconnect");
     }
 }
