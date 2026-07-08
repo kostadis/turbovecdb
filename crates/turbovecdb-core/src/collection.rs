@@ -353,9 +353,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 // silently wrong-shaped cache would produce a wrong-but-
                 // plausible search, not an error.
                 if idx.dim() as i64 == self.dim.unwrap() && idx.bit_width() as i64 == self.bit_width {
-                    self.index = Some(idx);
-                    self.seen_gen = store_gen;
-                    return Ok(());
+                    if idx.len() as i64 == self.count()? {
+                        self.index = Some(idx);
+                        self.seen_gen = store_gen;
+                        return Ok(());
+                    }
                 }
             }
         }

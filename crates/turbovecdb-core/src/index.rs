@@ -34,6 +34,7 @@ where
     /// not that its shape still matches — e.g. after a reembed).
     fn dim(&self) -> usize;
     fn bit_width(&self) -> usize;
+    fn len(&self) -> usize;
 }
 
 pub struct TurbovecIndex(turbovec::IdMapIndex);
@@ -73,6 +74,10 @@ impl VectorIndex for TurbovecIndex {
 
     fn bit_width(&self) -> usize {
         self.0.bit_width()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
@@ -154,6 +159,10 @@ impl VectorIndex for FakeIndex {
 
     fn bit_width(&self) -> usize {
         self.bit_width
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
     }
 }
 
