@@ -140,27 +140,10 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             }
         }
 
-        // C7: first-creation of a brand-new collection must serialize its
-        // meta read-then-write (bit_width/dim/embedder_identity) against
-        // concurrent creators. Compute `looks_new` BEFORE opening the
-        // connection — `Connection::open` *creates* store.sqlite3, so a check
-        // afterward would always read false and the guard would never fire.
-        // Only the create path pays the lock cost; re-opening an existing
-        // collection (the hot path, e.g. service.py per-request) stays
-        // lock-free.
-        let looks_new = !Path::new(&db_path).exists();
         std::fs::create_dir_all(&coll_dir)?;
-        // Scope the guard to meta-init only: it must be released before `new`
-        // returns, or the first write on the returned handle would self-
-        // conflict on a second, independent file description (flock is
-        // per-open-description, not per-process).
-        let _create_guard = if looks_new {
-            Some(FlockGuard::acquire(&write_lock_path(&coll_dir), lock_timeout, || {
-                write_lock_timeout_msg(&coll_dir, lock_timeout)
-            })?)
-        } else {
-            None
-        };
+        let _create_guard = FlockGuard::acquire(&write_lock_path(&coll_dir), lock_timeout, || {
+            write_lock_timeout_msg(&coll_dir, lock_timeout)
+        })?;
 
         let conn = Connection::open(&db_path)?;
         // Set the busy timeout FIRST — before the WAL-mode switch and DDL
@@ -2296,5 +2279,62 @@ mod tests {
         let h = c.health().unwrap();
         assert!(h.ok);
         assert_eq!(h.doc_count, 1);
+    }
+
+    /// Regression for #44: constructor must acquire the cross-process write
+    /// lock even when re-opening an EXISTING collection, or a concurrent
+    /// `delete_collection` can rmtree the directory out from under it.
+    #[test]
+    fn constructor_acquires_lock_for_existing_collection() {
+        let dir = temp_dir("constructor_lock_existing");
+        // Step 1: create collection, write data, persist, close
+        {
+            let mut c = new_collection(&dir, Some(8));
+            c.add(
+                vec!["a".into()],
+                None,
+                None,
+                Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])),
+            )
+            .unwrap();
+            c.close().unwrap();
+        }
+        assert!(std::path::Path::new(&format!("{dir}/store.sqlite3")).exists());
+
+        // Step 2: hold the lock from another thread
+        let lock_path = write_lock_path(&dir);
+        let lock_path2 = lock_path.clone();
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let held2 = held.clone();
+        let h = std::thread::spawn(move || {
+            let _guard =
+                FlockGuard::acquire(&lock_path2, 5.0, || "test".to_string()).unwrap();
+            while held2.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+
+        // Give the thread time to acquire
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // Step 3: try to create a new handle — should timeout
+        let result = Collection::<ConstantEmbedder, FakeIndex>::new(
+            dir.clone(),
+            Some(8),
+            4,
+            Some("cosine".to_string()),
+            Some(ConstantEmbedder { dim: 8 }),
+            0.3,
+        );
+
+        match &result {
+            Err(CoreError::LockTimeout(_)) => { /* expected */ }
+            Ok(_) => panic!("constructor should have failed with LockTimeout — the fix didn't work"),
+            Err(other) => panic!("expected LockTimeout, got {other:?}"),
+        }
+
+        // Cleanup: release the lock
+        held.store(false, std::sync::atomic::Ordering::SeqCst);
+        h.join().unwrap();
     }
 }
