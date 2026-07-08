@@ -104,7 +104,7 @@ pub(crate) fn get_result_to_py(py: Python<'_>, r: GetResult) -> PyResult<PyObjec
 pub(crate) fn health_result_to_py(py: Python<'_>, r: HealthResult) -> PyResult<PyObject> {
     let hr = py.import_bound("turbovecdb.collection")?.getattr("HealthResult")?;
     Ok(hr
-        .call1((r.ok, r.quick_check, r.store_gen, r.tvim_gen, r.coherent, r.doc_count))?
+        .call1((r.ok, r.quick_check, r.store_gen, r.tvim_gen, r.coherent, r.doc_count, r.wal_size_bytes))?
         .unbind())
 }
 

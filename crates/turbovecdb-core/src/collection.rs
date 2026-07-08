@@ -835,7 +835,9 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 self.dir, qc
             )));
         }
-        Ok(HealthResult { ok, quick_check: qc, store_gen, tvim_gen, coherent, doc_count })
+        let wal_path = format!("{}-wal", self.db_path());
+        let wal_size_bytes = std::fs::metadata(&wal_path).ok().map(|m| m.len());
+        Ok(HealthResult { ok, quick_check: qc, store_gen, tvim_gen, coherent, doc_count, wal_size_bytes })
     }
 
     pub fn add(

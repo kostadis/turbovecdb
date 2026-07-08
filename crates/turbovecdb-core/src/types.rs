@@ -76,6 +76,7 @@ pub struct HealthResult {
     pub tvim_gen: i64,
     pub coherent: bool,
     pub doc_count: i64,
+    pub wal_size_bytes: Option<u64>,
 }
 
 /// `old_dim`/`new_dim` are `Option` to faithfully mirror the historical
