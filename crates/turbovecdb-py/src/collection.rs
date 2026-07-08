@@ -170,6 +170,14 @@ impl Collection {
         convert::health_result_to_py(py, r)
     }
 
+    /// Open a fresh SQLite connection to the same store file, recovering
+    /// from a lost connection (e.g. transient filesystem error).
+    fn reconnect(&self, py: Python<'_>) -> PyResult<()> {
+        let inner = &self.inner;
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.reconnect())
+            .map_err(|e| convert::core_err_to_py(py, e))
+    }
+
     #[pyo3(signature = (ids, documents=None, metadatas=None, vectors=None))]
     fn add(
         &self,
