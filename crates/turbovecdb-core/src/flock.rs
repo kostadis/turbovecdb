@@ -34,12 +34,15 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use rand::Rng;
+
 use crate::error::CoreError;
 
 /// Poll interval between non-blocking acquire attempts — matches Python
 /// `filelock`'s default `poll_interval` closely enough to be
 /// indistinguishable under contention.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MAX_BACKOFF: Duration = Duration::from_secs(1);
 
 /// Reproduce Python's `repr()` of a `str` for the historical lock-timeout
 /// messages, which format the collection directory with `{...!r}`. CPython
@@ -121,9 +124,17 @@ impl FlockGuard {
             if elapsed >= timeout_secs {
                 return Err(CoreError::LockTimeout(timeout_msg()));
             }
-            // Don't overshoot a small timeout by a whole poll interval.
+            // Exponential backoff with jitter: start at POLL_INTERVAL, cap at
+            // MAX_BACKOFF, add ±25% random jitter to desynchronize competing
+            // waiters (thundering herd mitigation).
+            let attempt = (elapsed / POLL_INTERVAL.as_secs_f64()).floor() as u32;
+            let backoff_ms = 50u64 * 2u64.pow(attempt.min(5));
+            let backoff = Duration::from_millis(backoff_ms.min(MAX_BACKOFF.as_millis() as u64));
+            let jitter = rand::thread_rng().gen_range(0.75f64..=1.25);
             let remaining = timeout_secs - elapsed;
-            let nap = POLL_INTERVAL.min(Duration::from_secs_f64(remaining.max(0.0)));
+            let nap = Duration::from_secs_f64(
+                (backoff.as_secs_f64() * jitter).min(remaining.max(0.0)),
+            );
             std::thread::sleep(nap);
         }
     }

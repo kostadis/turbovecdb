@@ -132,6 +132,14 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         let db_path = format!("{coll_dir}/store.sqlite3");
         let tvim_path = format!("{coll_dir}/index.tvim");
 
+        // Clean up any orphaned .tmp files from a previous crash mid-flush.
+        let tmp_path = format!("{tvim_path}.tmp");
+        if std::path::Path::new(&tmp_path).exists() {
+            if let Err(e) = std::fs::remove_file(&tmp_path) {
+                log::warn!("failed to remove orphan .tvim.tmp file {tmp_path:?}: {e}");
+            }
+        }
+
         // C7: first-creation of a brand-new collection must serialize its
         // meta read-then-write (bit_width/dim/embedder_identity) against
         // concurrent creators. Compute `looks_new` BEFORE opening the
