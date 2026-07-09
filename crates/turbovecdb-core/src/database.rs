@@ -242,6 +242,60 @@ impl<E: Embedder, I: VectorIndex> CachedDatabase<E, I> {
     pub fn close(&self) {
         self.cache.lock().unwrap().clear();
     }
+
+    /// Add text documents to a collection.
+    ///
+    /// Embedding runs **outside** the collection lock so concurrent
+    /// reads are not blocked during a slow embedder call.
+    ///
+    /// The embedder identity is re-checked under the write lock to
+    /// guard against embedder swaps (R3). Parameters after `metadatas`
+    /// are forwarded to `Collection::new` for first-creation only.
+    pub fn add_text(
+        &self,
+        name: &str,
+        ids: Vec<String>,
+        documents: Vec<String>,
+        metadatas: Option<Vec<String>>,
+        dim: Option<i64>,
+        bit_width: i64,
+        metric: Option<String>,
+        lock_timeout: f64,
+    ) -> Result<(), CoreError> {
+        // Phase 1: grab the embedder reference (brief lock, no I/O for
+        // existing collections thanks to the cache).
+        let (emb, identity) = {
+            let handle = self.collection(name, dim, bit_width, metric.clone(), None, lock_timeout)?;
+            let coll = handle.lock().unwrap();
+            let emb = coll.embedder().ok_or_else(|| {
+                CoreError::EmbedderRequired(
+                    "text was provided but this collection has no embedder; \
+                     pass vectors instead, or create the collection with embedder=..."
+                        .to_string(),
+                )
+            })?;
+            let identity = emb.identity();
+            (emb, identity)
+        };
+
+        // Phase 2: embed OUTSIDE the collection lock.
+        let vectors = emb.embed(&documents)?;
+
+        // Phase 3: re-acquire lock, re-check identity, write.
+        let handle = self.collection(name, dim, bit_width, metric, None, lock_timeout)?;
+        let mut coll = handle.lock().unwrap();
+        // Re-check embedder identity under lock (R3).
+        let current_identity = coll.embedder().map(|e| e.identity()).unwrap_or_default();
+        if current_identity != identity {
+            return Err(CoreError::EmbedderIdentityMismatch(
+                "embedder changed between embedding and write".to_string(),
+            ));
+        }
+        // resolve_vectors with pre-embedded vectors (fast: just normalizes).
+        let vectors = coll.resolve_vectors(None, Some(vectors))?;
+        coll.add(ids, None, metadatas, Some(vectors))?;
+        Ok(())
+    }
 }
 
 // -- Delegation methods (transparent pass-through to inner `Database`) -------
@@ -435,9 +489,40 @@ mod tests {
         );
     }
 
+    /// Embedder for `add_text` tests — returns dim-8 one-hot vectors.
+    /// Each doc `i` gets a unit vector with 1.0 at index `i % 8`.
+    struct TestEmbedder;
+
+    impl Embedder for TestEmbedder {
+        fn embed(&self, docs: &[String]) -> Result<Array2<f32>, CoreError> {
+            let dim = 8usize;
+            let n = docs.len();
+            let mut data = Vec::with_capacity(n * dim);
+            for i in 0..n {
+                for j in 0..dim {
+                    data.push(if i % dim == j { 1.0 } else { 0.0 });
+                }
+            }
+            // Already unit-length, but normalize explicitly per contract.
+            for row in 0..n {
+                let start = row * dim;
+                let sum2: f32 = data[start..start + dim].iter().map(|x| x * x).sum();
+                if sum2 > 0.0 {
+                    let norm = sum2.sqrt();
+                    for j in 0..dim {
+                        data[start + j] /= norm;
+                    }
+                }
+            }
+            Ok(Array2::from_shape_vec((n, dim), data).unwrap())
+        }
+        fn identity(&self) -> String {
+            "TestEmbedder".into()
+        }
+    }
+
     // ------------------------------------------------------------------
-    // CachedDatabase tests — these call todo!() stubs and will panic
-    // until the builder implements the methods.
+    // CachedDatabase tests
     // ------------------------------------------------------------------
 
     #[test]
@@ -469,5 +554,52 @@ mod tests {
         let h2_again = db.collection("b", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
         assert!(!Arc::ptr_eq(&h1, &h1_again));
         assert!(!Arc::ptr_eq(&h2, &h2_again));
+    }
+
+    #[test]
+    fn add_text_writes_embedded_documents() {
+        let root = temp_root("add-text-basic");
+        let db = CachedDatabase::<TestEmbedder, FakeIndex>::new(&root);
+        // Pre-create the collection with an embedder (add_text doesn't
+        // pass an embedder — it expects the collection to already exist).
+        db.collection("coll", Some(8), 8, Some("cosine".into()), Some(TestEmbedder), 5.0).unwrap();
+        db.add_text(
+            "coll",
+            vec!["a".into(), "b".into()],
+            vec!["doc a".into(), "doc b".into()],
+            None,
+            Some(8),
+            8,
+            None,
+            5.0,
+        )
+        .unwrap();
+        // Read back via the collection handle to confirm writes.
+        let handle = db.collection("coll", None, 8, None, None, 5.0).unwrap();
+        let coll = handle.lock().unwrap();
+        let stats = coll.health().unwrap();
+        assert_eq!(stats.doc_count, 2, "add_text should insert 2 documents");
+    }
+
+    #[test]
+    fn add_text_errors_when_no_embedder() {
+        let root = temp_root("add-text-no-emb");
+        let db = CachedDatabase::<TestEmbedder, FakeIndex>::new(&root);
+        // Collection exists but was created without an embedder.
+        db.collection("coll", Some(8), 8, Some("cosine".into()), None, 5.0).unwrap();
+        let e = db
+            .add_text(
+                "coll",
+                vec!["x".into()],
+                vec!["text".into()],
+                None,
+                Some(8),
+                8,
+                None,
+                5.0,
+            )
+            .unwrap_err();
+        assert!(matches!(e, CoreError::EmbedderRequired(_)),
+            "expected EmbedderRequired when collection has no embedder, got {e:?}");
     }
 }

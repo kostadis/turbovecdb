@@ -10,6 +10,7 @@ use ndarray::Array2;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::embedder::Embedder;
 use crate::error::CoreError;
@@ -103,7 +104,7 @@ pub struct Collection<E: Embedder, I: VectorIndex> {
     dim: Option<i64>,
     next_uid: i64,
     conn: Connection,
-    embedder: Option<E>,
+    embedder: Option<Arc<E>>,
     index: Option<I>,
     seen_gen: i64,
     dirty: bool,
@@ -158,6 +159,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
              CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
         )?;
 
+        let embedder: Option<Arc<E>> = embedder.map(Arc::new);
         let mut c = Collection {
             dir: coll_dir,
             tvim_path,
@@ -378,7 +380,22 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     /// Return the normalized vectors for a write: either the caller's raw
     /// vectors (normalized here), or the embedder's output on `documents`
     /// (already normalized — see `Embedder::embed`'s contract).
-    fn resolve_vectors(
+    /// Get a reference-counted handle to the embedder, if any.
+    /// The caller can clone the `Arc` and embed documents outside
+    /// any collection lock, enabling concurrent reads during a slow
+    /// embedder call.
+    pub fn embedder(&self) -> Option<Arc<E>> {
+        self.embedder.clone()
+    }
+
+    /// Resolve documents → L2-normalized vectors, or just normalize
+    /// pre-embedded vectors. If `vectors` is provided, it is normalized
+    /// and returned directly. If `documents` is provided, the embedder
+    /// is called (embedding runs under the in-process lock — callers
+    /// that want concurrent reads during embedding should use
+    /// `collection.embedder()` to clone the Arc, embed outside the
+    /// lock, then call `resolve_vectors(None, Some(vectors))`).
+    pub fn resolve_vectors(
         &self,
         documents: Option<&[String]>,
         vectors: Option<Array2<f32>>,
@@ -1673,7 +1690,7 @@ mod tests {
     }
 
     fn new_collection(dir: &str, dim: Option<i64>) -> Collection<ConstantEmbedder, FakeIndex> {
-        Collection::new(dir.to_string(), dim, 4, None, Some(ConstantEmbedder { dim: 8 }), 30.0).unwrap()
+        Collection::new(dir.to_string(), dim, 4, None,             Some(ConstantEmbedder { dim: 8 }), 30.0).unwrap()
     }
 
     fn vecs(rows: &[[f32; 8]]) -> Array2<f32> {
