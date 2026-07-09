@@ -602,4 +602,84 @@ mod tests {
         assert!(matches!(e, CoreError::EmbedderRequired(_)),
             "expected EmbedderRequired when collection has no embedder, got {e:?}");
     }
+
+    /// Embedder that sleeps to simulate a slow network/Python embedder.
+    struct SlowEmbedder;
+
+    impl Embedder for SlowEmbedder {
+        fn embed(&self, docs: &[String]) -> Result<Array2<f32>, CoreError> {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let dim = 8;
+            let n = docs.len();
+            let mut data = Vec::with_capacity(n * dim);
+            for i in 0..n {
+                for j in 0..dim {
+                    data.push(if i % dim == j { 1.0 } else { 0.0 });
+                }
+            }
+            for row in 0..n {
+                let start = row * dim;
+                let sum2: f32 = data[start..start + dim].iter().map(|x| x * x).sum();
+                if sum2 > 0.0 {
+                    let norm = sum2.sqrt();
+                    for j in 0..dim {
+                        data[start + j] /= norm;
+                    }
+                }
+            }
+            Ok(Array2::from_shape_vec((n, dim), data).unwrap())
+        }
+        fn identity(&self) -> String {
+            "SlowEmbedder".into()
+        }
+    }
+
+    #[test]
+    fn concurrent_query_not_blocked_during_slow_add_text() {
+        let root = temp_root("concurrent-query-during-add");
+        let db = Arc::new(CachedDatabase::<SlowEmbedder, FakeIndex>::new(&root));
+
+        // Pre-create collection with the slow embedder.
+        db.collection("coll", Some(8), 8, Some("cosine".into()), Some(SlowEmbedder), 5.0).unwrap();
+
+        // Spawn add_text in another thread (embedding takes 500ms inside).
+        let db_clone = db.clone();
+        let t1 = std::thread::spawn(move || {
+            db_clone.add_text(
+                "coll",
+                vec!["a".into()],
+                vec!["hello world".into()],
+                None,
+                Some(8),
+                8,
+                None,
+                5.0,
+            ).unwrap();
+        });
+
+        // Give t1 enough time to get past Phase 1 (brief lock) and start embedding.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Query during the embed phase — should NOT block.
+        let start = std::time::Instant::now();
+        let handle = db.collection("coll", None, 8, None, None, 5.0).unwrap();
+        let coll = handle.lock().unwrap();
+        coll.health().unwrap();
+        drop(coll);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_millis(300),
+            "query() blocked during add_text embed, took {:?} (expected < 300ms)",
+            elapsed,
+        );
+
+        t1.join().unwrap();
+
+        // Verify the document was written successfully.
+        let handle = db.collection("coll", None, 8, None, None, 5.0).unwrap();
+        let coll = handle.lock().unwrap();
+        let stats = coll.health().unwrap();
+        assert_eq!(stats.doc_count, 1);
+    }
 }
