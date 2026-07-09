@@ -264,18 +264,16 @@ impl<E: Embedder, I: VectorIndex> CachedDatabase<E, I> {
     ) -> Result<(), CoreError> {
         // Phase 1: grab the embedder reference (brief lock, no I/O for
         // existing collections thanks to the cache).
-        let (emb, identity) = {
+        let emb = {
             let handle = self.collection(name, dim, bit_width, metric.clone(), None, lock_timeout)?;
             let coll = handle.lock().unwrap();
-            let emb = coll.embedder().ok_or_else(|| {
+            coll.embedder().ok_or_else(|| {
                 CoreError::EmbedderRequired(
                     "text was provided but this collection has no embedder; \
                      pass vectors instead, or create the collection with embedder=..."
                         .to_string(),
                 )
-            })?;
-            let identity = emb.identity();
-            (emb, identity)
+            })?
         };
 
         // Phase 2: embed OUTSIDE the collection lock.
@@ -284,12 +282,11 @@ impl<E: Embedder, I: VectorIndex> CachedDatabase<E, I> {
         // Phase 3: re-acquire lock, re-check identity, write.
         let handle = self.collection(name, dim, bit_width, metric, None, lock_timeout)?;
         let mut coll = handle.lock().unwrap();
-        // Re-check embedder identity under lock (R3).
-        let current_identity = coll.embedder().map(|e| e.identity()).unwrap_or_default();
-        if current_identity != identity {
-            return Err(CoreError::EmbedderIdentityMismatch(
-                "embedder changed between embedding and write".to_string(),
-            ));
+        // Re-check embedder identity under lock (R3): a concurrent reembed()
+        // between Phase 1 and Phase 3 will have changed the stored identity,
+        // making check_embedder_identity fail here.
+        if let Some(emb) = coll.embedder() {
+            coll.check_embedder_identity(&emb)?;
         }
         // resolve_vectors with pre-embedded vectors (fast: just normalizes).
         let vectors = coll.resolve_vectors(None, Some(vectors))?;
@@ -677,6 +674,126 @@ mod tests {
         t1.join().unwrap();
 
         // Verify the document was written successfully.
+        let handle = db.collection("coll", None, 8, None, None, 5.0).unwrap();
+        let coll = handle.lock().unwrap();
+        let stats = coll.health().unwrap();
+        assert_eq!(stats.doc_count, 1);
+    }
+
+    // ------------------------------------------------------------------
+    // Identity-swap concurrency test
+    // ------------------------------------------------------------------
+
+    /// Embedder with configurable identity string and sleep delay.
+    /// Used to verify that `add_text` Phase 3 catches a concurrent
+    /// reembed() that changed the stored embedder identity.
+    #[derive(Clone)]
+    struct DynEmbedder {
+        name: &'static str,
+        delay: std::time::Duration,
+    }
+
+    impl Embedder for DynEmbedder {
+        fn embed(&self, docs: &[String]) -> Result<Array2<f32>, CoreError> {
+            std::thread::sleep(self.delay);
+            let dim = 8;
+            let n = docs.len();
+            let mut data = Vec::with_capacity(n * dim);
+            for i in 0..n {
+                for j in 0..dim {
+                    data.push(if i % dim == j { 1.0 } else { 0.0 });
+                }
+            }
+            for row in 0..n {
+                let start = row * dim;
+                let sum2: f32 = data[start..start + dim].iter().map(|x| x * x).sum();
+                if sum2 > 0.0 {
+                    let norm = sum2.sqrt();
+                    for j in 0..dim {
+                        data[start + j] /= norm;
+                    }
+                }
+            }
+            Ok(Array2::from_shape_vec((n, dim), data).unwrap())
+        }
+        fn identity(&self) -> String {
+            self.name.to_string()
+        }
+    }
+
+    #[test]
+    fn reembed_during_add_text_caught_by_identity_check() {
+        let root = temp_root("add-text-reembed");
+        let db = Arc::new(CachedDatabase::<DynEmbedder, FakeIndex>::new(&root));
+
+        // Pre-create collection with a slow embedder (identity "Alpha").
+        db.collection(
+            "coll",
+            Some(8),
+            8,
+            Some("cosine".into()),
+            Some(DynEmbedder { name: "Alpha", delay: std::time::Duration::from_millis(500) }),
+            5.0,
+        )
+        .unwrap();
+
+        // Add one doc so reembed has something to process.
+        db.add_text(
+            "coll",
+            vec!["seed".into()],
+            vec!["seed doc".into()],
+            None,
+            Some(8),
+            8,
+            None,
+            5.0,
+        )
+        .unwrap();
+
+        // Spawn add_text — Phase 1 grabs the Arc, Phase 2 embeds slowly.
+        let db_clone = db.clone();
+        let t1 = std::thread::spawn(move || {
+            db_clone.add_text(
+                "coll",
+                vec!["a".into()],
+                vec!["hello world".into()],
+                None,
+                Some(8),
+                8,
+                None,
+                5.0,
+            )
+        });
+
+        // Let t1 reach Phase 2 (embedding slowly).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        // Swap the stored identity via reembed — this changes the meta table
+        // but does NOT replace the Arc in the collection.
+        let handle = db.collection("coll", None, 8, None, None, 5.0).unwrap();
+        let mut coll = handle.lock().unwrap();
+        coll.reembed(
+            DynEmbedder { name: "Beta", delay: std::time::Duration::ZERO },
+            None,
+            None,
+            10,
+            None,
+            "keep",   // seed doc has empty text (add_text stores text=None)
+        )
+        .unwrap();
+        drop(coll);
+
+        // t1 Phase 3 re-checks under the lock: check_embedder_identity
+        // compares Arc identity ("Alpha") against stored meta identity
+        // ("Beta") — mismatch.
+        let result = t1.join().unwrap();
+        assert!(
+            matches!(result, Err(CoreError::EmbedderIdentityMismatch(_))),
+            "expected EmbedderIdentityMismatch when embedder was swapped during add_text, got {result:?}"
+        );
+
+        // The seed doc remains (reembed re-embedded it); t1's add_text
+        // must NOT have written anything.
         let handle = db.collection("coll", None, 8, None, None, 5.0).unwrap();
         let coll = handle.lock().unwrap();
         let stats = coll.health().unwrap();

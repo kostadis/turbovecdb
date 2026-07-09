@@ -425,7 +425,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     /// (text=...) skipped it (C5) — opening a collection with the wrong
     /// embedder silently produced garbage rankings on every text query,
     /// with nothing ever erroring.
-    fn check_embedder_identity(&self, emb: &E) -> Result<(), CoreError> {
+    pub(crate) fn check_embedder_identity(&self, emb: &E) -> Result<(), CoreError> {
         if let Some(stored) = self.meta_get("embedder_identity")? {
             let current = emb.identity();
             if current != stored {
