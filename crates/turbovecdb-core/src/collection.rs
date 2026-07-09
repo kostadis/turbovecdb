@@ -1214,6 +1214,122 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         snapshot
     }
 
+    pub fn query_batch(
+        &mut self,
+        vectors: Vec<Array2<f32>>,
+        k: usize,
+        where_: Option<&serde_json::Value>,
+        where_document: Option<&serde_json::Value>,
+        include: Option<&[String]>,
+    ) -> Result<Vec<QueryResult>, CoreError> {
+        let inc = Include::resolve(include, true);
+
+        let mut qs: Vec<Vec<f32>> = Vec::with_capacity(vectors.len());
+        for mut q in vectors {
+            l2_normalize(&mut q);
+            qs.push(q.row(0).to_vec());
+        }
+
+        self.conn.execute_batch("BEGIN DEFERRED")?;
+        let results = (|| -> Result<Vec<QueryResult>, CoreError> {
+            self.ensure_current()?;
+            if self.index.is_none() || self.dim.is_none() {
+                return Ok(vec![Self::empty_query_result(inc.vectors); qs.len()]);
+            }
+            let dim = self.dim.unwrap();
+            let pool = std::cmp::max(k as i64, RERANK_FLOOR) as usize;
+            let allow = self.query_allowlist(where_, where_document)?;
+            let allow_ids: Option<Vec<u64>> = match &allow {
+                Some(uids) => {
+                    if uids.is_empty() {
+                        return Ok(vec![Self::empty_query_result(inc.vectors); qs.len()]);
+                    }
+                    Some(uids.iter().map(|&x| x as u64).collect())
+                }
+                None => None,
+            };
+            let allow_ref = allow_ids.as_deref();
+
+            let mut results = Vec::with_capacity(qs.len());
+            for qrow in qs {
+                let (_, cand_uids_u64) =
+                    self.index.as_ref().unwrap().search(&qrow, pool, allow_ref);
+                let cand_uids: Vec<i64> = cand_uids_u64.iter().map(|&x| x as i64).collect();
+
+                let mut map: HashMap<i64, (String, String, String, Vec<u8>)> = HashMap::new();
+                if !cand_uids.is_empty() {
+                    let qmarks = vec!["?"; cand_uids.len()].join(",");
+                    let sql = format!(
+                        "SELECT uid, str_id, document, metadata, vector FROM docs WHERE uid IN ({qmarks})"
+                    );
+                    let mut stmt = self.conn.prepare(&sql)?;
+                    let rows = stmt.query_map(rusqlite::params_from_iter(cand_uids.iter()), |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                            r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                            r.get::<_, Vec<u8>>(4)?,
+                        ))
+                    })?;
+                    for row in rows {
+                        let (u, sid, doc, meta, vec) = row?;
+                        map.insert(u, (sid, doc, meta, vec));
+                    }
+                }
+                let mut scored: Vec<(f32, i64)> = Vec::new();
+                for &uid in &cand_uids {
+                    if let Some((_, _, _, vecb)) = map.get(&uid) {
+                        let dot: f32 = qrow
+                            .iter()
+                            .zip(blob_to_f32_checked(vecb, dim)?)
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        scored.push((1.0 - dot, uid));
+                    }
+                }
+                scored.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                scored.truncate(k);
+
+                let mut result = QueryResult {
+                    vectors: if inc.vectors { Some(Vec::new()) } else { None },
+                    ..Default::default()
+                };
+                for (dist, uid) in &scored {
+                    let (sid, doc, meta, vecb) = map.get(uid).unwrap();
+                    result.ids.push(sid.clone());
+                    if inc.distances {
+                        result.distances.push(*dist as f64);
+                    }
+                    if inc.documents {
+                        result.documents.push(doc.clone());
+                    }
+                    if inc.metadatas {
+                        result.metadatas.push(meta.clone());
+                    }
+                    if inc.vectors {
+                        result.vectors.as_mut().unwrap().push(
+                            blob_to_f32_checked(vecb, dim)?.collect()
+                        );
+                    }
+                }
+                results.push(result);
+            }
+            Ok(results)
+        })();
+
+        match &results {
+            Ok(_) => {
+                if let Err(e) = self.conn.execute_batch("COMMIT") {
+                    self.rollback();
+                    return Err(e.into());
+                }
+            }
+            Err(_) => self.rollback(),
+        }
+        results
+    }
+
     pub fn get(
         &self,
         ids: Option<Vec<String>>,
@@ -2336,5 +2452,79 @@ mod tests {
         // Cleanup: release the lock
         held.store(false, std::sync::atomic::Ordering::SeqCst);
         h.join().unwrap();
+    }
+
+    #[test]
+    fn query_batch_matches_individual_queries() {
+        let dir = temp_dir("query_batch");
+        let mut c = new_collection(&dir, Some(8));
+
+        c.add(
+            vec!["a".into(), "b".into(), "c".into(), "d".into()],
+            Some(vec!["doc-a".into(), "doc-b".into(), "doc-c".into(), "doc-d".into()]),
+            Some(vec![
+                r#"{"pid":"a"}"#.into(),
+                r#"{"pid":"b"}"#.into(),
+                r#"{"pid":"c"}"#.into(),
+                r#"{"pid":"d"}"#.into(),
+            ]),
+            Some(vecs(&[
+                [1., 0., 0., 0., 0., 0., 0., 0.],
+                [0., 1., 0., 0., 0., 0., 0., 0.],
+                [0., 0., 1., 0., 0., 0., 0., 0.],
+                [0.7071, 0.7071, 0., 0., 0., 0., 0., 0.],
+            ])),
+        )
+        .unwrap();
+
+        let q1 = Array2::from_shape_vec((1, 8), vec![1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let q2 = Array2::from_shape_vec((1, 8), vec![0., 1., 0., 0., 0., 0., 0., 0.]).unwrap();
+        let q3 = Array2::from_shape_vec((1, 8), vec![0.7071, 0.7071, 0., 0., 0., 0., 0., 0.]).unwrap();
+        let q4 = Array2::from_shape_vec((1, 8), vec![-1., 0., 0., 0., 0., 0., 0., 0.]).unwrap();
+
+        let query_vectors = vec![q1, q2, q3, q4];
+        let k = 2;
+        let include: &[String] = &[
+            "documents".to_string(),
+            "metadatas".to_string(),
+            "distances".to_string(),
+            "vectors".to_string(),
+        ];
+
+        let batch_results = c
+            .query_batch(query_vectors.clone(), k, None, None, Some(include))
+            .unwrap();
+
+        assert_eq!(batch_results.len(), query_vectors.len());
+
+        for (i, qv) in query_vectors.iter().enumerate() {
+            let individual = c.query(None, Some(qv.clone()), k, None, None, Some(include)).unwrap();
+            let batch = &batch_results[i];
+
+            assert_eq!(batch.ids.len(), individual.ids.len(),
+                "query index {i}: result count mismatch");
+            assert_eq!(batch.ids, individual.ids,
+                "query index {i}: ids mismatch");
+            assert_eq!(batch.distances.len(), individual.distances.len(),
+                "query index {i}: distances length mismatch");
+            for (j, (bd, id)) in batch.distances.iter().zip(individual.distances.iter()).enumerate() {
+                assert!((bd - id).abs() < 1e-5,
+                    "query index {i}, result {j}: distance {} != {}", bd, id);
+            }
+            assert_eq!(batch.documents, individual.documents,
+                "query index {i}: documents mismatch");
+            assert_eq!(batch.metadatas, individual.metadatas,
+                "query index {i}: metadatas mismatch");
+            if let (Some(bv), Some(iv)) = (&batch.vectors, &individual.vectors) {
+                assert_eq!(bv.len(), iv.len(),
+                    "query index {i}: vectors count mismatch");
+                for (j, (b_row, i_row)) in bv.iter().zip(iv.iter()).enumerate() {
+                    for (d, (b_val, i_val)) in b_row.iter().zip(i_row.iter()).enumerate() {
+                        assert!((b_val - i_val).abs() < 1e-5,
+                            "query index {i}, result {j}, dim {d}: vector {} != {}", b_val, i_val);
+                    }
+                }
+            }
+        }
     }
 }

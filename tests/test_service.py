@@ -70,3 +70,52 @@ def test_collection_clear_empty_is_noop(tmp_path):
     assert c.count() == 0
     assert c._store_gen() == gen_before  # no needless store_gen churn
     db.close()
+
+
+def test_op_candidate_pairs_with_query_batch(tmp_path):
+    db_path = str(tmp_path / "svc")
+    items = [
+        {"id": "a", "vector": _vec(1), "type": "page", "title": "Alpha"},
+        {"id": "b", "vector": _vec(2), "type": "page", "title": "Beta"},
+        {"id": "c", "vector": _vec(3), "type": "page", "title": "Gamma"},
+        {"id": "d", "vector": _vec(4), "type": "note", "title": "Delta"},
+        {"id": "e", "vector": _vec(5), "type": "note", "title": "Echo"},
+        {"id": "f", "vector": _vec(1), "type": "page", "title": "Alpha2"},
+        {"id": "g", "vector": _vec(2), "type": "page", "title": "Beta2"},
+        {"id": "h", "vector": _vec(6), "type": "note", "title": "Hotel"},
+        {"id": "i", "vector": _vec(7), "type": "page", "title": "India"},
+        {"id": "j", "vector": _vec(8), "type": "note", "title": "Juliett"},
+    ]
+    assert service.op_upsert({"db_path": db_path, "items": items})["count"] == 10
+
+    result = service.op_candidate_pairs({"db_path": db_path, "threshold": 1.0, "k": 6})
+
+    assert "pairs" in result
+    pairs = result["pairs"]
+
+    for p in pairs:
+        assert "a" in p
+        assert "b" in p
+        assert "distance" in p
+        assert "a_title" in p
+        assert "b_title" in p
+        assert "a_type" in p
+        assert "b_type" in p
+
+    for i in range(len(pairs) - 1):
+        assert pairs[i]["distance"] <= pairs[i + 1]["distance"]
+
+    for p in pairs:
+        assert p["a"] != p["b"]
+
+    seen = set()
+    for p in pairs:
+        key = (p["a"], p["b"])
+        assert key not in seen
+        seen.add(key)
+
+    for p in pairs:
+        assert p["distance"] <= 1.0
+
+    af_pairs = [p for p in pairs if {p["a"], p["b"]} == {"a", "f"}]
+    assert len(af_pairs) == 1

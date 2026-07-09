@@ -177,6 +177,10 @@ class Collection:
               include=("documents", "metadatas", "distances")):
         return self._core.query(text, vector, k, where, where_document, _inc(include))
 
+    def query_batch(self, *, vectors, k=10, where=None, where_document=None,
+                    include=("documents", "metadatas", "distances")):
+        return self._core.query_batch(vectors, k, where, where_document, _inc(include))
+
     def get(self, *, ids=None, where=None, where_document=None, limit=None,
             offset=None, include=("documents", "metadatas")):
         return self._core.get(ids, where, where_document, limit, offset, _inc(include))
