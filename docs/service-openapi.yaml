@@ -1,0 +1,178 @@
+openapi: "3.1.0"
+info:
+  title: turbovecdb-service
+  description: Embedded vector database HTTP service
+  version: "0.1.0"
+servers:
+  - url: http://localhost:8077
+paths:
+  /v1/health:
+    get:
+      operationId: health
+      summary: Health check
+      responses:
+        "200":
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                required: [ok]
+  /v1/upsert:
+    post:
+      operationId: upsert
+      summary: Insert or update vectors
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                db_path:
+                  type: string
+                collection:
+                  type: string
+                items:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      vector:
+                        type: array
+                        items:
+                          type: number
+                      type:
+                        type: string
+                      title:
+                        type: string
+                    required: [id, vector]
+              required: [db_path, collection, items]
+      responses:
+        "200":
+          description: Upsert result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                required: [count]
+        "500":
+          description: Server error
+  /v1/candidate_pairs:
+    post:
+      operationId: candidatePairs
+      summary: Find nearest-neighbor pairs
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                db_path:
+                  type: string
+                collection:
+                  type: string
+                threshold:
+                  type: number
+                k:
+                  type: integer
+                  default: 6
+              required: [db_path, collection, threshold]
+      responses:
+        "200":
+          description: Candidate pairs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  pairs:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        a:
+                          type: string
+                        b:
+                          type: string
+                        distance:
+                          type: number
+                        a_title:
+                          type: string
+                        b_title:
+                          type: string
+                        a_type:
+                          type: string
+                        b_type:
+                          type: string
+                      required: [a, b, distance, a_title, b_title, a_type, b_type]
+                required: [pairs]
+        "500":
+          description: Server error
+  /v1/count:
+    post:
+      operationId: count
+      summary: Count documents in a collection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                db_path:
+                  type: string
+                collection:
+                  type: string
+              required: [db_path, collection]
+      responses:
+        "200":
+          description: Document count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                required: [count]
+        "500":
+          description: Server error
+  /v1/clear:
+    post:
+      operationId: clear
+      summary: Clear all documents from a collection
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                db_path:
+                  type: string
+                collection:
+                  type: string
+              required: [db_path, collection]
+      responses:
+        "200":
+          description: Clear result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                required: [count]
+        "500":
+          description: Server error

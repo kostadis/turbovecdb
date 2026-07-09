@@ -15,6 +15,9 @@ def _vec(seed, dim=8):
     return rng.standard_normal(dim).astype(np.float32).tolist()
 
 
+COLL = "pages"
+
+
 def test_op_clear_empties_then_stays_usable(tmp_path):
     db_path = str(tmp_path / "svc")
     items = [
@@ -22,25 +25,24 @@ def test_op_clear_empties_then_stays_usable(tmp_path):
         {"id": "b", "vector": _vec(2), "type": "page", "title": "Beta"},
         {"id": "c", "vector": _vec(3), "type": "page", "title": "Gamma"},
     ]
-    assert service.op_upsert({"db_path": db_path, "items": items})["count"] == 3
-    assert service.op_count({"db_path": db_path})["count"] == 3
+    assert service.op_upsert({"db_path": db_path, "collection": COLL, "items": items})["count"] == 3
+    assert service.op_count({"db_path": db_path, "collection": COLL})["count"] == 3
 
     # /clear must actually empty the collection (regression: used to raise
     # AttributeError because Collection.clear() was missing).
-    assert service.op_clear({"db_path": db_path})["count"] == 0
-    assert service.op_count({"db_path": db_path})["count"] == 0
+    assert service.op_clear({"db_path": db_path, "collection": COLL})["count"] == 0
+    assert service.op_count({"db_path": db_path, "collection": COLL})["count"] == 0
 
     # And the collection must remain usable — this exercises the next_uid
     # reset + empty-index rebuild together.
-    assert service.op_upsert({"db_path": db_path, "items": items[:2]})["count"] == 2
-    assert service.op_count({"db_path": db_path})["count"] == 2
-    pairs = service.op_candidate_pairs({"db_path": db_path, "threshold": 2.0, "k": 6})
+    assert service.op_upsert({"db_path": db_path, "collection": COLL, "items": items[:2]})["count"] == 2
+    assert service.op_count({"db_path": db_path, "collection": COLL})["count"] == 2
+    pairs = service.op_candidate_pairs({"db_path": db_path, "collection": COLL, "threshold": 2.0, "k": 6})
     assert {p["a"] for p in pairs["pairs"]} | {p["b"] for p in pairs["pairs"]} <= {"a", "b"}
 
 
 def test_op_clear_on_missing_collection_is_noop(tmp_path):
-    # No upsert has ever created the "pages" collection here.
-    assert service.op_clear({"db_path": str(tmp_path / "empty")})["count"] == 0
+    assert service.op_clear({"db_path": str(tmp_path / "empty"), "collection": COLL})["count"] == 0
 
 
 def test_collection_clear_directly(tmp_path):
@@ -86,9 +88,9 @@ def test_op_candidate_pairs_with_query_batch(tmp_path):
         {"id": "i", "vector": _vec(7), "type": "page", "title": "India"},
         {"id": "j", "vector": _vec(8), "type": "note", "title": "Juliett"},
     ]
-    assert service.op_upsert({"db_path": db_path, "items": items})["count"] == 10
+    assert service.op_upsert({"db_path": db_path, "collection": COLL, "items": items})["count"] == 10
 
-    result = service.op_candidate_pairs({"db_path": db_path, "threshold": 1.0, "k": 6})
+    result = service.op_candidate_pairs({"db_path": db_path, "collection": COLL, "threshold": 1.0, "k": 6})
 
     assert "pairs" in result
     pairs = result["pairs"]
@@ -119,3 +121,33 @@ def test_op_candidate_pairs_with_query_batch(tmp_path):
 
     af_pairs = [p for p in pairs if {p["a"], p["b"]} == {"a", "f"}]
     assert len(af_pairs) == 1
+
+
+def test_db_objects_are_cached_per_path(tmp_path):
+    service._databases.clear()
+    db_path = str(tmp_path / "cached")
+
+    r1 = service.op_count({"db_path": db_path, "collection": COLL})
+    assert r1["count"] == 0
+
+    r2 = service.op_count({"db_path": db_path, "collection": COLL})
+    assert r2["count"] == 0
+
+    assert db_path in service._databases
+
+
+def test_collection_handle_survives_across_calls(tmp_path):
+    rng = np.random.default_rng(42)
+    vec = rng.standard_normal(8).astype(np.float32).tolist()
+    db_path = str(tmp_path / "survive")
+    service._databases.clear()
+
+    r1 = service.op_upsert({
+        "db_path": db_path,
+        "collection": COLL,
+        "items": [{"id": "a", "vector": vec, "type": "page", "title": "Alpha"}]
+    })
+    assert r1["count"] == 1
+
+    r2 = service.op_count({"db_path": db_path, "collection": COLL})
+    assert r2["count"] == 1
