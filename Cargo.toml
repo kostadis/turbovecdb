@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/turbovecdb-core", "crates/turbovecdb-py"]
+members = ["crates/turbovecdb-core", "crates/turbovecdb-py", "crates/turbovecdb-cli"]
 
 [profile.release]
 opt-level = 3

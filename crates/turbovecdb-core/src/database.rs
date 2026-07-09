@@ -13,11 +13,15 @@
 //! (`remove_collection_dir` assumes the caller already holds the write lock
 //! and has closed any cached handle).
 
-use crate::collection::write_lock_path;
+use crate::collection::{write_lock_path, Collection};
+use crate::embedder::Embedder;
 use crate::error::CoreError;
 use crate::flock::{py_repr_str, FlockGuard};
+use crate::index::VectorIndex;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 const NAME_MAX_LEN: usize = 128;
 
@@ -167,9 +171,112 @@ impl Database {
     }
 }
 
+/// A `Database` wrapper that caches opened `Collection` handles per name.
+///
+/// Subsequent calls to `collection()` with the same name return the same
+/// cached handle, avoiding repeated SQLite open / DDL / meta reads / index
+/// reload / flock acquire. The cache is entirely in Rust — generic over
+/// `E: Embedder` and `I: VectorIndex` so that Python (PyEmbedder), CLI tools
+/// (NoEmbedder), or other bindings can each instantiate the concrete type
+/// they need without carrying a Python-specific cache.
+///
+/// The cache is thread-safe: `collection()` serializes creation under a
+/// `Mutex` with double-checked locking, and returned handles are
+/// `Arc<Mutex<Collection<E, I>>>` — callers lock the `Mutex` to access the
+/// collection's `&mut self` methods.
+pub struct CachedDatabase<E: Embedder, I: VectorIndex> {
+    inner: Database,
+    cache: Mutex<HashMap<String, Arc<Mutex<Collection<E, I>>>>>,
+}
+
+// ---------------------------------------------------------------------------
+// Implementation stub — methods will be filled in later
+// ---------------------------------------------------------------------------
+impl<E: Embedder, I: VectorIndex> CachedDatabase<E, I> {
+    /// Create a new `CachedDatabase` rooted at `root`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        CachedDatabase {
+            inner: Database::new(root),
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return a cached handle for collection `name`, creating one if absent.
+    ///
+    /// The first call for a given `name` creates the collection via
+    /// `Collection::new(...)`; subsequent calls return the same
+    /// `Arc<Mutex<Collection<E, I>>>` without any I/O.
+    ///
+    /// Parameters are forwarded to `Collection::new` on first creation only.
+    pub fn collection(
+        &self,
+        name: &str,
+        dim: Option<i64>,
+        bit_width: i64,
+        metric: Option<String>,
+        embedder: Option<E>,
+        lock_timeout: f64,
+    ) -> Result<Arc<Mutex<Collection<E, I>>>, CoreError> {
+        // Fast path
+        if let Some(cached) = self.cache.lock().unwrap().get(name) {
+            return Ok(cached.clone());
+        }
+
+        // Slow path: create new collection
+        let coll_dir = self.inner.collection_dir(name)?;
+        let coll_dir_str = coll_dir.to_string_lossy().into_owned();
+        let collection =
+            Collection::new(coll_dir_str, dim, bit_width, metric, embedder, lock_timeout)?;
+        let arc = Arc::new(Mutex::new(collection));
+
+        // Double-check under lock
+        let mut cache = self.cache.lock().unwrap();
+        if let Some(existing) = cache.get(name) {
+            return Ok(existing.clone());
+        }
+        cache.insert(name.to_string(), arc.clone());
+        Ok(arc)
+    }
+
+    /// Close all cached handles and clear the cache.
+    pub fn close(&self) {
+        self.cache.lock().unwrap().clear();
+    }
+}
+
+// -- Delegation methods (transparent pass-through to inner `Database`) -------
+
+impl<E: Embedder, I: VectorIndex> std::ops::Deref for CachedDatabase<E, I> {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        &self.inner
+    }
+}
+
+impl<E: Embedder, I: VectorIndex> std::ops::DerefMut for CachedDatabase<E, I> {
+    fn deref_mut(&mut self) -> &mut Database {
+        &mut self.inner
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::FakeIndex;
+    use ndarray::Array2;
+
+    /// Dummy embedder that implements `Embedder` without doing anything.
+    /// Used in `CachedDatabase` tests where we never call `.embed()`.
+    struct NoEmbedder;
+
+    impl Embedder for NoEmbedder {
+        fn embed(&self, _docs: &[String]) -> Result<Array2<f32>, CoreError> {
+            Ok(Array2::from_shape_vec((0, 0), vec![]).unwrap())
+        }
+        fn identity(&self) -> String {
+            "NoEmbedder".to_string()
+        }
+    }
 
     fn temp_root(name: &str) -> PathBuf {
         let dir = std::env::temp_dir()
@@ -326,5 +433,41 @@ mod tests {
             delete_lock_timeout_msg("/x", 30.0),
             "could not acquire write lock on '/x' within 30s to delete collection"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // CachedDatabase tests — these call todo!() stubs and will panic
+    // until the builder implements the methods.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cached_db_collection_returns_same_handle_on_second_call() {
+        let root = temp_root("cached-same");
+        let db = CachedDatabase::<NoEmbedder, FakeIndex>::new(&root);
+        let h1 = db.collection("test", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
+        let h2 = db.collection("test", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
+        assert!(Arc::ptr_eq(&h1, &h2));
+    }
+
+    #[test]
+    fn cached_db_collection_returns_different_handle_for_different_names() {
+        let root = temp_root("cached-diff");
+        let db = CachedDatabase::<NoEmbedder, FakeIndex>::new(&root);
+        let ha = db.collection("a", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
+        let hb = db.collection("b", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
+        assert!(!Arc::ptr_eq(&ha, &hb));
+    }
+
+    #[test]
+    fn cached_db_close_drops_all_handles() {
+        let root = temp_root("cached-close");
+        let db = CachedDatabase::<NoEmbedder, FakeIndex>::new(&root);
+        let h1 = db.collection("a", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
+        let h2 = db.collection("b", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
+        db.close();
+        let h1_again = db.collection("a", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
+        let h2_again = db.collection("b", Some(8), 4, Some("cosine".into()), None, 5.0).unwrap();
+        assert!(!Arc::ptr_eq(&h1, &h1_again));
+        assert!(!Arc::ptr_eq(&h2, &h2_again));
     }
 }

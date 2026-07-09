@@ -26,6 +26,22 @@ pub trait Embedder: Send {
     fn identity(&self) -> String;
 }
 
+/// An embedder that only supports vector input (panics if asked to embed text).
+/// Useful for CLI tools and non-Python consumers that pass vectors directly.
+pub struct NoEmbedder;
+
+impl Embedder for NoEmbedder {
+    fn embed(&self, _docs: &[String]) -> Result<Array2<f32>, CoreError> {
+        Err(CoreError::InvalidArgument(
+            "NoEmbedder cannot embed text; pass vectors directly".to_string()
+        ))
+    }
+
+    fn identity(&self) -> String {
+        "NoEmbedder".to_string()
+    }
+}
+
 #[cfg(test)]
 pub(crate) struct ConstantEmbedder {
     pub dim: usize,
