@@ -279,6 +279,50 @@ impl Collection {
         convert::query_result_to_py(py, r)
     }
 
+    #[pyo3(signature = (vectors, k=10, where_=None, where_document=None, include=None))]
+    fn query_batch(
+        &self,
+        py: Python<'_>,
+        vectors: Vec<Vec<f32>>,
+        k: usize,
+        where_: Option<PyObject>,
+        where_document: Option<PyObject>,
+        include: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        let maybe_dim: Option<i64> = {
+            let inner = &self.inner;
+            py.allow_threads(|| -> Result<Option<i64>, CoreError> {
+                Ok(inner.lock().map_err(|_| lock_poisoned())?.dim())
+            })
+            .map_err(|e| convert::core_err_to_py(py, e))?
+        };
+        let mut arrs = Vec::with_capacity(vectors.len());
+        if let Some(dim) = maybe_dim {
+            for v in &vectors {
+                if v.len() as i64 != dim {
+                    return Err(convert::core_err_to_py(py, CoreError::InvalidArgument(format!(
+                        "vector has dimension {} but collection expects {}",
+                        v.len(), dim
+                    ))));
+                }
+                arrs.push(Array2::from_shape_vec((1, dim as usize), v.clone())
+                    .map_err(|e| convert::core_err_to_py(py, CoreError::Other(e.to_string())))?);
+            }
+        }
+        let where_json = where_to_json(py, &where_)?;
+        let wd_json = where_to_json(py, &where_document)?;
+        let inner = &self.inner;
+        let r = py
+            .allow_threads(|| {
+                inner
+                    .lock()
+                    .map_err(|_| lock_poisoned())?
+                    .query_batch(arrs, k, where_json.as_ref(), wd_json.as_ref(), include.as_deref())
+            })
+            .map_err(|e| convert::core_err_to_py(py, e))?;
+        convert::query_batch_result_to_py(py, r)
+    }
+
     #[pyo3(signature = (ids=None, where_=None, where_document=None, limit=None, offset=None, include=None))]
     fn get(
         &self,

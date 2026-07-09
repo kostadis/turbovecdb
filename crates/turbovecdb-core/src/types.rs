@@ -47,7 +47,7 @@ impl Include {
 /// Python `QueryResult` dataclass exactly). `metadatas` holds raw JSON text
 /// (or `""` for "no metadata") — `turbovecdb-py::convert` does the final
 /// `json.loads`.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct QueryResult {
     pub ids: Vec<String>,
     pub distances: Vec<f64>,

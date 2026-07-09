@@ -108,6 +108,15 @@ pub(crate) fn health_result_to_py(py: Python<'_>, r: HealthResult) -> PyResult<P
         .unbind())
 }
 
+pub(crate) fn query_batch_result_to_py(py: Python<'_>, results: Vec<QueryResult>) -> PyResult<PyObject> {
+    let list = PyList::empty_bound(py);
+    for r in results {
+        let item = query_result_to_py(py, r)?;
+        list.append(item)?;
+    }
+    Ok(list.into_any().unbind())
+}
+
 pub(crate) fn reembed_report_to_py(py: Python<'_>, r: ReembedReport) -> PyResult<PyObject> {
     let rr = py.import_bound("turbovecdb.collection")?.getattr("ReembedReport")?;
     Ok(rr

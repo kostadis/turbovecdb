@@ -113,10 +113,10 @@ def op_candidate_pairs(req: dict) -> dict:
             meta_by_id = {pid: m for pid, m in zip(ids, metas)}
             seen: set[tuple[str, str]] = set()
             pairs = []
-            for pid, v in zip(ids, vecs):
-                q = col.query(vector=v, k=k, where={"pid": {"$ne": pid}})
-                for nid, dist in zip(q.ids, q.distances):
-                    if dist > tau:
+            batch = col.query_batch(vectors=vecs, k=k)
+            for pid, qr in zip(ids, batch):
+                for nid, dist in zip(qr.ids, qr.distances):
+                    if nid == pid or dist > tau:
                         continue
                     key = tuple(sorted((pid, nid)))
                     if key in seen:
