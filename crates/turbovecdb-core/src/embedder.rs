@@ -12,7 +12,7 @@ use ndarray::Array2;
 
 use crate::error::CoreError;
 
-pub trait Embedder: Send {
+pub trait Embedder: Send + Sync {
     /// Embed a batch of documents, returning one L2-normalized row per
     /// document (row-normalization is the caller's contract — `Collection`
     /// relies on embedder output already being unit-norm, matching the
