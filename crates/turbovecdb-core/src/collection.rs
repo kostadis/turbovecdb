@@ -2414,6 +2414,73 @@ mod tests {
         assert_eq!(h.doc_count, 1);
     }
 
+    /// Deterministic reproduction of bug #91: concurrent flushes can
+    /// cross-stamp so that tvim_gen == store_gen but the .tvim file has
+    /// stale content from a different generation's snapshot.
+    ///
+    /// Race interleaving (both handles call flush() without the lock
+    /// held for file I/O):
+    ///   1. h2.flush_file_io writes gen=N .tvim
+    ///   2. h1.flush_file_io OVERWRITES .tvim with gen=M (M < N)
+    ///   3. h1.meta_set stamps tvim_gen=M  (overwritten by ...)
+    ///   4. h2.meta_set stamps tvim_gen=N  (N == store_gen → coherent!)
+    ///   → .tvim has gen=M content but tvim_gen=N == store_gen → trusted
+    ///   → stale cache; health reports coherent because only
+    ///     store_gen==tvim_gen is checked, not content integrity
+    ///
+    /// This test simulates the end state directly (deterministic).
+    /// With RERANK_FLOOR=50, the re-rank from SQLite hides the bug for
+    /// small datasets — the health_integrity probe is the definitive
+    /// signal.
+    #[test]
+    fn flush_cross_stamp_simulated_health_hides_it() {
+        let dir = temp_dir("cross_stamp_sim");
+        let mut c = new_collection(&dir, Some(8));
+
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.flush().unwrap();
+
+        // Save .tvim from gen=2 (stale handle's snapshot).
+        c.upsert(vec!["a".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.flush().unwrap();
+        let stale_tvim = std::fs::read_to_string(&c.tvim_path).unwrap();
+
+        // Advance to gen=3 with different vector content.
+        c.upsert(vec!["a".into()], None, None, Some(vecs(&[[0., 0., 1., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.flush().unwrap();
+
+        // Pre-race sanity.
+        assert_eq!(
+            c.store_gen_val().unwrap(),
+            c.meta_get_i64("tvim_gen", -1).unwrap(),
+        );
+
+        // CROSS-STAMP: write stale .tvim, then set tvim_gen to match
+        // store_gen so health() thinks everything is coherent.
+        std::fs::write(&c.tvim_path, stale_tvim.as_bytes()).unwrap();
+        let store_gen = c.store_gen_val().unwrap();
+        c.conn
+            .execute(
+                &format!("UPDATE meta SET value = '{store_gen}' WHERE key = 'tvim_gen'"),
+                [],
+            )
+            .unwrap();
+
+        // BUG: health reports coherent even though .tvim content is
+        // from a different generation.
+        let h = c.health().unwrap();
+        assert!(
+            !h.coherent,
+            "Bug #91: cross-stamp hidden from health — tvim_gen==store_gen=={gen} \
+             but .tvim has stale content from gen={stale}",
+            gen = store_gen,
+            stale = store_gen - 1,
+        );
+    }
+
     /// Regression for #44: constructor must acquire the cross-process write
     /// lock even when re-opening an EXISTING collection, or a concurrent
     /// `delete_collection` can rmtree the directory out from under it.
