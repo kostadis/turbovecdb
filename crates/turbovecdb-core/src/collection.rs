@@ -915,8 +915,21 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     /// coherence stamp + WAL checkpoint (fast), not the file I/O (slow).
     pub fn flush(&mut self) -> Result<(), CoreError> {
         self.check_conn_or_reconnect()?;
-        self.flush_file_io()?;
+        self.ensure_current()?;
         let _guard = self.acquire_write_lock()?;
+        if self.index.is_some() && self.dirty {
+            let tmp = format!("{}.tmp", self.tvim_path);
+            self.index.as_ref().unwrap().write(&tmp)?;
+            std::fs::File::open(&tmp)?.sync_all()?;
+            std::fs::rename(&tmp, &self.tvim_path)?;
+            let fp = Self::compute_collection_fingerprint(&self.conn, &self.tvim_path)?;
+            self.write_fingerprint(fp)?;
+            if let Some(parent) = std::path::Path::new(&self.tvim_path).parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
         self.meta_set("tvim_gen", &self.seen_gen.to_string())?;
         self.wal_checkpoint();
         self.dirty = false;
@@ -968,35 +981,23 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         Some(u64::from_le_bytes(buf))
     }
 
-    /// Lock-free file I/O: write .tmp, fsync, rename, parent-dir fsync.
-    /// Does NOT touch SQLite or hold any cross-process lock — other writers
-    /// can proceed in parallel. If a concurrent writer bumps store_gen
-    /// between our rename and the lock-protected meta_set, the worst case
-    /// is tvim_gen < store_gen -> stale .tvim -> harmless rebuild on next
-    /// open. The .tvim is a cache; staleness is self-healing.
-    fn flush_file_io(&mut self) -> Result<(), CoreError> {
-        self.ensure_current()?;
-        if self.index.is_none() || !self.dirty {
-            return Ok(());
-        }
-        let tmp = format!("{}.tmp", self.tvim_path);
-        self.index.as_ref().unwrap().write(&tmp)?;
-        std::fs::File::open(&tmp)?.sync_all()?;
-        std::fs::rename(&tmp, &self.tvim_path)?;
-        let fp = Self::compute_collection_fingerprint(&self.conn, &self.tvim_path)?;
-        self.write_fingerprint(fp)?;
-        if let Some(parent) = std::path::Path::new(&self.tvim_path).parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
-        }
-        Ok(())
-    }
-
     pub fn close(&mut self) -> Result<(), CoreError> {
         self.check_conn_or_reconnect()?;
-        self.flush_file_io()?;
+        self.ensure_current()?;
         let _guard = self.acquire_write_lock()?;
+        if self.index.is_some() && self.dirty {
+            let tmp = format!("{}.tmp", self.tvim_path);
+            self.index.as_ref().unwrap().write(&tmp)?;
+            std::fs::File::open(&tmp)?.sync_all()?;
+            std::fs::rename(&tmp, &self.tvim_path)?;
+            let fp = Self::compute_collection_fingerprint(&self.conn, &self.tvim_path)?;
+            self.write_fingerprint(fp)?;
+            if let Some(parent) = std::path::Path::new(&self.tvim_path).parent() {
+                if let Ok(dir) = std::fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+        }
         self.meta_set("tvim_gen", &self.seen_gen.to_string())?;
         self.wal_checkpoint();
         self.dirty = false;
@@ -1014,7 +1015,26 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         let store_gen = self.store_gen_val()?;
         let tvim_gen = self.meta_get_i64("tvim_gen", -1)?;
         let doc_count = self.count()?;
-        let coherent = store_gen == tvim_gen;
+        let coherent = if store_gen == tvim_gen && std::path::Path::new(&self.tvim_path).exists() {
+            // tvim_gen matching store_gen is not enough — the .tvim file
+            // content must also correspond to the current UID/vector set.
+            // Verify via the content fingerprint (#90 / bug #91).
+            match self.read_fingerprint() {
+                Some(stored) => {
+                    let expected = match Self::compute_collection_fingerprint(&self.conn, &self.tvim_path) {
+                        Ok(fp) => fp,
+                        Err(_) => return Ok(HealthResult {
+                            ok: qc == "ok", quick_check: qc, store_gen, tvim_gen,
+                            coherent: false, doc_count, wal_size_bytes: None,
+                        }),
+                    };
+                    stored == expected
+                }
+                None => true, // pre-fix .tvim, accept
+            }
+        } else {
+            store_gen == tvim_gen
+        };
         let ok = qc == "ok";
         if !ok {
             return Err(CoreError::Other(format!(
