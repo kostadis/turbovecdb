@@ -62,6 +62,9 @@ pub enum CoreError {
     /// a hard error — silently falling back to a default would produce wrong
     /// results or silently reuse uids.
     CorruptedMetadata(String),
+    /// -> `turbovecdb.errors.CorruptedMetadataError`. The `.tvim` cache was
+    /// written by a different collection (UID/vector fingerprint mismatch).
+    CorruptedTvim(String),
 }
 
 impl fmt::Display for CoreError {
@@ -78,7 +81,8 @@ impl fmt::Display for CoreError {
             | CoreError::LockTimeout(m)
             | CoreError::ConnectionClosed(m)
             | CoreError::EmbedderMismatch(m)
-            | CoreError::CorruptedMetadata(m) => write!(f, "{m}"),
+            | CoreError::CorruptedMetadata(m)
+            | CoreError::CorruptedTvim(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),
         }
