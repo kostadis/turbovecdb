@@ -104,15 +104,17 @@ impl Collection {
     #[getter]
     fn dim(&self, py: Python<'_>) -> PyResult<Option<i64>> {
         let inner = &self.inner;
-        py.allow_threads(|| Ok::<_, CoreError>(inner.lock().map_err(|_| lock_poisoned())?.dim()))
+        py.allow_threads(|| inner.lock().map_err(|_| lock_poisoned())?.dim())
             .map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[getter]
     fn bit_width(&self, py: Python<'_>) -> PyResult<i64> {
         let inner = &self.inner;
-        py.allow_threads(|| Ok::<_, CoreError>(inner.lock().map_err(|_| lock_poisoned())?.bit_width()))
-            .map_err(|e| convert::core_err_to_py(py, e))
+        py.allow_threads(|| {
+            let mut guard = inner.lock().map_err(|_| lock_poisoned())?;
+            guard.bit_width()
+        }).map_err(|e| convert::core_err_to_py(py, e))
     }
 
     #[getter]
@@ -292,7 +294,7 @@ impl Collection {
         let maybe_dim: Option<i64> = {
             let inner = &self.inner;
             py.allow_threads(|| -> Result<Option<i64>, CoreError> {
-                Ok(inner.lock().map_err(|_| lock_poisoned())?.dim())
+                Ok(inner.lock().map_err(|_| lock_poisoned())?.dim()?)
             })
             .map_err(|e| convert::core_err_to_py(py, e))?
         };

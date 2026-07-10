@@ -192,7 +192,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         // Record embedder identity on first creation so later opens with a
         // different embedder are caught by the write-path guard.
         if let Some(emb) = c.embedder.as_ref() {
-            if c.meta_get("embedder_identity")?.is_none() {
+            if c.meta_get("embedder_identity")?.is_none() && c.count()? == 0 {
                 let id = emb.identity();
                 c.meta_set("embedder_identity", &id)?;
             }
@@ -370,8 +370,28 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         Ok(())
     }
 
+    /// Re-read `dim` and `bit_width` from the SQLite meta table so this
+    /// handle sees config changes made by another handle (e.g. after
+    /// reembed). Must be called *before* `reload_index()` so the index
+    /// rebuild uses the current shape.
+    fn refresh_config_from_meta(&mut self) -> Result<(), CoreError> {
+        if let Some(s) = self.meta_get("dim")? {
+            self.dim = Some(s.parse().map_err(|_| {
+                CoreError::Other("unparseable dim in meta".into())
+            })?);
+        }
+        if let Some(s) = self.meta_get("bit_width")? {
+            self.bit_width = s.parse().map_err(|_| {
+                CoreError::Other("unparseable bit_width in meta".into())
+            })?;
+        }
+        Ok(())
+    }
+
     fn ensure_current(&mut self) -> Result<(), CoreError> {
         if self.store_gen_val()? != self.seen_gen {
+            self.refresh_config_from_meta()?;
+            self.seen_gen = self.store_gen_val()?;
             self.reload_index()?;
         }
         Ok(())
@@ -426,13 +446,24 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     /// embedder silently produced garbage rankings on every text query,
     /// with nothing ever erroring.
     pub(crate) fn check_embedder_identity(&self, emb: &E) -> Result<(), CoreError> {
-        if let Some(stored) = self.meta_get("embedder_identity")? {
-            let current = emb.identity();
-            if current != stored {
-                return Err(CoreError::EmbedderIdentityMismatch(format!(
-                    "embedder identity mismatch: stored {stored:?} != current {current:?}; \
-                     use reembed() to change embedders"
-                )));
+        match self.meta_get("embedder_identity")? {
+            Some(stored) => {
+                let current = emb.identity();
+                if current != stored {
+                    return Err(CoreError::EmbedderIdentityMismatch(format!(
+                        "embedder identity mismatch: stored {stored:?} != current {current:?}; \
+                         use reembed() to change embedders"
+                    )));
+                }
+            }
+            None => {
+                let count = self.count()?;
+                if count > 0 {
+                    return Err(CoreError::EmbedderMismatch(format!(
+                        "collection has {count} documents but no embedder identity; \
+                         use reembed() to set a new embedder"
+                    )));
+                }
             }
         }
         Ok(())
@@ -743,12 +774,14 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         &self.dir
     }
 
-    pub fn dim(&self) -> Option<i64> {
-        self.dim
+    pub fn dim(&mut self) -> Result<Option<i64>, CoreError> {
+        self.ensure_current()?;
+        Ok(self.dim)
     }
 
-    pub fn bit_width(&self) -> i64 {
-        self.bit_width
+    pub fn bit_width(&mut self) -> Result<i64, CoreError> {
+        self.ensure_current()?;
+        Ok(self.bit_width)
     }
 
     pub fn tvim_path(&self) -> &str {
@@ -1805,7 +1838,7 @@ mod tests {
         c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
         c.clear().unwrap();
         assert_eq!(c.count().unwrap(), 0);
-        assert_eq!(c.dim(), Some(8));
+        assert_eq!(c.dim().unwrap(), Some(8));
     }
 
     /// Regression for C4: clear() used to reset next_uid to 0. Uids are
@@ -2344,7 +2377,7 @@ mod tests {
         c.reconnect().unwrap();
         assert!(c.conn_is_alive());
         assert_eq!(c.count().unwrap(), 2);
-        assert_eq!(c.dim(), Some(8));
+        assert_eq!(c.dim().unwrap(), Some(8));
     }
 
     #[test]

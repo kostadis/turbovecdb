@@ -35,6 +35,9 @@ pub(crate) fn core_err_to_py(py: Python<'_>, e: CoreError) -> PyErr {
         CoreError::EmbedderIdentityMismatch(m) => {
             turbovec_error(py, "EmbedderIdentityMismatchError", m)
         }
+        CoreError::EmbedderMismatch(m) => {
+            turbovec_error(py, "EmbedderMismatchError", m)
+        }
         CoreError::UnsupportedFilter(m) => turbovec_error(py, "UnsupportedFilterError", m),
         CoreError::CollectionNotFound(m) => turbovec_error(py, "CollectionNotFoundError", m),
         CoreError::Other(m) => turbovec_error(py, "TurboVecError", m),

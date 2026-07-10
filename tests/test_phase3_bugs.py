@@ -130,7 +130,6 @@ def test_reembed_callback_deadlocks(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(reason="Bug #101: populated collection with missing identity silently adopts new embedder")
 def test_populated_collection_adopts_caller_embedder(tmp_path):
     """A populated collection with no embedder_identity must NOT
     automatically stamp the opener's embedder as authoritative."""
@@ -258,7 +257,6 @@ def test_identity_collision_allows_wrong_model_write(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(reason="Bug #99: live handle has stale dim after reembed")
 def test_live_handle_stale_dim_after_reembed(tmp_path):
     """A handle that was opened before reembed uses its original dim
     even after another handle changes it."""
@@ -286,7 +284,6 @@ def test_live_handle_stale_dim_after_reembed(tmp_path):
     db_a.close()
 
 
-@pytest.mark.xfail(reason="Bug #99: live handle has stale bit_width after reembed")
 def test_live_handle_stale_bit_width_after_reembed(tmp_path):
     """Same as above but for bit_width."""
     path = str(tmp_path / "db")

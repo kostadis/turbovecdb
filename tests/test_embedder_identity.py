@@ -97,18 +97,21 @@ def test_no_embedder_no_identity_check(tmp_path):
 
 
 def test_legacy_collection_allows_first_embedder(tmp_path):
-    """Legacy collection (no identity stored) should accept first embedder."""
+    """Populated legacy collection (no identity stored) must reject a new
+    embedder's text writes — require reembed() to set a proper identity."""
+    from turbovecdb.errors import EmbedderMismatchError
+
     db = turbovecdb.connect(str(tmp_path / "db"))
     c = db.collection("c", create=True)
     c.add(ids=["a"], vectors=[[1.0] + [0.0] * (DIM - 1)])
     db.close()
 
-    # Reopen with embedder on legacy collection — identity not stored yet,
-    # so first add should store it and succeed.
     db2 = turbovecdb.connect(str(tmp_path / "db"))
     c2 = db2.collection("c", embedder=_embedder_a)
-    c2.add(ids=["b"], documents=["beta document"])
-    assert c2._meta_get("embedder_identity") == "_embedder_a"
+    with pytest.raises(EmbedderMismatchError, match="no embedder identity"):
+        c2.add(ids=["b"], documents=["beta document"])
+    # Raw vector path still works — it bypasses the embedder identity check.
+    c2.add(ids=["b"], vectors=[[1.0] + [0.0] * (DIM - 1)])
     db2.close()
 
 
