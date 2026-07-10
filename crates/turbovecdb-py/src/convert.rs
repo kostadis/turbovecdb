@@ -40,6 +40,7 @@ pub(crate) fn core_err_to_py(py: Python<'_>, e: CoreError) -> PyErr {
         }
         CoreError::UnsupportedFilter(m) => turbovec_error(py, "UnsupportedFilterError", m),
         CoreError::CollectionNotFound(m) => turbovec_error(py, "CollectionNotFoundError", m),
+        CoreError::CorruptedMetadata(m) => turbovec_error(py, "CorruptedMetadataError", m),
         CoreError::Other(m) => turbovec_error(py, "TurboVecError", m),
         // The cross-process write-lock timeout — historically a plain
         // `TurboVecError` raised by the Python wrapper's `_locked()`.

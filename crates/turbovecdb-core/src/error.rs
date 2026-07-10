@@ -56,6 +56,12 @@ pub enum CoreError {
     /// collection. A new embedder cannot be silently adopted; use
     /// `reembed()` to set a proper identity.
     EmbedderMismatch(String),
+    /// -> `turbovecdb.errors.CorruptedMetadataError`. Metadata in the meta
+    /// table is missing, unparseable, or semantically invalid (e.g. a non-
+    /// numeric `dim` or a `next_uid` that is not an integer). This is always
+    /// a hard error — silently falling back to a default would produce wrong
+    /// results or silently reuse uids.
+    CorruptedMetadata(String),
 }
 
 impl fmt::Display for CoreError {
@@ -71,7 +77,8 @@ impl fmt::Display for CoreError {
             | CoreError::CollectionNotFound(m)
             | CoreError::LockTimeout(m)
             | CoreError::ConnectionClosed(m)
-            | CoreError::EmbedderMismatch(m) => write!(f, "{m}"),
+            | CoreError::EmbedderMismatch(m)
+            | CoreError::CorruptedMetadata(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),
         }

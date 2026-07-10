@@ -1,15 +1,4 @@
-"""Tests proving Phase 1 high-severity bugs still exist.
-
-Each test asserts the CORRECT behaviour (what should happen after the fix)
-and is marked ``xfail`` because the bug is still present. When a fix is
-applied, remove ``xfail`` and the test should pass.
-
-Current status after investigation (July 2026):
-  #88 — NaN/inf vectors:     ALREADY FIXED (add path validates)
-  #86 — invalid bit_width:   ALREADY FIXED (constructor validates)
-  #87 — query input validation:  STILL BROKEN (3 sub-cases)
-  #85 — corrupt dim metadata:    STILL BROKEN (2 sub-cases)
-"""
+"""Tests proving Phase 1 high-severity bugs are fixed."""
 
 import os
 import sqlite3
@@ -31,7 +20,6 @@ _UNIT = [1.0, 0, 0, 0, 0, 0, 0, 0]
 # ═══════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(reason="Bug #87: query with wrong dim panics + poisons handle (assert 4 == 0 in turbovec)")
 def test_query_wrong_dimension_raises(tmp_path):
     db = turbovecdb.connect(str(tmp_path / "db"))
     c = db.collection("c", dim=DIM, create=True)
@@ -43,7 +31,6 @@ def test_query_wrong_dimension_raises(tmp_path):
     db.close()
 
 
-@pytest.mark.xfail(reason="Bug #87: multi-row array silently uses row 0, no error")
 def test_query_multi_row_raises(tmp_path):
     db = turbovecdb.connect(str(tmp_path / "db"))
     c = db.collection("c", dim=DIM, create=True)
@@ -54,7 +41,6 @@ def test_query_multi_row_raises(tmp_path):
     db.close()
 
 
-@pytest.mark.xfail(reason="Bug #87: empty vector silently succeeds, returns []")
 def test_query_empty_vector_raises(tmp_path):
     db = turbovecdb.connect(str(tmp_path / "db"))
     c = db.collection("c", dim=DIM, create=True)
@@ -64,7 +50,6 @@ def test_query_empty_vector_raises(tmp_path):
     db.close()
 
 
-@pytest.mark.xfail(reason="Bug #88: NaN query vector panics + poisons handle (assert 9 == 8 in turbovec)")
 def test_query_nan_vector_raises(tmp_path):
     db = turbovecdb.connect(str(tmp_path / "db"))
     c = db.collection("c", dim=DIM, create=True)
@@ -76,7 +61,6 @@ def test_query_nan_vector_raises(tmp_path):
     db.close()
 
 
-@pytest.mark.xfail(reason="Bug #88: Inf query vector panics + poisons handle")
 def test_query_inf_vector_raises(tmp_path):
     db = turbovecdb.connect(str(tmp_path / "db"))
     c = db.collection("c", dim=DIM, create=True)
@@ -94,7 +78,6 @@ def test_query_inf_vector_raises(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(reason="Bug #85: corrupt dim meta -> dim=None, query returns empty, no error")
 def test_corrupt_dim_meta_errors_on_reopen(tmp_path):
     path = str(tmp_path / "db")
     db = turbovecdb.connect(path)
@@ -117,7 +100,6 @@ def test_corrupt_dim_meta_errors_on_reopen(tmp_path):
     db2.close()
 
 
-@pytest.mark.xfail(reason="Bug #85: missing dim meta -> dim=None, no error on reopen")
 def test_missing_dim_meta_errors_on_reopen(tmp_path):
     path = str(tmp_path / "db")
     db = turbovecdb.connect(path)

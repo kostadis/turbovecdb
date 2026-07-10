@@ -47,3 +47,11 @@ class EmbedderMismatchError(TurboVecError):
     cannot silently adopt a new embedder. Use ``reembed()`` to set a proper
     identity before adding text documents.
     """
+
+
+class CorruptedMetadataError(TurboVecError):
+    """Raised when collection metadata is missing, unparseable, or semantically invalid.
+
+    For example: a non-numeric ``dim`` value in the meta table. This is always a
+    hard error — silently falling back to a default would produce wrong results.
+    """
