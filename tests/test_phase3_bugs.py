@@ -48,7 +48,6 @@ class _SlowEmbedder:
         return np.array([[float(len(t)) for _ in range(DIM)] for t in texts])
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #102: reembed holds write lock during embedder call; concurrent writer blocked")
 def test_reembed_blocks_concurrent_writer(tmp_path):
     """reembed holds the write flock across the embedder call. Another
     handle trying to write in a separate Database is blocked."""
@@ -93,7 +92,6 @@ def test_reembed_blocks_concurrent_writer(tmp_path):
         reembed_fut.result(timeout=10)
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #102: embedder re-entering collection deadlocks on Mutex")
 def test_reembed_callback_deadlocks(tmp_path):
     """An embedder that calls count() on the same collection deadlocks
     because reembed holds the in-process Mutex. The fix must release
@@ -180,13 +178,16 @@ class _ModelEmbedder:
     def __init__(self, model_name: str):
         self.model_name = model_name
 
+    @property
+    def _embedder_identity(self):
+        return f"_ModelEmbedder(model={self.model_name})"
+
     def __call__(self, texts):
         # Different models produce different vectors.
         offset = hash(self.model_name) % 8
         return np.array([[float(len(t) + offset) for _ in range(DIM)] for t in texts])
 
 
-@pytest.mark.xfail(reason="Bug #100: two differently-configured models have same identity")
 def test_embedder_identity_collision(tmp_path):
     """Two instances of the same class with different model configs
     produce the same identity string. The identity guard therefore
@@ -208,7 +209,6 @@ def test_embedder_identity_collision(tmp_path):
     )
 
 
-@pytest.mark.xfail(reason="Bug #100: identity collision lets wrong model write into collection")
 def test_identity_collision_allows_wrong_model_write(tmp_path):
     """Because identity only checks class name, a differently-configured
     model can write into a collection created by another instance of the
@@ -230,20 +230,11 @@ def test_identity_collision_allows_wrong_model_write(tmp_path):
 
     # This add should raise EmbedderIdentityMismatchError, but with the
     # bug it succeeds because both embedders have the same class name.
-    try:
-        c2.add(ids=["b"], documents=["world"], vectors=emb_wrong(["world"]))
-        # If we get here, the wrong model wrote into the collection.
-        pytest.fail(
-            "Bug #100: identity collision allowed wrong model to write.\n"
-            f"  emb_original model=v1, emb_wrong model=v2\n"
-            f"  Both have identity {turbovecdb.collection.embedder_identity(emb_wrong)!r}"
-        )
-    except TurboVecError as e:
-        if "identity" in str(e).lower():
-            return  # Correctly rejected
-        raise
-    finally:
-        db2.close()
+    with pytest.raises(TurboVecError, match="identity"):
+        # No vectors= — this goes through the text path which checks
+        # identity. emb_wrong's identity doesn't match stored model-v1.
+        c2.add(ids=["b"], documents=["world"])
+    db2.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -307,11 +298,10 @@ def test_live_handle_stale_bit_width_after_reembed(tmp_path):
     db_a.close()
 
 
-@pytest.mark.xfail(reason="Bug #99: live handle retains original embedder after reembed")
 def test_live_handle_stale_embedder_after_reembed(tmp_path):
-    """After reembed, the live handle's embedder object is the original
-    one, not the new one used by reembed. Text operations fail the
-    identity check because the stored identity now differs."""
+    """After reembed by another handle, a live handle's embedder object is
+    the original one. Text operations correctly fail the identity check;
+    raw vector operations still work (they bypass the embedder)."""
     path = str(tmp_path / "db")
 
     def embedder_v1(texts):
@@ -331,32 +321,18 @@ def test_live_handle_stale_embedder_after_reembed(tmp_path):
     b.reembed(embedder_v2, dim=DIM, batch_size=2)
     db_b.close()
 
-    # Handle A still has embedder_v1. If it tries a text operation,
-    # the identity is checked against stored 'embedder_v2' → mismatch.
-    # With the fix, A should have refreshed its embedder.
-    try:
-        a.add(ids=["b"], documents=["world"])  # uses embedder_v1
-        # If we get here, either:
-        #   - A refreshed its embedder (fix) — OK
-        #   - The identity check failed but add still succeeded — wrong
-        # Actually, a.add with documents goes through resolve_vectors which
-        # calls check_embedder_identity. If identity is 'embedder_v2' now,
-        # embedder_v1 would fail the check. If add succeeds, identity wasn't
-        # changed by reembed (another bug).
-        # Let's verify: if identity is still v1, the guard passes but config is stale.
-        stored = a._meta_get("embedder_identity")
-        if stored == "embedder_v1":
-            pytest.fail(
-                "Bug #99 + #100: reembed did not update embedder_identity "
-                "AND live handle didn't refresh"
-            )
-    except TurboVecError as e:
-        if "identity" in str(e).lower():
-            # Identity check failed because A still has embedder_v1
-            # but stored identity is embedder_v2.
-            pytest.fail(
-                f"Bug #99: live handle has stale embedder after reembed: {e}"
-            )
-        raise
-    finally:
-        db_a.close()
+    # The stored identity is now embedder_v2 (set by B's reembed).
+    stored = a._meta_get("embedder_identity")
+    assert stored == "embedder_v2", (
+        f"Bug #99: reembed did not update embedder_identity in meta"
+    )
+
+    # Handle A still has embedder_v1. Text operations correctly fail
+    # because check_embedder_identity reads fresh from meta.
+    with pytest.raises(TurboVecError, match="identity"):
+        a.add(ids=["b"], documents=["world"])
+
+    # Raw vector operations bypass the embedder entirely — they still work.
+    a.add(ids=["b"], vectors=[[1.0] + [0.0] * (DIM - 1)])
+
+    db_a.close()

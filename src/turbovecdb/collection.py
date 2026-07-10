@@ -111,7 +111,14 @@ def embedder_identity(callable_):
     ``__name__``, else ``f"{module}.{qualname}"`` for its class. Used by
     :meth:`Database.collection` to detect a conflicting embedder on an
     already-cached handle (C6) before it ever reaches the Rust core's
-    authoritative GAP-1 guard."""
+    authoritative GAP-1 guard.
+
+    If the callable defines ``_embedder_identity`` (as a string, callable,
+    or ``@property``), that takes precedence — allowing class instances
+    with different configurations to produce unique identities."""
+    custom = getattr(callable_, "_embedder_identity", None)
+    if custom is not None:
+        return custom() if callable(custom) else str(custom)
     name = getattr(callable_, "__name__", None)
     if isinstance(name, str):
         return name

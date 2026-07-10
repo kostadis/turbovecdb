@@ -115,6 +115,23 @@ pub struct Collection<E: Embedder, I: VectorIndex> {
     lock_timeout: f64,
 }
 
+/// Intermediate data from the read phase of a three-phase reembed.
+/// The caller embeds `embed_docs` outside the lock, then passes the
+/// resulting vectors to `finish_reembed()`.
+pub struct ReembedPrep {
+    pub embed_uids: Vec<i64>,
+    pub embed_docs: Vec<String>,
+    pub keep: Vec<(i64, Vec<u8>)>,
+    pub drop_uids: Vec<i64>,
+    pub old_dim: i64,
+    pub old_bit_width: i64,
+    pub total_docs: i64,
+    pub skipped: i64,
+    pub embedder_identity: String,
+    pub explicit_dim: Option<i64>,
+    pub explicit_bit_width: Option<i64>,
+}
+
 impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     pub fn new(
         coll_dir: String,
@@ -1463,23 +1480,17 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         Ok(result)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn reembed(
+    /// Phase 1 of three-phase reembed: validate params, read + classify
+    /// every doc under the in-process lock. Returns the data the caller
+    /// needs to embed outside the lock. No write lock is acquired here.
+    pub fn prepare_reembed(
         &mut self,
-        embedder: E,
+        embedder_identity: &str,
         dim: Option<i64>,
         bit_width: Option<i64>,
-        batch_size: usize,
-        mut on_progress: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>>,
         skip_empty: &str,
-    ) -> Result<ReembedReport, CoreError> {
+    ) -> Result<ReembedPrep, CoreError> {
         self.check_conn_or_reconnect()?;
-        // reembed re-embeds and rewrites every row; hold the cross-process
-        // write lock for its whole duration (mirrors the wrapper's historical
-        // `with self._locked(): self._core.reembed(...)`). The embedder here
-        // runs *under* the lock by design — unlike add/upsert (I5), reembed
-        // is a bulk maintenance op, not a hot write path.
-        let _guard = self.acquire_write_lock()?;
         if !matches!(skip_empty, "error" | "keep" | "drop") {
             return Err(CoreError::InvalidArgument(format!(
                 "skip_empty must be 'error', 'keep', or 'drop', got {skip_empty:?}"
@@ -1497,27 +1508,26 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 )));
             }
         }
-
-        let embedder_identity = embedder.identity();
         let total_docs = self.count()?;
         if total_docs == 0 {
-            return Ok(ReembedReport {
+            return Ok(ReembedPrep {
+                embed_uids: Vec::new(),
+                embed_docs: Vec::new(),
+                keep: Vec::new(),
+                drop_uids: Vec::new(),
+                old_dim: self.dim.unwrap_or(0),
+                old_bit_width: self.bit_width,
                 total_docs: 0,
-                old_dim: self.dim,
-                new_dim: self.dim,
                 skipped: 0,
-                elapsed_seconds: 0.0,
+                embedder_identity: embedder_identity.to_string(),
+                explicit_dim: dim,
+                explicit_bit_width: bit_width,
             });
         }
-
         self.ensure_current()?;
-        let start = std::time::Instant::now();
         let old_dim = self.dim.expect("dim is set when documents exist");
         let old_bit_width = self.bit_width;
 
-        // Phase 1 — classify every doc; nothing is written yet, so any
-        // error here (the 'error' policy, an embedder failure, a dim
-        // mismatch) leaves the collection untouched.
         let mut embed_uids: Vec<i64> = Vec::new();
         let mut embed_docs: Vec<String> = Vec::new();
         let mut keep: Vec<(i64, Vec<u8>)> = Vec::new();
@@ -1551,88 +1561,52 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             }
         }
 
-        // Embed the non-empty docs; new_dim comes from the real embedder
-        // output. Any embedder-call failure collapses to a single
-        // InvalidArgument (matching the historical `emb_call` wrapper,
-        // which always raised a plain ValueError regardless of cause).
-        let mut updates: Vec<(Vec<u8>, i64)> = Vec::new();
-        let mut new_dim: Option<i64> = None;
-        let mut processed = 0i64;
-        let bs = batch_size.max(1);
-        let mut start_i = 0;
-        while start_i < embed_docs.len() {
-            let end = std::cmp::min(start_i + bs, embed_docs.len());
-            let b_docs = &embed_docs[start_i..end];
-            let b_uids = &embed_uids[start_i..end];
-            let out = embedder.embed(b_docs).map_err(|e| {
-                CoreError::InvalidArgument(format!(
-                    "Embedder failed on batch uids [{}..{}]: {}",
-                    b_uids[0],
-                    b_uids[b_uids.len() - 1],
-                    e
-                ))
-            })?;
-            if out.nrows() != b_uids.len() {
-                return Err(CoreError::DimensionMismatch(format!(
-                    "embedder must return one 2-D vector per document; got array of shape {:?} for {} documents",
-                    out.shape(),
-                    b_uids.len()
-                )));
-            }
-            let bdim = out.ncols() as i64;
-            match new_dim {
-                None => new_dim = Some(bdim),
-                Some(nd) if bdim != nd => {
-                    return Err(CoreError::DimensionMismatch(format!(
-                        "embedder returned inconsistent dimensions across batches: {nd} then {bdim}"
-                    )));
-                }
-                _ => {}
-            }
-            for (i, &uid) in b_uids.iter().enumerate() {
-                let bytes = f32_to_blob(out.row(i).iter().copied());
-                updates.push((bytes, uid));
-            }
-            processed += b_docs.len() as i64;
-            if let Some(cb) = on_progress.as_deref_mut() {
-                cb(processed, total_docs)?;
-            }
-            start_i = end;
-        }
+        Ok(ReembedPrep {
+            embed_uids,
+            embed_docs,
+            keep,
+            drop_uids,
+            old_dim,
+            old_bit_width,
+            total_docs,
+            skipped,
+            embedder_identity: embedder_identity.to_string(),
+            explicit_dim: dim,
+            explicit_bit_width: bit_width,
+        })
+    }
 
-        let new_dim_v = new_dim.unwrap_or(old_dim);
-        if let Some(dd) = dim {
-            if new_dim_v != dd {
-                return Err(CoreError::DimensionMismatch(format!(
-                    "Embedder returned vectors of dimension {new_dim_v}, but dim was explicitly set to {dd}"
-                )));
-            }
-        }
-        if !keep.is_empty() && new_dim_v != old_dim {
+    /// Phase 3 of three-phase reembed: validate keep vectors, acquire
+    /// write lock, write new vectors, update meta, rebuild index, commit.
+    pub fn finish_reembed(
+        &mut self,
+        prep: ReembedPrep,
+        mut updates: Vec<(Vec<u8>, i64)>,
+        new_dim: i64,
+        new_bit_width: i64,
+    ) -> Result<ReembedReport, CoreError> {
+        let start = std::time::Instant::now();
+        let old_dim = prep.old_dim;
+        let old_bit_width = prep.old_bit_width;
+
+        // Validate + re-normalize kept vectors.
+        if !prep.keep.is_empty() && new_dim != old_dim {
             return Err(CoreError::DimensionMismatch(format!(
-                "skip_empty='keep' cannot retain {old_dim}-dim vectors in a {new_dim_v}-dim \
+                "skip_empty='keep' cannot retain {old_dim}-dim vectors in a {new_dim}-dim \
                  collection; use skip_empty='drop' or give the empty documents text to embed"
             )));
         }
-        // Retained docs keep their old vector (dims match new_dim here); re-normalize.
-        for (uid, vecb) in &keep {
+        for (uid, vecb) in &prep.keep {
             let v: Vec<f32> = blob_to_f32_checked(vecb, old_dim)?.collect();
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let denom = if norm == 0.0 { 1.0 } else { norm };
             let bytes: Vec<u8> = v.iter().flat_map(|x| (x / denom).to_ne_bytes()).collect();
             updates.push((bytes, *uid));
         }
-        if let Some(cb) = on_progress.as_deref_mut() {
-            if skipped > 0 {
-                cb(processed + skipped, total_docs)?;
-            }
-        }
-        let new_bit_width = bit_width.unwrap_or(old_bit_width);
 
-        // Phase 2 — apply in one transaction; rebuild the index from the
-        // uncommitted rows, commit only if that succeeds, else roll back.
+        let _guard = self.acquire_write_lock()?;
         self.conn.execute_batch("BEGIN")?;
-        for chunk in drop_uids.chunks(900) {
+        for chunk in prep.drop_uids.chunks(900) {
             let qs = vec!["?"; chunk.len()].join(",");
             if let Err(e) = self.conn.execute(
                 &format!("DELETE FROM docs WHERE uid IN ({qs})"),
@@ -1656,9 +1630,9 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 return Err(e.into());
             }
         }
-        self.dim = Some(new_dim_v);
+        self.dim = Some(new_dim);
         self.bit_width = new_bit_width;
-        if let Err(e) = self.set_reembed_meta(new_dim_v, new_bit_width, &embedder_identity) {
+        if let Err(e) = self.set_reembed_meta(new_dim, new_bit_width, &prep.embedder_identity) {
             self.rollback();
             self.dim = Some(old_dim);
             self.bit_width = old_bit_width;
@@ -1685,12 +1659,113 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
 
         let elapsed = start.elapsed().as_secs_f64();
         Ok(ReembedReport {
-            total_docs,
+            total_docs: prep.total_docs,
             old_dim: Some(old_dim),
-            new_dim: Some(new_dim_v),
-            skipped,
+            new_dim: Some(new_dim),
+            skipped: prep.skipped,
             elapsed_seconds: elapsed,
         })
+    }
+
+    /// Convenience wrapper: prepare → embed → finish, holding the write
+    /// lock throughout for backward compat (Rust callers that don't need
+    /// three-phase).
+    pub fn reembed(
+        &mut self,
+        embedder: E,
+        dim: Option<i64>,
+        bit_width: Option<i64>,
+        batch_size: usize,
+        mut on_progress: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>>,
+        skip_empty: &str,
+    ) -> Result<ReembedReport, CoreError> {
+        let id = embedder.identity();
+        let mut prep = self.prepare_reembed(&id, dim, bit_width, skip_empty)?;
+        if prep.total_docs == 0 {
+            return Ok(ReembedReport {
+                total_docs: 0,
+                old_dim: self.dim,
+                new_dim: self.dim,
+                skipped: 0,
+                elapsed_seconds: 0.0,
+            });
+        }
+
+        let mut updates: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut new_dim_v: Option<i64> = None;
+        let mut processed = 0i64;
+        let bs = batch_size.max(1);
+        let mut start_i = 0;
+        while start_i < prep.embed_docs.len() {
+            let end = std::cmp::min(start_i + bs, prep.embed_docs.len());
+            let b_docs = &prep.embed_docs[start_i..end];
+            let b_uids = &prep.embed_uids[start_i..end];
+            let out = embedder.embed(b_docs).map_err(|e| {
+                CoreError::InvalidArgument(format!(
+                    "Embedder failed on batch uids [{}..{}]: {}",
+                    b_uids[0],
+                    b_uids[b_uids.len() - 1],
+                    e
+                ))
+            })?;
+            if out.nrows() != b_uids.len() {
+                return Err(CoreError::DimensionMismatch(format!(
+                    "embedder must return one 2-D vector per document; got array of shape {:?} for {} documents",
+                    out.shape(),
+                    b_uids.len()
+                )));
+            }
+            let bdim = out.ncols() as i64;
+            match new_dim_v {
+                None => new_dim_v = Some(bdim),
+                Some(nd) if bdim != nd => {
+                    return Err(CoreError::DimensionMismatch(format!(
+                        "embedder returned inconsistent dimensions across batches: {nd} then {bdim}"
+                    )));
+                }
+                _ => {}
+            }
+            for (i, &uid) in b_uids.iter().enumerate() {
+                let bytes = f32_to_blob(out.row(i).iter().copied());
+                updates.push((bytes, uid));
+            }
+            processed += b_docs.len() as i64;
+            if let Some(cb) = on_progress.as_deref_mut() {
+                cb(processed, prep.total_docs)?;
+            }
+            start_i = end;
+        }
+
+        let new_dim = new_dim_v.unwrap_or(prep.old_dim);
+        if let Some(dd) = dim {
+            if new_dim != dd {
+                return Err(CoreError::DimensionMismatch(format!(
+                    "Embedder returned vectors of dimension {new_dim}, but dim was explicitly set to {dd}"
+                )));
+            }
+        }
+        if !prep.keep.is_empty() && new_dim != prep.old_dim {
+            return Err(CoreError::DimensionMismatch(format!(
+                "skip_empty='keep' cannot retain {}-dim vectors in a {}-dim \
+                 collection; use skip_empty='drop' or give the empty documents text to embed",
+                prep.old_dim, new_dim
+            )));
+        }
+        for (uid, vecb) in &prep.keep {
+            let v: Vec<f32> = blob_to_f32_checked(vecb, prep.old_dim)?.collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let denom = if norm == 0.0 { 1.0 } else { norm };
+            let bytes: Vec<u8> = v.iter().flat_map(|x| (x / denom).to_ne_bytes()).collect();
+            updates.push((bytes, *uid));
+        }
+        if let Some(cb) = on_progress.as_deref_mut() {
+            if prep.skipped > 0 {
+                cb(processed + prep.skipped, prep.total_docs)?;
+            }
+        }
+        let new_bit_width = bit_width.unwrap_or(prep.old_bit_width);
+
+        self.finish_reembed(prep, updates, new_dim, new_bit_width)
     }
 }
 

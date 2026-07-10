@@ -47,6 +47,17 @@ impl Embedder for PyEmbedder {
     fn identity(&self) -> String {
         Python::with_gil(|py| {
             let b = self.callable.bind(py);
+            // Check for explicit _embedder_identity first — lets
+            // callable instances (e.g. _ModelEmbedder with different
+            // model config) produce unique identities.
+            if let Ok(attr) = b.getattr("_embedder_identity") {
+                if let Ok(s) = attr.call0().and_then(|r| r.extract::<String>()) {
+                    return s;
+                }
+                if let Ok(s) = attr.extract::<String>() {
+                    return s;
+                }
+            }
             if let Ok(name) = b.getattr("__name__") {
                 if let Ok(s) = name.extract::<String>() {
                     return s;

@@ -26,6 +26,7 @@ use numpy::ndarray::Array2;
 use pyo3::prelude::*;
 use std::sync::Mutex;
 use turbovecdb_core::collection::Collection as CoreCollection;
+use turbovecdb_core::embedder::Embedder;
 use turbovecdb_core::error::CoreError;
 use turbovecdb_core::index::TurbovecIndex;
 
@@ -366,38 +367,99 @@ impl Collection {
         }
         let skip_empty = skip_empty.unwrap_or_else(|| "error".to_string());
         let core_embedder = PyEmbedder::new(embedder);
-
-        // I1's forcing function: unlike the old reembed (which held the GIL
-        // throughout because the progress callback captured `py`), the whole
-        // reembed now runs inside allow_threads. The progress callback
-        // re-acquires the GIL itself via `Python::with_gil` on each tick. If
-        // the Python callback raises, we stash the exact PyErr and surface it
-        // (preserving the historical progress-error precedence) rather than
-        // the CoreError it collapses to for the core control flow.
         let inner = &self.inner;
-        let mut progress_err: Option<PyErr> = None;
-        let result: Result<turbovecdb_core::types::ReembedReport, CoreError> = py.allow_threads(|| {
+
+        // Phase 1: prepare under lock — read docs, validate params.
+        let embedder_identity = core_embedder.identity();
+        let prep = py.allow_threads(|| {
             let mut guard = inner.lock().map_err(|_| lock_poisoned())?;
-            let mut progress_cb = |processed: i64, total: i64| -> Result<(), CoreError> {
-                match &on_progress {
-                    Some(cb) => Python::with_gil(|py| match cb.bind(py).call1((processed, total)) {
-                        Ok(_) => Ok(()),
-                        Err(e) => {
-                            let msg = e.to_string();
-                            progress_err = Some(e);
-                            Err(CoreError::Other(msg))
-                        }
-                    }),
-                    None => Ok(()),
+            guard.prepare_reembed(&embedder_identity, dim, bit_width, &skip_empty)
+        }).map_err(|e| convert::core_err_to_py(py, e))?;
+
+        if prep.total_docs == 0 {
+            return convert::reembed_report_to_py(py, turbovecdb_core::types::ReembedReport {
+                total_docs: 0,
+                old_dim: Some(prep.old_dim),
+                new_dim: Some(prep.old_dim),
+                skipped: 0,
+                elapsed_seconds: 0.0,
+            });
+        }
+
+        // Phase 2: embed OUTSIDE the lock (no Mutex, no flock). The
+        // embedder is just a PyO3 callable; the progress callback runs
+        // outside the lock too so it can re-enter the collection safely.
+        let mut progress_err: Option<PyErr> = None;
+        let mut updates: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut new_dim: Option<i64> = None;
+        let mut processed = 0i64;
+        let bs = batch_size.max(1);
+        let total = prep.total_docs;
+        let old_dim = prep.old_dim;
+        let mut start_i = 0;
+        while start_i < prep.embed_docs.len() {
+            let end = std::cmp::min(start_i + bs, prep.embed_docs.len());
+            let batch = &prep.embed_docs[start_i..end];
+            let batch_uids = &prep.embed_uids[start_i..end];
+
+            let out = core_embedder.embed(batch).map_err(|e| {
+                let first = batch_uids[0];
+                let last = batch_uids[batch_uids.len() - 1];
+                let msg = format!("Embedder failed on batch uids [{first}..{last}]: {e}");
+                convert::core_err_to_py(py, CoreError::Other(msg))
+            })?;
+
+            let bdim = out.ncols() as i64;
+            match new_dim {
+                None => new_dim = Some(bdim),
+                Some(nd) if bdim != nd => {
+                    return Err(convert::core_err_to_py(py, CoreError::DimensionMismatch(
+                        format!("embedder returned inconsistent dimensions: {nd} then {bdim}")
+                    )));
                 }
-            };
-            let progress_ref: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>> =
-                Some(&mut progress_cb);
-            guard.reembed(core_embedder, dim, bit_width, batch_size, progress_ref, &skip_empty)
+                _ => {}
+            }
+            for (i, &uid) in batch_uids.iter().enumerate() {
+                let bytes: Vec<u8> = out.row(i).iter()
+                    .flat_map(|x| x.to_ne_bytes())
+                    .collect();
+                updates.push((bytes, uid));
+            }
+            processed += batch.len() as i64;
+            if let Some(ref cb) = on_progress {
+                let result = cb.call1(py, (processed, total));
+                match result {
+                    Ok(_) => {}
+                    Err(e) => {
+                        progress_err = Some(e);
+                        break;
+                    }
+                }
+            }
+            start_i = end;
+        }
+
+        if let Some(err) = progress_err.take() {
+            return Err(err);
+        }
+
+        let new_dim_v = new_dim.unwrap_or(old_dim);
+        if let Some(dd) = dim {
+            if new_dim_v != dd {
+                return Err(convert::core_err_to_py(py, CoreError::DimensionMismatch(
+                    format!("Embedder returned dim {new_dim_v}, but dim was set to {dd}")
+                )));
+            }
+        }
+        let new_bit_width = bit_width.unwrap_or(prep.old_bit_width);
+
+        // Phase 3: re-acquire lock, write vectors, update meta.
+        let result = py.allow_threads(|| {
+            let mut guard = inner.lock().map_err(|_| lock_poisoned())?;
+            guard.finish_reembed(prep, updates, new_dim_v, new_bit_width)
         });
         match result {
             Ok(r) => convert::reembed_report_to_py(py, r),
-            Err(_) if progress_err.is_some() => Err(progress_err.unwrap()),
             Err(e) => Err(convert::core_err_to_py(py, e)),
         }
     }
