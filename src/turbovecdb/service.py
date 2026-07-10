@@ -19,7 +19,7 @@ Endpoints (all POST, JSON in/out; GET /v1/health):
 Run:  python3 -m turbovecdb.service [--host 127.0.0.1] [--port 8077]
 """
 from __future__ import annotations
-import argparse, json, threading
+import argparse, json, threading, time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -253,7 +253,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/v1/health":
+            # Liveness check: just verify the handler is working
             self._send(200, {"ok": True})
+        elif self.path == "/v1/ready":
+            # Readiness check: verify database accessibility
+            self._handle_readiness_check()
         else:
             self._send(404, {"error": {"code": "NOT_FOUND", "message": "not found", "status": 404}})
 
@@ -284,6 +288,44 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a):  # quieter logs
         pass
+
+    def _handle_readiness_check(self):
+        """Perform readiness checks and return appropriate status."""
+        try:
+            # Check 1: Verify we can access the database cache
+            with _databases_lock:
+                db_count = len(_databases)
+            
+            # Check 2: Verify we can access at least one database if any exist
+            # For a basic readiness check, we just check if we can access the cache
+            # For a more thorough check, we could test one database
+            if db_count > 0:
+                # Get the first database and try a lightweight operation
+                db_path = next(iter(_databases.keys()))
+                with _databases_lock:
+                    db = _databases.get(db_path)
+                if db is not None:
+                    # Try to list collections - lightweight operation
+                    collections = db.list_collections()
+                    # If we get here without exception, basic DB access works
+            
+            # All checks passed
+            self._send(200, {
+                "status": "ready",
+                "timestamp": time.time(),
+                "checks": {
+                    "database_cache": "ok",
+                    "database_access": "ok" if db_count > 0 else "no_databases",
+                    "database_count": db_count
+                }
+            })
+        except Exception as e:
+            # Any error means not ready
+            self._send(503, {
+                "status": "not_ready",
+                "error": str(e),
+                "timestamp": time.time()
+            })
 
 
 def main():
