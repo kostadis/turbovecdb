@@ -285,7 +285,6 @@ def _start_service():
     return port, server
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #107: no Content-Length bounds in HTTP service")
 def test_http_oversized_content_length(tmp_path):
     """POST with an oversized Content-Length must be rejected with
     413 Payload Too Large. With the bug, the server blocks trying
@@ -331,7 +330,6 @@ def test_http_oversized_content_length(tmp_path):
     server.shutdown()
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #107: negative Content-Length read")
 def test_http_negative_content_length(tmp_path):
     """POST with a negative Content-Length must be rejected with
     400 Bad Request. With the bug, rfile.read(-1) reads until EOF

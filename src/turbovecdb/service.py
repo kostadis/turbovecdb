@@ -204,6 +204,8 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": {"code": "NOT_FOUND", "message": "not found", "status": 404}})
 
+    MAX_BODY_SIZE = 1_048_576  # 1 MB
+
     def do_POST(self):
         fn = ROUTES.get(self.path)
         if fn is None:
@@ -211,6 +213,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             n = int(self.headers.get("Content-Length", 0))
+            if n < 0:
+                self._send(400, {"error": {"code": "INVALID_CONTENT_LENGTH", "message": "negative Content-Length", "status": 400}})
+                return
+            if n > self.MAX_BODY_SIZE:
+                self._send(413, {"error": {"code": "PAYLOAD_TOO_LARGE", "message": "payload exceeds maximum size", "status": 413}})
+                return
             req = json.loads(self.rfile.read(n) or b"{}")
             self._send(200, fn(req))
         except json.JSONDecodeError as e:
