@@ -21,8 +21,10 @@ Run:  python3 -m turbovecdb.service [--host 127.0.0.1] [--port 8077]
 from __future__ import annotations
 import argparse, json, threading
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future, TimeoutError
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import queue
+import socket
 
 import turbovecdb
 from .errors import (
@@ -46,6 +48,10 @@ from .errors import (
 _locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 _locks_guard = threading.Lock()
 _databases: dict[str, turbovecdb.Database] = {}
+# Track active requests to implement backpressure when queue is full
+# This prevents unbounded queue growth in the underlying ThreadPoolExecutor
+_active_requests: threading.Semaphore = threading.Semaphore(100)  # Default max queued requests
+_active_requests_lock = threading.Lock()
 
 def _lock_for(db_path: str) -> threading.Lock:
     with _locks_guard:
@@ -179,14 +185,28 @@ ROUTES = {
 
 
 class BoundedThreadingHTTPServer(ThreadingHTTPServer):
-    """ThreadingHTTPServer with a bounded thread pool."""
+    """ThreadingHTTPServer with bounded thread pool and bounded work queue."""
 
-    def __init__(self, *args, max_workers=10, **kwargs):
+    def __init__(self, *args, max_workers=10, max_queued_requests=100, **kwargs):
         super().__init__(*args, **kwargs)
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        self._max_queued_requests = max_queued_requests
+        # Semaphore to limit queued requests - blocks when queue is full
+        self._request_semaphore = threading.Semaphore(max_queued_requests)
 
     def process_request(self, request, client_address):
-        self._executor.submit(self.process_request_thread, request, client_address)
+        # Acquire semaphore - blocks if queue is full
+        acquired = self._request_semaphore.acquire(timeout=1.0)  # 1 second timeout
+        if not acquired:
+            # Queue is full, send 503 Service Unavailable
+            self.send_error(503, "Service Unavailable - Request queue full")
+            return
+        try:
+            self._executor.submit(self.process_request_thread, request, client_address)
+        except Exception:
+            # If submit fails for any reason, release the semaphore
+            self._request_semaphore.release()
+            raise
 
 
 class Handler(BaseHTTPRequestHandler):
