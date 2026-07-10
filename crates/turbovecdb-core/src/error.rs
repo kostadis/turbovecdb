@@ -51,6 +51,9 @@ pub enum CoreError {
     /// `reconnect()` before any further I/O. Carries the already-formatted
     /// message so `Display` stays a passthrough.
     ConnectionClosed(String),
+    /// -> `turbovecdb.errors.TurboVecError`. The `.tvim` cache was written
+    /// by a different collection (UID/vector fingerprint mismatch).
+    CorruptedTvim(String),
 }
 
 impl fmt::Display for CoreError {
@@ -65,7 +68,8 @@ impl fmt::Display for CoreError {
             | CoreError::Other(m)
             | CoreError::CollectionNotFound(m)
             | CoreError::LockTimeout(m)
-            | CoreError::ConnectionClosed(m) => write!(f, "{m}"),
+            | CoreError::ConnectionClosed(m)
+            | CoreError::CorruptedTvim(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),
         }

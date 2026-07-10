@@ -8,7 +8,9 @@
 
 use ndarray::Array2;
 use rusqlite::{params, Connection, OptionalExtension};
+use siphasher::sip::SipHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -339,9 +341,29 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 // plausible search, not an error.
                 if idx.dim() as i64 == self.dim.unwrap() && idx.bit_width() as i64 == self.bit_width {
                     if idx.len() as i64 == self.count()? {
-                        self.index = Some(idx);
-                        self.seen_gen = store_gen;
-                        return Ok(());
+                        // Bug #90: verify the UID+vector fingerprint so a
+                        // .tvim from another collection with the same
+                        // shape/count is not silently trusted.  If no
+                        // fingerprint file exists (pre-fix .tvim) we
+                        // accept the cache for backward compatibility.
+                        match self.read_fingerprint() {
+                            None => {}
+                            Some(stored) => {
+                                let expected = Self::compute_collection_fingerprint(&self.conn, &self.tvim_path)?;
+                                if stored != expected {
+                                    log::warn!(
+                                        "tvim fingerprint mismatch for {:?}; \
+                                         rebuilding from SQLite",
+                                        self.tvim_path
+                                    );
+                                    // Fall through to rebuild below.
+                                } else {
+                                    self.index = Some(idx);
+                                    self.seen_gen = store_gen;
+                                    return Ok(());
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -657,6 +679,25 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             )));
         }
 
+        // Pre-flight: for add (replace=false), verify no ids already exist
+        // outside the transaction so a duplicate doesn't leave an open
+        // BEGIN/COMMIT pair (bug #95).
+        if !replace {
+            for i in 0..n {
+                let dup: Option<i64> = self
+                    .conn
+                    .query_row("SELECT uid FROM docs WHERE str_id=?1", params![ids[i]], |r| r.get(0))
+                    .optional()?;
+                if dup.is_some() {
+                    return Err(CoreError::InvalidArgument(format!(
+                        "id {:?} already exists (use upsert)",
+                        ids[i]
+                    )));
+                }
+            }
+        }
+
+        let sg = self.store_gen_val()? + 1;
         self.conn.execute_batch("BEGIN")?;
         let mut batch_uids: Vec<i64> = Vec::with_capacity(n);
         let mut replaced_uids: Vec<i64> = Vec::new();
@@ -664,26 +705,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             let meta_json = metadatas.as_ref().map(|m| m[i].clone()).unwrap_or_else(|| "{}".to_string());
             let bytes = f32_to_blob(vecs.row(i).iter().copied());
 
-            let existing: Option<i64> = match self
+            let existing: Option<i64> = self
                 .conn
                 .query_row("SELECT uid FROM docs WHERE str_id=?1", params![ids[i]], |r| r.get(0))
-                .optional()
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    self.rollback();
-                    return Err(e.into());
-                }
-            };
+                .optional()?;
 
             let uid = if let Some(u) = existing {
-                if !replace {
-                    self.rollback();
-                    return Err(CoreError::InvalidArgument(format!(
-                        "id {:?} already exists (use upsert)",
-                        ids[i]
-                    )));
-                }
                 if let Err(e) = self.conn.execute(
                     "UPDATE docs SET document=?1, metadata=?2, vector=?3 WHERE str_id=?4",
                     params![docs[i], meta_json, bytes, ids[i]],
@@ -707,8 +734,6 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             };
             batch_uids.push(uid);
         }
-
-        let sg = self.store_gen_val()? + 1;
         if self
             .meta_set("next_uid", &self.next_uid.to_string())
             .and_then(|_| self.meta_set("store_gen", &sg.to_string()))
@@ -721,10 +746,10 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         // Mirror the write into the in-memory index, then commit. If either
         // fails, roll back and invalidate the index so the next read rebuilds
         // it from the committed store — never a divergent cache.
+        self.seen_gen = sg;
         let mirrored = self.mirror_write_to_index(&replaced_uids, &batch_uids, &vecs);
         match mirrored.and_then(|_| self.conn.execute_batch("COMMIT").map_err(CoreError::from)) {
             Ok(()) => {
-                self.seen_gen = self.store_gen_val()?;
                 self.dirty = true;
                 Ok(())
             }
@@ -783,6 +808,51 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         Ok(())
     }
 
+    /// Companion file for the `.tvim` UID+vector fingerprint.
+    fn tvim_fingerprint_path(tvim_path: &str) -> String {
+        format!("{tvim_path}.fp")
+    }
+
+    /// Compute a SipHash-2-4 fingerprint that binds the `.tvim` cache
+    /// to this collection's UIDs, vectors, *and* the `.tvim` file itself.
+    /// Including the `.tvim` bytes means a copy of the file from another
+    /// collection produces a different fingerprint even when the
+    /// collections happen to share the same UID set.
+    fn compute_collection_fingerprint(conn: &Connection, tvim_path: &str) -> Result<u64, CoreError> {
+        let mut hasher = SipHasher::new();
+        let mut stmt = conn.prepare("SELECT uid, vector FROM docs ORDER BY uid")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })?;
+        for row in rows {
+            let (uid, vector) = row?;
+            hasher.write(&uid.to_le_bytes());
+            hasher.write(&vector);
+        }
+        // Bind to the specific .tvim file contents.
+        let tvim_data = std::fs::read(tvim_path).map_err(CoreError::from)?;
+        hasher.write(&tvim_data);
+        Ok(hasher.finish())
+    }
+
+    /// Write the fingerprint to the companion `.fp` file.
+    fn write_fingerprint(&self, fp: u64) -> Result<(), CoreError> {
+        let path = Self::tvim_fingerprint_path(&self.tvim_path);
+        std::fs::write(&path, fp.to_le_bytes()).map_err(CoreError::from)
+    }
+
+    /// Read the stored fingerprint, or `None` if absent / unreadable.
+    fn read_fingerprint(&self) -> Option<u64> {
+        let path = Self::tvim_fingerprint_path(&self.tvim_path);
+        let bytes = std::fs::read(&path).ok()?;
+        if bytes.len() != 8 {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes);
+        Some(u64::from_le_bytes(buf))
+    }
+
     /// Lock-free file I/O: write .tmp, fsync, rename, parent-dir fsync.
     /// Does NOT touch SQLite or hold any cross-process lock — other writers
     /// can proceed in parallel. If a concurrent writer bumps store_gen
@@ -798,6 +868,8 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         self.index.as_ref().unwrap().write(&tmp)?;
         std::fs::File::open(&tmp)?.sync_all()?;
         std::fs::rename(&tmp, &self.tvim_path)?;
+        let fp = Self::compute_collection_fingerprint(&self.conn, &self.tvim_path)?;
+        self.write_fingerprint(fp)?;
         if let Some(parent) = std::path::Path::new(&self.tvim_path).parent() {
             if let Ok(dir) = std::fs::File::open(parent) {
                 let _ = dir.sync_all();
@@ -870,12 +942,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         if self.count()? == 0 {
             return Ok(());
         }
+        let sg = self.store_gen_val()? + 1;
         self.conn.execute_batch("BEGIN")?;
         if let Err(e) = self.conn.execute("DELETE FROM docs", []) {
             self.rollback();
             return Err(e.into());
         }
-        let sg = self.store_gen_val()? + 1;
         // Deliberately does NOT reset next_uid: uids are otherwise never
         // reused, and a reader caught in the brief window between this
         // commit and its own next reload (C3) could pair a stale index hit
@@ -884,6 +956,8 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             self.rollback();
             return Err(CoreError::Runtime("clear: meta update failed".to_string()));
         }
+        self.seen_gen = sg;
+        self.index = if self.dim.is_some() { Some(self.make_index()?) } else { None };
         if let Err(e) = self.conn.execute_batch("COMMIT") {
             // A failed COMMIT (e.g. SQLITE_BUSY) leaves the transaction open
             // in SQLite; roll it back explicitly so the next write doesn't
@@ -895,9 +969,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             self.seen_gen = -1;
             return Err(e.into());
         }
-        self.seen_gen = sg;
         self.dirty = true;
-        self.index = if self.dim.is_some() { Some(self.make_index()?) } else { None };
         Ok(())
     }
 
@@ -953,23 +1025,23 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             return Ok(());
         }
 
+        let sg = self.store_gen_val()? + 1;
         self.conn.execute_batch("BEGIN")?;
         let sql = format!("DELETE FROM docs{clause}");
         if let Err(e) = self.conn.execute(&sql, rusqlite::params_from_iter(values.iter())) {
             self.rollback();
             return Err(e.into());
         }
-        let sg = self.store_gen_val()? + 1;
         if self.meta_set("store_gen", &sg.to_string()).is_err() {
             self.rollback();
             return Err(CoreError::Runtime("delete: meta update failed".to_string()));
         }
+        self.seen_gen = sg;
         match self
             .remove_from_index(&del_uids)
             .and_then(|_| self.conn.execute_batch("COMMIT").map_err(CoreError::from))
         {
             Ok(()) => {
-                self.seen_gen = self.store_gen_val()?;
                 self.dirty = true;
                 Ok(())
             }
@@ -996,23 +1068,22 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
         let _guard = self.acquire_write_lock()?;
         self.ensure_current()?;
-        self.conn.execute_batch("BEGIN")?;
+
+        // Pre-flight: verify all ids exist outside the transaction so a
+        // missing id doesn't leave an open BEGIN/COMMIT pair (bug #95).
         for i in 0..ids.len() {
-            let exists: Option<i64> = match self
+            let exists: Option<i64> = self
                 .conn
                 .query_row("SELECT uid FROM docs WHERE str_id=?1", params![ids[i]], |r| r.get(0))
-                .optional()
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    self.rollback();
-                    return Err(e.into());
-                }
-            };
+                .optional()?;
             if exists.is_none() {
-                self.rollback();
                 return Err(CoreError::InvalidArgument(format!("id {:?} not found", ids[i])));
             }
+        }
+
+        let sg = self.store_gen_val()? + 1;
+        self.conn.execute_batch("BEGIN")?;
+        for i in 0..ids.len() {
             if let Err(e) = self.conn.execute(
                 "UPDATE docs SET metadata=?1 WHERE str_id=?2",
                 params![metadatas[i], ids[i]],
@@ -1021,18 +1092,17 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 return Err(e.into());
             }
         }
-        let sg = self.store_gen_val()? + 1;
         if self.meta_set("store_gen", &sg.to_string()).is_err() {
             self.rollback();
             return Err(CoreError::Runtime("update_metadata: meta update failed".to_string()));
         }
+        self.seen_gen = sg; // vectors unchanged → index stays valid
         if let Err(e) = self.conn.execute_batch("COMMIT") {
             self.rollback();
             self.index = None;
             self.seen_gen = -1;
             return Err(e.into());
         }
-        self.seen_gen = sg; // vectors unchanged → index stays valid
         Ok(())
     }
 
@@ -1050,23 +1120,22 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         }
         let _guard = self.acquire_write_lock()?;
         self.ensure_current()?;
-        self.conn.execute_batch("BEGIN")?;
+
+        // Pre-flight: verify all ids exist outside the transaction so a
+        // missing id doesn't leave an open BEGIN/COMMIT pair (bug #95).
         for i in 0..ids.len() {
-            let exists: Option<i64> = match self
+            let exists: Option<i64> = self
                 .conn
                 .query_row("SELECT uid FROM docs WHERE str_id=?1", params![ids[i]], |r| r.get(0))
-                .optional()
-            {
-                Ok(v) => v,
-                Err(e) => {
-                    self.rollback();
-                    return Err(e.into());
-                }
-            };
+                .optional()?;
             if exists.is_none() {
-                self.rollback();
                 return Err(CoreError::InvalidArgument(format!("id {:?} not found", ids[i])));
             }
+        }
+
+        let sg = self.store_gen_val()? + 1;
+        self.conn.execute_batch("BEGIN")?;
+        for i in 0..ids.len() {
             if let Err(e) = self.conn.execute(
                 "UPDATE docs SET document=?1 WHERE str_id=?2",
                 params![documents[i], ids[i]],
@@ -1075,18 +1144,17 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 return Err(e.into());
             }
         }
-        let sg = self.store_gen_val()? + 1;
         if self.meta_set("store_gen", &sg.to_string()).is_err() {
             self.rollback();
             return Err(CoreError::Runtime("update_documents: meta update failed".to_string()));
         }
+        self.seen_gen = sg; // vectors unchanged → index stays valid
         if let Err(e) = self.conn.execute_batch("COMMIT") {
             self.rollback();
             self.index = None;
             self.seen_gen = -1;
             return Err(e.into());
         }
-        self.seen_gen = sg; // vectors unchanged → index stays valid
         Ok(())
     }
 
