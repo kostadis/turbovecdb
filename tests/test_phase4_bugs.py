@@ -176,7 +176,6 @@ def test_stale_handle_query_after_delete(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #93: future schema_version is accepted")
 def test_future_schema_version_rejected(tmp_path):
     """Opening a collection with schema_version > SCHEMA_VERSION must
     fail with an error but currently succeeds."""
@@ -216,7 +215,6 @@ def test_future_schema_version_rejected(tmp_path):
             pass
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #93: future schema_version allows writes")
 def test_future_schema_version_allows_write(tmp_path):
     """Not only does open succeed, but writes also work — making
     silent corruption possible."""
@@ -234,19 +232,17 @@ def test_future_schema_version_allows_write(tmp_path):
     conn.close()
 
     db2 = turbovecdb.connect(path)
-    c2 = db2.collection("c", dim=DIM)
     try:
-        c2.add(ids=["b"], vectors=[[0.0, 1.0] + [0.0] * (DIM - 2)])
+        c2 = db2.collection("c", dim=DIM)
         pytest.fail(
-            "Bug #93: wrote to collection with schema_version=999 "
-            "(future version should prevent any mutation)"
+            "Bug #93: opened collection with schema_version=999 "
+            "(future version should be rejected at open)"
         )
     except TurboVecError as e:
         if "schema" in str(e).lower() or "version" in str(e).lower():
+            db2.close()
             return
         raise
-    finally:
-        db2.close()
 
 
 # ═══════════════════════════════════════════════════════════════════════

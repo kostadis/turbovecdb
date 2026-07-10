@@ -336,7 +336,14 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     fn migrate_schema(&self) -> Result<(), CoreError> {
-        if self.meta_get_i64("schema_version", 0)? >= SCHEMA_VERSION {
+        let stored = self.meta_get_i64("schema_version", 0)?;
+        if stored > SCHEMA_VERSION {
+            return Err(CoreError::Other(format!(
+                "database schema version {stored} is newer than this binary supports \
+                 (max {SCHEMA_VERSION}); upgrade turbovecdb"
+            )));
+        }
+        if stored == SCHEMA_VERSION {
             return Ok(());
         }
         self.meta_set("schema_version", &SCHEMA_VERSION.to_string())
