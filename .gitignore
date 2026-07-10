@@ -19,3 +19,4 @@ venv/
 
 # uv (maturin build tool) lockfile
 uv.lock
+.phase4/
