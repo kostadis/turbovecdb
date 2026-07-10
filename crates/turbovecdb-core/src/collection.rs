@@ -115,6 +115,23 @@ pub struct Collection<E: Embedder, I: VectorIndex> {
     lock_timeout: f64,
 }
 
+/// Intermediate data from the read phase of a three-phase reembed.
+/// The caller embeds `embed_docs` outside the lock, then passes the
+/// resulting vectors to `finish_reembed()`.
+pub struct ReembedPrep {
+    pub embed_uids: Vec<i64>,
+    pub embed_docs: Vec<String>,
+    pub keep: Vec<(i64, Vec<u8>)>,
+    pub drop_uids: Vec<i64>,
+    pub old_dim: i64,
+    pub old_bit_width: i64,
+    pub total_docs: i64,
+    pub skipped: i64,
+    pub embedder_identity: String,
+    pub explicit_dim: Option<i64>,
+    pub explicit_bit_width: Option<i64>,
+}
+
 impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     pub fn new(
         coll_dir: String,
@@ -192,7 +209,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         // Record embedder identity on first creation so later opens with a
         // different embedder are caught by the write-path guard.
         if let Some(emb) = c.embedder.as_ref() {
-            if c.meta_get("embedder_identity")?.is_none() {
+            if c.meta_get("embedder_identity")?.is_none() && c.count()? == 0 {
                 let id = emb.identity();
                 c.meta_set("embedder_identity", &id)?;
             }
@@ -245,8 +262,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     /// Lightweight connection liveness check: runs `SELECT 1` and returns
-    /// `true` if the connection is still alive, `false` otherwise.
+    /// `true` if the connection is still alive and the collection directory
+    /// exists on disk, `false` otherwise.
     pub fn conn_is_alive(&self) -> bool {
+        if !std::path::Path::new(&self.dir).exists() {
+            return false;
+        }
         self.conn.query_row("SELECT 1", [], |_| Ok(())).is_ok()
     }
 
@@ -275,6 +296,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     /// stale connection is recovered transparently.
     fn check_conn_or_reconnect(&mut self) -> Result<(), CoreError> {
         if !self.conn_is_alive() {
+            if !std::path::Path::new(&self.dir).exists() {
+                return Err(CoreError::Other(
+                    "stale handle: collection directory has been deleted".into(),
+                ));
+            }
             log::warn!("connection not alive, attempting reconnect");
             self.reconnect()?;
         }
@@ -310,7 +336,14 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     fn migrate_schema(&self) -> Result<(), CoreError> {
-        if self.meta_get_i64("schema_version", 0)? >= SCHEMA_VERSION {
+        let stored = self.meta_get_i64("schema_version", 0)?;
+        if stored > SCHEMA_VERSION {
+            return Err(CoreError::Other(format!(
+                "database schema version {stored} is newer than this binary supports \
+                 (max {SCHEMA_VERSION}); upgrade turbovecdb"
+            )));
+        }
+        if stored == SCHEMA_VERSION {
             return Ok(());
         }
         self.meta_set("schema_version", &SCHEMA_VERSION.to_string())
@@ -370,8 +403,28 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         Ok(())
     }
 
+    /// Re-read `dim` and `bit_width` from the SQLite meta table so this
+    /// handle sees config changes made by another handle (e.g. after
+    /// reembed). Must be called *before* `reload_index()` so the index
+    /// rebuild uses the current shape.
+    fn refresh_config_from_meta(&mut self) -> Result<(), CoreError> {
+        if let Some(s) = self.meta_get("dim")? {
+            self.dim = Some(s.parse().map_err(|_| {
+                CoreError::Other("unparseable dim in meta".into())
+            })?);
+        }
+        if let Some(s) = self.meta_get("bit_width")? {
+            self.bit_width = s.parse().map_err(|_| {
+                CoreError::Other("unparseable bit_width in meta".into())
+            })?;
+        }
+        Ok(())
+    }
+
     fn ensure_current(&mut self) -> Result<(), CoreError> {
         if self.store_gen_val()? != self.seen_gen {
+            self.refresh_config_from_meta()?;
+            self.seen_gen = self.store_gen_val()?;
             self.reload_index()?;
         }
         Ok(())
@@ -426,13 +479,24 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     /// embedder silently produced garbage rankings on every text query,
     /// with nothing ever erroring.
     pub(crate) fn check_embedder_identity(&self, emb: &E) -> Result<(), CoreError> {
-        if let Some(stored) = self.meta_get("embedder_identity")? {
-            let current = emb.identity();
-            if current != stored {
-                return Err(CoreError::EmbedderIdentityMismatch(format!(
-                    "embedder identity mismatch: stored {stored:?} != current {current:?}; \
-                     use reembed() to change embedders"
-                )));
+        match self.meta_get("embedder_identity")? {
+            Some(stored) => {
+                let current = emb.identity();
+                if current != stored {
+                    return Err(CoreError::EmbedderIdentityMismatch(format!(
+                        "embedder identity mismatch: stored {stored:?} != current {current:?}; \
+                         use reembed() to change embedders"
+                    )));
+                }
+            }
+            None => {
+                let count = self.count()?;
+                if count > 0 {
+                    return Err(CoreError::EmbedderMismatch(format!(
+                        "collection has {count} documents but no embedder identity; \
+                         use reembed() to set a new embedder"
+                    )));
+                }
             }
         }
         Ok(())
@@ -743,12 +807,14 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         &self.dir
     }
 
-    pub fn dim(&self) -> Option<i64> {
-        self.dim
+    pub fn dim(&mut self) -> Result<Option<i64>, CoreError> {
+        self.ensure_current()?;
+        Ok(self.dim)
     }
 
-    pub fn bit_width(&self) -> i64 {
-        self.bit_width
+    pub fn bit_width(&mut self) -> Result<i64, CoreError> {
+        self.ensure_current()?;
+        Ok(self.bit_width)
     }
 
     pub fn tvim_path(&self) -> &str {
@@ -763,6 +829,16 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     pub fn count(&self) -> Result<i64, CoreError> {
+        if !self.conn_is_alive() {
+            if !std::path::Path::new(&self.dir).exists() {
+                return Err(CoreError::Other(
+                    "stale handle: collection directory has been deleted".into(),
+                ));
+            }
+            return Err(CoreError::Other(
+                "stale handle: SQLite connection is dead".into(),
+            ));
+        }
         Ok(self.conn.query_row("SELECT COUNT(*) FROM docs", [], |r| r.get::<_, i64>(0))?)
     }
 
@@ -1430,23 +1506,17 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         Ok(result)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn reembed(
+    /// Phase 1 of three-phase reembed: validate params, read + classify
+    /// every doc under the in-process lock. Returns the data the caller
+    /// needs to embed outside the lock. No write lock is acquired here.
+    pub fn prepare_reembed(
         &mut self,
-        embedder: E,
+        embedder_identity: &str,
         dim: Option<i64>,
         bit_width: Option<i64>,
-        batch_size: usize,
-        mut on_progress: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>>,
         skip_empty: &str,
-    ) -> Result<ReembedReport, CoreError> {
+    ) -> Result<ReembedPrep, CoreError> {
         self.check_conn_or_reconnect()?;
-        // reembed re-embeds and rewrites every row; hold the cross-process
-        // write lock for its whole duration (mirrors the wrapper's historical
-        // `with self._locked(): self._core.reembed(...)`). The embedder here
-        // runs *under* the lock by design — unlike add/upsert (I5), reembed
-        // is a bulk maintenance op, not a hot write path.
-        let _guard = self.acquire_write_lock()?;
         if !matches!(skip_empty, "error" | "keep" | "drop") {
             return Err(CoreError::InvalidArgument(format!(
                 "skip_empty must be 'error', 'keep', or 'drop', got {skip_empty:?}"
@@ -1464,27 +1534,26 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 )));
             }
         }
-
-        let embedder_identity = embedder.identity();
         let total_docs = self.count()?;
         if total_docs == 0 {
-            return Ok(ReembedReport {
+            return Ok(ReembedPrep {
+                embed_uids: Vec::new(),
+                embed_docs: Vec::new(),
+                keep: Vec::new(),
+                drop_uids: Vec::new(),
+                old_dim: self.dim.unwrap_or(0),
+                old_bit_width: self.bit_width,
                 total_docs: 0,
-                old_dim: self.dim,
-                new_dim: self.dim,
                 skipped: 0,
-                elapsed_seconds: 0.0,
+                embedder_identity: embedder_identity.to_string(),
+                explicit_dim: dim,
+                explicit_bit_width: bit_width,
             });
         }
-
         self.ensure_current()?;
-        let start = std::time::Instant::now();
         let old_dim = self.dim.expect("dim is set when documents exist");
         let old_bit_width = self.bit_width;
 
-        // Phase 1 — classify every doc; nothing is written yet, so any
-        // error here (the 'error' policy, an embedder failure, a dim
-        // mismatch) leaves the collection untouched.
         let mut embed_uids: Vec<i64> = Vec::new();
         let mut embed_docs: Vec<String> = Vec::new();
         let mut keep: Vec<(i64, Vec<u8>)> = Vec::new();
@@ -1518,88 +1587,52 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             }
         }
 
-        // Embed the non-empty docs; new_dim comes from the real embedder
-        // output. Any embedder-call failure collapses to a single
-        // InvalidArgument (matching the historical `emb_call` wrapper,
-        // which always raised a plain ValueError regardless of cause).
-        let mut updates: Vec<(Vec<u8>, i64)> = Vec::new();
-        let mut new_dim: Option<i64> = None;
-        let mut processed = 0i64;
-        let bs = batch_size.max(1);
-        let mut start_i = 0;
-        while start_i < embed_docs.len() {
-            let end = std::cmp::min(start_i + bs, embed_docs.len());
-            let b_docs = &embed_docs[start_i..end];
-            let b_uids = &embed_uids[start_i..end];
-            let out = embedder.embed(b_docs).map_err(|e| {
-                CoreError::InvalidArgument(format!(
-                    "Embedder failed on batch uids [{}..{}]: {}",
-                    b_uids[0],
-                    b_uids[b_uids.len() - 1],
-                    e
-                ))
-            })?;
-            if out.nrows() != b_uids.len() {
-                return Err(CoreError::DimensionMismatch(format!(
-                    "embedder must return one 2-D vector per document; got array of shape {:?} for {} documents",
-                    out.shape(),
-                    b_uids.len()
-                )));
-            }
-            let bdim = out.ncols() as i64;
-            match new_dim {
-                None => new_dim = Some(bdim),
-                Some(nd) if bdim != nd => {
-                    return Err(CoreError::DimensionMismatch(format!(
-                        "embedder returned inconsistent dimensions across batches: {nd} then {bdim}"
-                    )));
-                }
-                _ => {}
-            }
-            for (i, &uid) in b_uids.iter().enumerate() {
-                let bytes = f32_to_blob(out.row(i).iter().copied());
-                updates.push((bytes, uid));
-            }
-            processed += b_docs.len() as i64;
-            if let Some(cb) = on_progress.as_deref_mut() {
-                cb(processed, total_docs)?;
-            }
-            start_i = end;
-        }
+        Ok(ReembedPrep {
+            embed_uids,
+            embed_docs,
+            keep,
+            drop_uids,
+            old_dim,
+            old_bit_width,
+            total_docs,
+            skipped,
+            embedder_identity: embedder_identity.to_string(),
+            explicit_dim: dim,
+            explicit_bit_width: bit_width,
+        })
+    }
 
-        let new_dim_v = new_dim.unwrap_or(old_dim);
-        if let Some(dd) = dim {
-            if new_dim_v != dd {
-                return Err(CoreError::DimensionMismatch(format!(
-                    "Embedder returned vectors of dimension {new_dim_v}, but dim was explicitly set to {dd}"
-                )));
-            }
-        }
-        if !keep.is_empty() && new_dim_v != old_dim {
+    /// Phase 3 of three-phase reembed: validate keep vectors, acquire
+    /// write lock, write new vectors, update meta, rebuild index, commit.
+    pub fn finish_reembed(
+        &mut self,
+        prep: ReembedPrep,
+        mut updates: Vec<(Vec<u8>, i64)>,
+        new_dim: i64,
+        new_bit_width: i64,
+    ) -> Result<ReembedReport, CoreError> {
+        let start = std::time::Instant::now();
+        let old_dim = prep.old_dim;
+        let old_bit_width = prep.old_bit_width;
+
+        // Validate + re-normalize kept vectors.
+        if !prep.keep.is_empty() && new_dim != old_dim {
             return Err(CoreError::DimensionMismatch(format!(
-                "skip_empty='keep' cannot retain {old_dim}-dim vectors in a {new_dim_v}-dim \
+                "skip_empty='keep' cannot retain {old_dim}-dim vectors in a {new_dim}-dim \
                  collection; use skip_empty='drop' or give the empty documents text to embed"
             )));
         }
-        // Retained docs keep their old vector (dims match new_dim here); re-normalize.
-        for (uid, vecb) in &keep {
+        for (uid, vecb) in &prep.keep {
             let v: Vec<f32> = blob_to_f32_checked(vecb, old_dim)?.collect();
             let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
             let denom = if norm == 0.0 { 1.0 } else { norm };
             let bytes: Vec<u8> = v.iter().flat_map(|x| (x / denom).to_ne_bytes()).collect();
             updates.push((bytes, *uid));
         }
-        if let Some(cb) = on_progress.as_deref_mut() {
-            if skipped > 0 {
-                cb(processed + skipped, total_docs)?;
-            }
-        }
-        let new_bit_width = bit_width.unwrap_or(old_bit_width);
 
-        // Phase 2 — apply in one transaction; rebuild the index from the
-        // uncommitted rows, commit only if that succeeds, else roll back.
+        let _guard = self.acquire_write_lock()?;
         self.conn.execute_batch("BEGIN")?;
-        for chunk in drop_uids.chunks(900) {
+        for chunk in prep.drop_uids.chunks(900) {
             let qs = vec!["?"; chunk.len()].join(",");
             if let Err(e) = self.conn.execute(
                 &format!("DELETE FROM docs WHERE uid IN ({qs})"),
@@ -1623,9 +1656,9 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 return Err(e.into());
             }
         }
-        self.dim = Some(new_dim_v);
+        self.dim = Some(new_dim);
         self.bit_width = new_bit_width;
-        if let Err(e) = self.set_reembed_meta(new_dim_v, new_bit_width, &embedder_identity) {
+        if let Err(e) = self.set_reembed_meta(new_dim, new_bit_width, &prep.embedder_identity) {
             self.rollback();
             self.dim = Some(old_dim);
             self.bit_width = old_bit_width;
@@ -1652,12 +1685,113 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
 
         let elapsed = start.elapsed().as_secs_f64();
         Ok(ReembedReport {
-            total_docs,
+            total_docs: prep.total_docs,
             old_dim: Some(old_dim),
-            new_dim: Some(new_dim_v),
-            skipped,
+            new_dim: Some(new_dim),
+            skipped: prep.skipped,
             elapsed_seconds: elapsed,
         })
+    }
+
+    /// Convenience wrapper: prepare → embed → finish, holding the write
+    /// lock throughout for backward compat (Rust callers that don't need
+    /// three-phase).
+    pub fn reembed(
+        &mut self,
+        embedder: E,
+        dim: Option<i64>,
+        bit_width: Option<i64>,
+        batch_size: usize,
+        mut on_progress: Option<&mut dyn FnMut(i64, i64) -> Result<(), CoreError>>,
+        skip_empty: &str,
+    ) -> Result<ReembedReport, CoreError> {
+        let id = embedder.identity();
+        let mut prep = self.prepare_reembed(&id, dim, bit_width, skip_empty)?;
+        if prep.total_docs == 0 {
+            return Ok(ReembedReport {
+                total_docs: 0,
+                old_dim: self.dim,
+                new_dim: self.dim,
+                skipped: 0,
+                elapsed_seconds: 0.0,
+            });
+        }
+
+        let mut updates: Vec<(Vec<u8>, i64)> = Vec::new();
+        let mut new_dim_v: Option<i64> = None;
+        let mut processed = 0i64;
+        let bs = batch_size.max(1);
+        let mut start_i = 0;
+        while start_i < prep.embed_docs.len() {
+            let end = std::cmp::min(start_i + bs, prep.embed_docs.len());
+            let b_docs = &prep.embed_docs[start_i..end];
+            let b_uids = &prep.embed_uids[start_i..end];
+            let out = embedder.embed(b_docs).map_err(|e| {
+                CoreError::InvalidArgument(format!(
+                    "Embedder failed on batch uids [{}..{}]: {}",
+                    b_uids[0],
+                    b_uids[b_uids.len() - 1],
+                    e
+                ))
+            })?;
+            if out.nrows() != b_uids.len() {
+                return Err(CoreError::DimensionMismatch(format!(
+                    "embedder must return one 2-D vector per document; got array of shape {:?} for {} documents",
+                    out.shape(),
+                    b_uids.len()
+                )));
+            }
+            let bdim = out.ncols() as i64;
+            match new_dim_v {
+                None => new_dim_v = Some(bdim),
+                Some(nd) if bdim != nd => {
+                    return Err(CoreError::DimensionMismatch(format!(
+                        "embedder returned inconsistent dimensions across batches: {nd} then {bdim}"
+                    )));
+                }
+                _ => {}
+            }
+            for (i, &uid) in b_uids.iter().enumerate() {
+                let bytes = f32_to_blob(out.row(i).iter().copied());
+                updates.push((bytes, uid));
+            }
+            processed += b_docs.len() as i64;
+            if let Some(cb) = on_progress.as_deref_mut() {
+                cb(processed, prep.total_docs)?;
+            }
+            start_i = end;
+        }
+
+        let new_dim = new_dim_v.unwrap_or(prep.old_dim);
+        if let Some(dd) = dim {
+            if new_dim != dd {
+                return Err(CoreError::DimensionMismatch(format!(
+                    "Embedder returned vectors of dimension {new_dim}, but dim was explicitly set to {dd}"
+                )));
+            }
+        }
+        if !prep.keep.is_empty() && new_dim != prep.old_dim {
+            return Err(CoreError::DimensionMismatch(format!(
+                "skip_empty='keep' cannot retain {}-dim vectors in a {}-dim \
+                 collection; use skip_empty='drop' or give the empty documents text to embed",
+                prep.old_dim, new_dim
+            )));
+        }
+        for (uid, vecb) in &prep.keep {
+            let v: Vec<f32> = blob_to_f32_checked(vecb, prep.old_dim)?.collect();
+            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let denom = if norm == 0.0 { 1.0 } else { norm };
+            let bytes: Vec<u8> = v.iter().flat_map(|x| (x / denom).to_ne_bytes()).collect();
+            updates.push((bytes, *uid));
+        }
+        if let Some(cb) = on_progress.as_deref_mut() {
+            if prep.skipped > 0 {
+                cb(processed + prep.skipped, prep.total_docs)?;
+            }
+        }
+        let new_bit_width = bit_width.unwrap_or(prep.old_bit_width);
+
+        self.finish_reembed(prep, updates, new_dim, new_bit_width)
     }
 }
 
@@ -1805,7 +1939,7 @@ mod tests {
         c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]]))).unwrap();
         c.clear().unwrap();
         assert_eq!(c.count().unwrap(), 0);
-        assert_eq!(c.dim(), Some(8));
+        assert_eq!(c.dim().unwrap(), Some(8));
     }
 
     /// Regression for C4: clear() used to reset next_uid to 0. Uids are
@@ -2344,7 +2478,7 @@ mod tests {
         c.reconnect().unwrap();
         assert!(c.conn_is_alive());
         assert_eq!(c.count().unwrap(), 2);
-        assert_eq!(c.dim(), Some(8));
+        assert_eq!(c.dim().unwrap(), Some(8));
     }
 
     #[test]
@@ -2412,6 +2546,73 @@ mod tests {
         let h = c.health().unwrap();
         assert!(h.ok);
         assert_eq!(h.doc_count, 1);
+    }
+
+    /// Deterministic reproduction of bug #91: concurrent flushes can
+    /// cross-stamp so that tvim_gen == store_gen but the .tvim file has
+    /// stale content from a different generation's snapshot.
+    ///
+    /// Race interleaving (both handles call flush() without the lock
+    /// held for file I/O):
+    ///   1. h2.flush_file_io writes gen=N .tvim
+    ///   2. h1.flush_file_io OVERWRITES .tvim with gen=M (M < N)
+    ///   3. h1.meta_set stamps tvim_gen=M  (overwritten by ...)
+    ///   4. h2.meta_set stamps tvim_gen=N  (N == store_gen → coherent!)
+    ///   → .tvim has gen=M content but tvim_gen=N == store_gen → trusted
+    ///   → stale cache; health reports coherent because only
+    ///     store_gen==tvim_gen is checked, not content integrity
+    ///
+    /// This test simulates the end state directly (deterministic).
+    /// With RERANK_FLOOR=50, the re-rank from SQLite hides the bug for
+    /// small datasets — the health_integrity probe is the definitive
+    /// signal.
+    #[test]
+    fn flush_cross_stamp_simulated_health_hides_it() {
+        let dir = temp_dir("cross_stamp_sim");
+        let mut c = new_collection(&dir, Some(8));
+
+        c.add(vec!["a".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.flush().unwrap();
+
+        // Save .tvim from gen=2 (stale handle's snapshot).
+        c.upsert(vec!["a".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.flush().unwrap();
+        let stale_tvim = std::fs::read_to_string(&c.tvim_path).unwrap();
+
+        // Advance to gen=3 with different vector content.
+        c.upsert(vec!["a".into()], None, None, Some(vecs(&[[0., 0., 1., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+        c.flush().unwrap();
+
+        // Pre-race sanity.
+        assert_eq!(
+            c.store_gen_val().unwrap(),
+            c.meta_get_i64("tvim_gen", -1).unwrap(),
+        );
+
+        // CROSS-STAMP: write stale .tvim, then set tvim_gen to match
+        // store_gen so health() thinks everything is coherent.
+        std::fs::write(&c.tvim_path, stale_tvim.as_bytes()).unwrap();
+        let store_gen = c.store_gen_val().unwrap();
+        c.conn
+            .execute(
+                &format!("UPDATE meta SET value = '{store_gen}' WHERE key = 'tvim_gen'"),
+                [],
+            )
+            .unwrap();
+
+        // BUG: health reports coherent even though .tvim content is
+        // from a different generation.
+        let h = c.health().unwrap();
+        assert!(
+            !h.coherent,
+            "Bug #91: cross-stamp hidden from health — tvim_gen==store_gen=={gen} \
+             but .tvim has stale content from gen={stale}",
+            gen = store_gen,
+            stale = store_gen - 1,
+        );
     }
 
     /// Regression for #44: constructor must acquire the cross-process write

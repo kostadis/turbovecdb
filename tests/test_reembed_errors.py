@@ -3,6 +3,7 @@
 import pytest
 
 import turbovecdb
+from turbovecdb import TurboVecError
 
 DIM = 8
 
@@ -24,7 +25,7 @@ def test_reembed_batch_error_includes_uid_range(tmp_path):
         import numpy as np
         return np.array([[float(len(t)) for _ in range(DIM)] for t in texts])
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(TurboVecError) as excinfo:
         col.reembed(failing_embedder, batch_size=2)
     assert "uids [" in str(excinfo.value)
     assert "embedder crashed" in str(excinfo.value)
@@ -41,7 +42,7 @@ def test_reembed_final_batch_error_includes_uid_range(tmp_path):
     import numpy as np
     col.add(ids=["a"], documents=["hello"], vectors=[np.ones(DIM, dtype=np.float32)])
 
-    with pytest.raises(ValueError) as excinfo:
+    with pytest.raises(TurboVecError) as excinfo:
         col.reembed(failing_embedder, batch_size=10)
     assert "uids [" in str(excinfo.value)
     assert "embedder completely dead" in str(excinfo.value)

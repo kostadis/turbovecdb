@@ -51,6 +51,11 @@ pub enum CoreError {
     /// `reconnect()` before any further I/O. Carries the already-formatted
     /// message so `Display` stays a passthrough.
     ConnectionClosed(String),
+    /// -> `turbovecdb.errors.EmbedderMismatchError`. The collection has
+    /// documents but no embedder identity — a legacy/unknown-origin
+    /// collection. A new embedder cannot be silently adopted; use
+    /// `reembed()` to set a proper identity.
+    EmbedderMismatch(String),
 }
 
 impl fmt::Display for CoreError {
@@ -65,7 +70,8 @@ impl fmt::Display for CoreError {
             | CoreError::Other(m)
             | CoreError::CollectionNotFound(m)
             | CoreError::LockTimeout(m)
-            | CoreError::ConnectionClosed(m) => write!(f, "{m}"),
+            | CoreError::ConnectionClosed(m)
+            | CoreError::EmbedderMismatch(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),
         }
@@ -102,6 +108,7 @@ mod tests {
         assert_eq!(CoreError::DimensionMismatch(msg.to_string()).to_string(), msg);
         assert_eq!(CoreError::EmbedderRequired(msg.to_string()).to_string(), msg);
         assert_eq!(CoreError::EmbedderIdentityMismatch(msg.to_string()).to_string(), msg);
+        assert_eq!(CoreError::EmbedderMismatch(msg.to_string()).to_string(), msg);
         assert_eq!(CoreError::UnsupportedFilter(msg.to_string()).to_string(), msg);
         assert_eq!(CoreError::Other(msg.to_string()).to_string(), msg);
     }

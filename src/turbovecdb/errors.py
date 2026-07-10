@@ -38,3 +38,12 @@ class EmbedderIdentityMismatchError(TurboVecError):
     This is the GAP-1 guard in action — it prevents accidental embedder swaps that
     would corrupt the index without the user's explicit awareness.
     """
+
+
+class EmbedderMismatchError(TurboVecError):
+    """Raised when a collection has documents but no embedder identity.
+
+    A legacy or restored collection with data but no stored embedder identity
+    cannot silently adopt a new embedder. Use ``reembed()`` to set a proper
+    identity before adding text documents.
+    """
