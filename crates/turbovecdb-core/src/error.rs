@@ -51,6 +51,12 @@ pub enum CoreError {
     /// `reconnect()` before any further I/O. Carries the already-formatted
     /// message so `Display` stays a passthrough.
     ConnectionClosed(String),
+    /// -> `turbovecdb.errors.CorruptedMetadataError`. Metadata in the meta
+    /// table is missing, unparseable, or semantically invalid (e.g. a non-
+    /// numeric `dim` or a `next_uid` that is not an integer). This is always
+    /// a hard error — silently falling back to a default would produce wrong
+    /// results or silently reuse uids.
+    CorruptedMetadata(String),
 }
 
 impl fmt::Display for CoreError {
@@ -65,7 +71,8 @@ impl fmt::Display for CoreError {
             | CoreError::Other(m)
             | CoreError::CollectionNotFound(m)
             | CoreError::LockTimeout(m)
-            | CoreError::ConnectionClosed(m) => write!(f, "{m}"),
+            | CoreError::ConnectionClosed(m)
+            | CoreError::CorruptedMetadata(m) => write!(f, "{m}"),
             CoreError::Sql(e) => write!(f, "sqlite error: {e}"),
             CoreError::Io(e) => write!(f, "{e}"),
         }

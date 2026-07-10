@@ -68,6 +68,32 @@ fn blob_to_f32_checked(blob: &[u8], dim: i64) -> Result<impl Iterator<Item = f32
     Ok(blob_to_f32(blob))
 }
 
+/// Validate a raw query vector before any compute: wrong shape, NaN/Inf,
+/// or zero-norm vectors must fail fast rather than producing garbage
+/// rankings or panicking in the index search.
+pub fn validate_query_vector(vec: &[f32], dims: u32) -> Result<(), CoreError> {
+    let expected = dims as usize;
+    if vec.len() != expected {
+        return Err(CoreError::DimensionMismatch(format!(
+            "query vector dim {} != collection dim {}",
+            vec.len(),
+            expected
+        )));
+    }
+    if vec.iter().any(|v| v.is_nan() || v.is_infinite()) {
+        return Err(CoreError::InvalidArgument(
+            "query vector contains NaN or Inf".to_string(),
+        ));
+    }
+    let norm: f32 = vec.iter().map(|v| v * v).sum::<f32>().sqrt();
+    if norm < f32::EPSILON {
+        return Err(CoreError::InvalidArgument(
+            "zero-norm query vector".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn f32_to_blob(row: impl Iterator<Item = f32>) -> Vec<u8> {
     row.flat_map(|x| x.to_ne_bytes()).collect()
 }
@@ -180,13 +206,26 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         let metric_val = c.metric.clone();
         c.meta_set("metric", &metric_val)?;
 
-        c.dim = c.meta_get("dim")?.and_then(|s| s.parse::<i64>().ok());
+        c.dim = match c.meta_get("dim")? {
+            None => None,
+            Some(s) => {
+                let parsed: i64 = s.parse().map_err(|_| {
+                    CoreError::CorruptedMetadata(format!("corrupt meta value for \"dim\": {s:?} is not a valid integer"))
+                })?;
+                Some(parsed)
+            }
+        };
         if c.dim.is_none() {
             if let Some(d) = dim {
                 c.commit_dim(d)?;
             }
         }
         c.next_uid = c.meta_get_i64("next_uid", 0)?;
+        if c.dim.is_none() && c.next_uid > 0 {
+            return Err(CoreError::CorruptedMetadata(
+                "collection has data but dim metadata is missing".into(),
+            ));
+        }
         c.migrate_schema()?;
 
         // Record embedder identity on first creation so later opens with a
@@ -1117,6 +1156,9 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             emb.embed(std::slice::from_ref(&t))?
         } else {
             let mut v = vector.unwrap();
+            if let Some(d) = self.dim {
+                validate_query_vector(v.as_slice().unwrap(), d as u32)?;
+            }
             l2_normalize(&mut v);
             v
         };

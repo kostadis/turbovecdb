@@ -38,3 +38,11 @@ class EmbedderIdentityMismatchError(TurboVecError):
     This is the GAP-1 guard in action — it prevents accidental embedder swaps that
     would corrupt the index without the user's explicit awareness.
     """
+
+
+class CorruptedMetadataError(TurboVecError):
+    """Raised when collection metadata is missing, unparseable, or semantically invalid.
+
+    For example: a non-numeric ``dim`` value in the meta table. This is always a
+    hard error — silently falling back to a default would produce wrong results.
+    """
