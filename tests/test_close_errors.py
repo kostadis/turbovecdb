@@ -21,36 +21,45 @@ def test_close_normal(tmp_path):
     db2.close()
 
 
-def test_close_multiple_collections(tmp_path):
-    """Database.close() handles multiple collections."""
+def test_close_multiple_collections_reports_errors(tmp_path):
+    """Database.close() reports errors for multiple failed collections."""
     db = turbovecdb.connect(str(tmp_path / "db"))
     for name in ("a", "b", "c"):
         col = db.collection(name, dim=DIM, create=True)
         col.add(ids=["x"], documents=["doc"], vectors=[[1.0] + [0.0] * (DIM - 1)])
-    db.close()
-    db2 = turbovecdb.connect(str(tmp_path / "db"))
-    assert db2.list_collections() == ["a", "b", "c"]
-    db2.close()
+    
+    # Make all collections fail to close
+    def _boom():
+        raise RuntimeError("boom")
+    for name in ("a", "b", "c"):
+        db._collections[name].close = _boom
+
+    # close() should raise TurboVecError with all three errors
+    with pytest.raises(TurboVecError, match="Failed to close 3 collections"):
+        db.close()
+
+    # All collections should be evicted from cache
+    assert db._collections == {}
 
 
-def test_close_logs_warning_on_error(tmp_path, caplog):
-    """Database.close() logs a warning when a collection close fails."""
+def test_close_reports_error(tmp_path):
+    """Database.close() raises TurboVecError when a collection close fails."""
     db = turbovecdb.connect(str(tmp_path / "db"))
     col = db.collection("c", dim=DIM, create=True)
     col.add(ids=["a"], documents=["hello"], vectors=[[1.0] + [0.0] * (DIM - 1)])
 
-    # Make the collection's close() raise, to trigger the database's warning path
+    # Make the collection's close() raise
     def _boom():
         raise RuntimeError("boom")
     col.close = _boom
 
-    with caplog.at_level(logging.WARNING, logger="turbovecdb.database"):
+    # close() should raise TurboVecError with error details
+    with pytest.raises(TurboVecError, match="Failed to close 1 collection"):
         db.close()
-        assert any("error closing collection" in rec.getMessage() for rec in caplog.records)
 
 
-def test_delete_collection_logs_warning_on_close_error(tmp_path, caplog):
-    """delete_collection logs a warning if the cached handle fails to close."""
+def test_delete_collection_reports_close_error(tmp_path):
+    """delete_collection propagates close errors from the cached handle."""
     db = turbovecdb.connect(str(tmp_path / "db"))
     col = db.collection("c", dim=DIM, create=True)
     col.add(ids=["a"], documents=["hello"], vectors=[[1.0] + [0.0] * (DIM - 1)])
@@ -60,23 +69,25 @@ def test_delete_collection_logs_warning_on_close_error(tmp_path, caplog):
         raise RuntimeError("boom")
     col.close = _boom
 
-    with caplog.at_level(logging.WARNING, logger="turbovecdb.database"):
+    # delete_collection should propagate the close error
+    with pytest.raises(RuntimeError, match="boom"):
         db.delete_collection("c")
-        assert any("error closing collection" in rec.getMessage() for rec in caplog.records)
 
 
-def test_close_continues_after_error(tmp_path):
-    """Database.close() continues closing remaining collections after one fails."""
+def test_close_continues_after_error_and_reports_errors(tmp_path):
+    """Database.close() reports errors and continues closing remaining collections."""
     db = turbovecdb.connect(str(tmp_path / "db"))
     good = db.collection("good", dim=DIM, create=True)
     good.add(ids=["a"], documents=["hello"], vectors=[[1.0] + [0.0] * (DIM - 1)])
-
     bad = db.collection("bad", dim=DIM, create=True)
     bad.add(ids=["b"], documents=["world"], vectors=[[0.0, 1.0] + [0.0] * (DIM - 2)])
     def _boom():
         raise RuntimeError("boom")
     bad.close = _boom  # make this collection fail to close
-
-    # close() should not raise, and both should be evicted from cache
-    db.close()
+    
+    # close() should raise TurboVecError for the failed collection
+    with pytest.raises(TurboVecError, match="Failed to close 1 collection"):
+        db.close()
+    
+    # Both collections should be evicted from cache
     assert db._collections == {}
