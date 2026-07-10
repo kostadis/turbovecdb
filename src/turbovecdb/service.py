@@ -45,9 +45,13 @@ from .errors import (
 # under same-DB write bursts (avoids piling handlers on the core Mutex /
 # flock poll loop), but it is no longer load-bearing for correctness and
 # could be removed if request-level parallelism is preferred.
-_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+# LRU cache for locks and databases to prevent unbounded growth
+from collections import OrderedDict
+_MAX_CACHED_ITEMS = 100  # Configurable limit for both locks and databases
+_locks: OrderedDict[str, threading.Lock] = OrderedDict()
 _locks_guard = threading.Lock()
-_databases: dict[str, turbovecdb.Database] = {}
+_databases: OrderedDict[str, turbovecdb.Database] = OrderedDict()
+_databases_lock = threading.Lock()
 # Track active requests to implement backpressure when queue is full
 # This prevents unbounded queue growth in the underlying ThreadPoolExecutor
 _active_requests: threading.Semaphore = threading.Semaphore(100)  # Default max queued requests
@@ -55,15 +59,34 @@ _active_requests_lock = threading.Lock()
 
 def _lock_for(db_path: str) -> threading.Lock:
     with _locks_guard:
-        return _locks[db_path]
+        if db_path in _locks:
+            # Move to end (most recently used)
+            lock = _locks.pop(db_path)
+            _locks[db_path] = lock
+            return lock
+        else:
+            lock = threading.Lock()
+            _locks[db_path] = lock
+            # Enforce limit
+            if len(_locks) > _MAX_CACHED_ITEMS:
+                _locks.popitem(last=False)  # Remove least recently used
+            return lock
 
 def _get_db(db_path: str) -> turbovecdb.Database:
     """Return a cached Database handle for the given path."""
-    db = _databases.get(db_path)
-    if db is None:
-        db = turbovecdb.connect(db_path)
-        _databases[db_path] = db
-    return db
+    with _databases_lock:
+        if db_path in _databases:
+            # Move to end (most recently used)
+            db = _databases.pop(db_path)
+            _databases[db_path] = db
+            return db
+        else:
+            db = turbovecdb.connect(db_path)
+            _databases[db_path] = db
+            # Enforce limit
+            if len(_databases) > _MAX_CACHED_ITEMS:
+                _databases.popitem(last=False)  # Remove least recently used
+            return db
 
 
 _ERROR_CODES: dict[type, tuple[int, str]] = {
@@ -85,6 +108,16 @@ def _error_payload(e: Exception) -> tuple[int, dict]:
     if "already open with different options" in msg:
         return 400, {"error": {"code": "CONFLICT", "message": str(e), "status": 400}}
     return 500, {"error": {"code": "INTERNAL_ERROR", "message": str(e), "status": 500}}
+
+
+def get_cache_stats() -> dict:
+    """Return statistics about the lock and database caches."""
+    with _locks_guard, _databases_lock:
+        return {
+            "cached_locks": len(_locks),
+            "cached_databases": len(_databases),
+            "max_cached": _MAX_CACHED_ITEMS
+        }
 
 
 def op_upsert(req: dict) -> dict:
