@@ -113,7 +113,7 @@ run_tests() {
 
 remove_xfail() {
   local test_filter=$1
-  python3 - "$test_filter" 2>/dev/null || true <<'PYEOF'
+  python3 - "$test_filter" <<'PYEOF'
 import re, sys
 filter = sys.argv[1] if len(sys.argv) > 1 else ""
 with open("tests/test_phase4_bugs.py", "r") as f:

@@ -262,8 +262,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     /// Lightweight connection liveness check: runs `SELECT 1` and returns
-    /// `true` if the connection is still alive, `false` otherwise.
+    /// `true` if the connection is still alive and the collection directory
+    /// exists on disk, `false` otherwise.
     pub fn conn_is_alive(&self) -> bool {
+        if !std::path::Path::new(&self.dir).exists() {
+            return false;
+        }
         self.conn.query_row("SELECT 1", [], |_| Ok(())).is_ok()
     }
 
@@ -292,6 +296,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     /// stale connection is recovered transparently.
     fn check_conn_or_reconnect(&mut self) -> Result<(), CoreError> {
         if !self.conn_is_alive() {
+            if !std::path::Path::new(&self.dir).exists() {
+                return Err(CoreError::Other(
+                    "stale handle: collection directory has been deleted".into(),
+                ));
+            }
             log::warn!("connection not alive, attempting reconnect");
             self.reconnect()?;
         }
@@ -813,6 +822,16 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
     }
 
     pub fn count(&self) -> Result<i64, CoreError> {
+        if !self.conn_is_alive() {
+            if !std::path::Path::new(&self.dir).exists() {
+                return Err(CoreError::Other(
+                    "stale handle: collection directory has been deleted".into(),
+                ));
+            }
+            return Err(CoreError::Other(
+                "stale handle: SQLite connection is dead".into(),
+            ));
+        }
         Ok(self.conn.query_row("SELECT COUNT(*) FROM docs", [], |r| r.get::<_, i64>(0))?)
     }
 

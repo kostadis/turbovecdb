@@ -106,7 +106,6 @@ def test_relative_path_retargets_after_chdir(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #82: stale handle writes after delete_collection")
 def test_stale_handle_write_after_delete(tmp_path):
     """A handle opened before delete_collection should fail on
     subsequent operations but currently succeeds."""
@@ -141,7 +140,6 @@ def test_stale_handle_write_after_delete(tmp_path):
         db1.close()
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #82: stale handle queries after delete_collection")
 def test_stale_handle_query_after_delete(tmp_path):
     """Querying after delete_collection should fail but currently
     returns stale cached data."""
