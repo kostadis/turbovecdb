@@ -154,7 +154,7 @@ $fl
 
 ## Next steps
 1. Review \`tests/test_phase4_bugs.py\` for expected behaviour
-2. Review \`.phase4/architecture.md\` for fix design
+2. Review \`docs/design/12-phase4-integrity-safety.md\` for fix design
 3. Implement manually
 4. Test: \`python3 -m pytest tests/test_phase4_bugs.py -k "test_$num" -v\`
 5. Remove xfail marker, commit
@@ -220,7 +220,7 @@ process_issue() {
     echo "│"
     for f in $files; do echo "│   $f"; done
     echo "│"
-    echo "│ Spec:  .phase4/architecture.md"
+    echo "│ Spec:  docs/design/12-phase4-integrity-safety.md"
     echo "│ Tests: tests/test_phase4_bugs.py (filter: $test_filter)"
     echo "│"
     echo "│ After implementing, run:"
