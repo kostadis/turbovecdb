@@ -127,6 +127,7 @@ class Database:
                 col.close()
             except Exception as exc:  # noqa: BLE001
                 _log.warning("error closing collection %r during delete: %s", name, exc)
+                raise  # Re-raise the exception so callers know about close failures
 
     def delete_collection(self, name):
         """Delete a collection and all its data.
@@ -166,12 +167,18 @@ class Database:
         return False  # don't suppress exceptions
 
     def close(self):
+        errors = []
         for name, col in list(self._collections.items()):
             try:
                 col.close()
             except Exception as exc:  # noqa: BLE001
                 _log.warning("error closing collection %r: %s", name, exc)
+                errors.append((name, exc))
         self._collections.clear()
+        if errors:
+            # Raise an aggregated error if any collections failed to close
+            error_msgs = [f"{name}: {exc}" for name, exc in errors]
+            raise TurboVecError(f"Failed to close {len(errors)} collection(s): {'; '.join(error_msgs)}")
 
 
 def connect(path):
