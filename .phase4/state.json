@@ -1,0 +1,22 @@
+{
+  "branch": "phase-4",
+  "issues": {
+    "83": {
+      "status": "pass",
+      "attempts": 2,
+      "fail_log": "\u001b[0;36m[p4]\u001b[0m Building Rust...\nerror: test failed, to rerun pass `-p turbovecdb-core --lib`\n\u001b[0;36m[p4]\u001b[0m Installing Python...\n[notice] To update, run: pip3 install --upgrade pip\n\u001b[0;36m[p4]\u001b[0m Testing #83 (filter: test_relative_path_retargets_after_chdir)...\n============================= test session starts ==============================\nplatform darwin -- Python 3.12.13, pytest-9.1.1, pluggy-1.6.0 -- /Users/kostadis.roussos/.venv/bin/python3\ncachedir: .pytest_cache\nhypothesis profile 'default'\nrootdir: /Users/kostadis.roussos/src/public/turbovecdb\nconfigfile: pyproject.toml\nplugins: rerunfailures-16.4, cov-7.1.0, anyio-4.14.1, hypothesis-6.156.2\ncollecting ... collected 7 items / 6 deselected / 1 selected\n\ntests/test_phase4_bugs.py::test_relative_path_retargets_after_chdir FAILED [100%]\n\n=================================== FAILURES ===================================\n___________________ test_relative_path_retargets_after_chdir ___________________\n[XPASS(strict)] Bug #83: relative path retargets after chdir\n=========================== short test summary info ============================\nFAILED tests/test_phase4_bugs.py::test_relative_path_retargets_after_chdir - ...\n======================= 1 failed, 6 deselected in 0.83s ========================"
+    },
+    "82": {
+      "status": "pending",
+      "attempts": 0
+    },
+    "93": {
+      "status": "pending",
+      "attempts": 0
+    },
+    "107": {
+      "status": "pass",
+      "attempts": 1
+    }
+  }
+}

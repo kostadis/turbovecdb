@@ -33,9 +33,9 @@ _UNSET = object()
 
 class Database:
     def __init__(self, path):
-        self._path = path
+        self._path = os.path.abspath(path)
         self._collections = {}
-        self._core = _CoreDatabase(path)
+        self._core = _CoreDatabase(self._path)
 
     @property
     def path(self):

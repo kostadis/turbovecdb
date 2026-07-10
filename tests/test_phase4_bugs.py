@@ -35,7 +35,6 @@ DIM = 8
 # ═══════════════════════════════════════════════════════════════════════
 
 
-@pytest.mark.xfail(strict=True, reason="Bug #83: relative path retargets after chdir")
 def test_relative_path_retargets_after_chdir(tmp_path):
     """Flushing after chdir() writes .tvim to new cwd instead of
     original database directory. The coordination domain splits:

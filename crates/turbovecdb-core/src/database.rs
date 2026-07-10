@@ -81,7 +81,13 @@ pub struct Database {
 
 impl Database {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Database { root: root.into() }
+        let root = root.into();
+        let root = if root.is_relative() {
+            std::env::current_dir().unwrap_or_default().join(&root)
+        } else {
+            root
+        };
+        Database { root }
     }
 
     pub fn root(&self) -> &Path {
@@ -95,10 +101,10 @@ impl Database {
     pub fn collection_dir(&self, name: &str) -> Result<PathBuf, CoreError> {
         validate_name(name)?;
         let dir = self.root.join(name);
-        let cwd = std::env::current_dir().unwrap_or_default();
-        let abs_root = normalize(&cwd, &self.root);
-        let abs_dir = normalize(&cwd, &dir);
-        if !abs_dir.starts_with(&abs_root) {
+        // Root is canonicalized at construction; escape check is belt-and-braces
+        // (name charset already excludes `/` and `..`).
+        let norm_dir = normalize(&self.root, &dir);
+        if !norm_dir.starts_with(&self.root) {
             return Err(CoreError::InvalidArgument(format!(
                 "collection name '{name}' escapes database root"
             )));
