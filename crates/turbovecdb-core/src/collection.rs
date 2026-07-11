@@ -9,6 +9,7 @@
 use ndarray::Array2;
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::embedder::Embedder;
@@ -107,6 +108,13 @@ pub struct Collection<E: Embedder, I: VectorIndex> {
     index: Option<I>,
     seen_gen: i64,
     dirty: bool,
+    /// The inode of `store.sqlite3` at the moment this handle opened its
+    /// connection. The write path re-`stat`s the store under the lock and
+    /// compares against this: if the file is gone (deleted under the handle)
+    /// or a *different* file now sits at the path (deleted-then-recreated),
+    /// the handle is stale and its writes would land in an orphaned inode —
+    /// so we refuse them with `CollectionNotFound` (F2).
+    store_ino: u64,
     /// Cross-process write-lock acquisition timeout (seconds). The core is
     /// now the sole serialization point — in-process (the PyO3 mutex) and
     /// cross-process (this flock) — so this is a real field, not the value
@@ -155,6 +163,11 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         };
 
         let conn = Connection::open(&db_path)?;
+        // Record the store's inode now, while we know the connection points at
+        // this exact file. The write path re-checks it under the lock to catch
+        // a cross-process delete (F2). turbovecdb never rewrites store.sqlite3
+        // in place (WAL appends), so this inode is stable for the handle's life.
+        let store_ino = std::fs::metadata(&db_path)?.ino();
         // Set the busy timeout FIRST — before the WAL-mode switch and DDL
         // below, which briefly need a write lock. The constructor runs
         // outside the cross-process file lock, so concurrent opens must
@@ -178,6 +191,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             index: None,
             seen_gen: -1,
             dirty: false,
+            store_ino,
             lock_timeout,
         };
 
@@ -385,6 +399,38 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         })
     }
 
+    /// Verify the collection this handle points at still exists on disk and is
+    /// the *same* store we opened. Guards against F2: another connection can
+    /// `delete_collection` (rmtree) out from under a live handle, after which
+    /// the handle's still-open SQLite fd points at an unlinked inode — writes
+    /// would commit into that orphaned file and be silently lost. The sibling
+    /// `<name>.lock` survives the rmtree (R1), so `acquire_write_lock` alone
+    /// can't detect this; we re-`stat` the store instead. An inode *mismatch*
+    /// (not just a missing path) also catches delete-then-recreate, where a
+    /// fresh `store.sqlite3` sits at the path but our handle still targets the
+    /// old inode. Must be called under the write lock so it's serialized
+    /// against a concurrent delete.
+    fn ensure_store_present(&self) -> Result<(), CoreError> {
+        let db_path = format!("{}/store.sqlite3", self.dir);
+        match std::fs::metadata(&db_path) {
+            Ok(m) if m.ino() == self.store_ino => Ok(()),
+            _ => Err(CoreError::CollectionNotFound(format!(
+                "collection at {} not found (deleted under an open handle)",
+                self.dir
+            ))),
+        }
+    }
+
+    /// Acquire the write lock and then verify the store is still present and
+    /// unchanged (F2). Every *mutating* op uses this; `flush`/`close` keep the
+    /// plain `acquire_write_lock` (they already surface I/O errors on a missing
+    /// dir and must not change their close-path behavior).
+    fn acquire_write_lock_checked(&self) -> Result<FlockGuard, CoreError> {
+        let guard = self.acquire_write_lock()?;
+        self.ensure_store_present()?;
+        Ok(guard)
+    }
+
     /// Truncate the WAL to bound its growth (best-effort).
     fn wal_checkpoint(&self) {
         let _ = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -537,8 +583,9 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             )));
         }
 
-        // Acquire the cross-process write lock for the store mutation only.
-        let _guard = self.acquire_write_lock()?;
+        // Acquire the cross-process write lock for the store mutation only,
+        // then verify the collection wasn't deleted out from under us (F2).
+        let _guard = self.acquire_write_lock_checked()?;
 
         // Re-check the embedder identity under the lock: a concurrent
         // reembed() elsewhere could have changed the stored identity in the
@@ -792,7 +839,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
 
     /// Remove all documents; keeps configuration.
     pub fn clear(&mut self) -> Result<(), CoreError> {
-        let _guard = self.acquire_write_lock()?;
+        let _guard = self.acquire_write_lock_checked()?;
         self.ensure_current()?;
         if self.count()? == 0 {
             return Ok(());
@@ -834,7 +881,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         where_: Option<&serde_json::Value>,
     ) -> Result<(), CoreError> {
         use rusqlite::types::Value;
-        let _guard = self.acquire_write_lock()?;
+        let _guard = self.acquire_write_lock_checked()?;
         let mut frags: Vec<String> = Vec::new();
         let mut values: Vec<Value> = Vec::new();
         if let Some(idlist) = &ids {
@@ -919,7 +966,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         if ids.is_empty() {
             return Ok(());
         }
-        let _guard = self.acquire_write_lock()?;
+        let _guard = self.acquire_write_lock_checked()?;
         self.ensure_current()?;
         self.conn.execute_batch("BEGIN")?;
         for i in 0..ids.len() {
@@ -972,7 +1019,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         if ids.is_empty() {
             return Ok(());
         }
-        let _guard = self.acquire_write_lock()?;
+        let _guard = self.acquire_write_lock_checked()?;
         self.ensure_current()?;
         self.conn.execute_batch("BEGIN")?;
         for i in 0..ids.len() {
@@ -1248,7 +1295,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         // `with self._locked(): self._core.reembed(...)`). The embedder here
         // runs *under* the lock by design — unlike add/upsert (I5), reembed
         // is a bulk maintenance op, not a hot write path.
-        let _guard = self.acquire_write_lock()?;
+        let _guard = self.acquire_write_lock_checked()?;
         if !matches!(skip_empty, "error" | "keep" | "drop") {
             return Err(CoreError::InvalidArgument(format!(
                 "skip_empty must be 'error', 'keep', or 'drop', got {skip_empty:?}"
@@ -1552,6 +1599,50 @@ mod tests {
         let bad = Array2::from_shape_vec((1, 4), vec![1.0, 0.0, 0.0, 0.0]).unwrap();
         let e = c.add(vec!["b".into()], None, None, Some(bad)).unwrap_err();
         assert!(matches!(e, CoreError::DimensionMismatch(_)));
+    }
+
+    /// F2: a live handle whose collection is deleted (rmtree) by another
+    /// connection must refuse subsequent writes, not silently commit them into
+    /// the now-unlinked SQLite inode. The sibling `<name>.lock` survives the
+    /// rmtree (R1), so `acquire_write_lock` still succeeds; the under-lock
+    /// store re-stat is what catches the deletion.
+    #[test]
+    fn add_after_external_delete_errors_not_silently_lost() {
+        let dir = temp_dir("stale_after_delete");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["before".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+
+        // Simulate another process's delete_collection: remove the collection
+        // dir out from under the open handle (the sibling lock survives).
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let e = c
+            .add(vec!["after".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap_err();
+        assert!(matches!(e, CoreError::CollectionNotFound(_)), "got {e:?}");
+    }
+
+    /// F2, delete-then-recreate variant: after a delete a *fresh* collection is
+    /// created at the same path (a different `store.sqlite3` inode). The stale
+    /// handle still targets the old inode, so its write must be refused even
+    /// though a `store.sqlite3` now exists — this is why the guard compares the
+    /// inode rather than merely checking the path exists.
+    #[test]
+    fn add_after_external_delete_then_recreate_errors_on_inode_mismatch() {
+        let dir = temp_dir("stale_after_recreate");
+        let mut c = new_collection(&dir, Some(8));
+        c.add(vec!["before".into()], None, None, Some(vecs(&[[1., 0., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Recreate a brand-new collection at the same path (new inode).
+        let _fresh = new_collection(&dir, Some(8));
+
+        let e = c
+            .add(vec!["after".into()], None, None, Some(vecs(&[[0., 1., 0., 0., 0., 0., 0., 0.]])))
+            .unwrap_err();
+        assert!(matches!(e, CoreError::CollectionNotFound(_)), "got {e:?}");
     }
 
     /// Regression for R5: blob_to_f32 used chunks_exact(4), which silently
