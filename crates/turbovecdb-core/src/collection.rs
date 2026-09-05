@@ -383,6 +383,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
                 "turbovec requires dim to be a positive multiple of 8, got {dim}"
             )));
         }
+        if dim > crate::index::MAX_DIM as i64 {
+            return Err(CoreError::DimensionMismatch(format!(
+                "turbovec supports dim up to {}, got {dim}",
+                crate::index::MAX_DIM
+            )));
+        }
         self.dim = Some(dim);
         self.meta_set("dim", &dim.to_string())
     }
@@ -415,7 +421,17 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
         let store_gen = self.store_gen_val()?;
         let tvim_gen = self.meta_get_i64("tvim_gen", -1)?;
         if std::path::Path::new(&self.tvim_path).exists() && tvim_gen == store_gen {
-            if let Ok(idx) = I::load(&self.tvim_path) {
+            let loaded = match I::load(&self.tvim_path) {
+                Ok(idx) => Some(idx),
+                Err(e) => {
+                    log::warn!(
+                        "ignoring cached index {:?}: {e}; rebuilding from SQLite",
+                        self.tvim_path
+                    );
+                    None
+                }
+            };
+            if let Some(idx) = loaded {
                 // A tvim_gen match only proves the file wasn't stale at
                 // write time; it says nothing about corruption or a
                 // mismatched shape (e.g. a .tvim from a since-reembedded
@@ -1374,7 +1390,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             };
 
             let (_, cand_uids_u64) =
-                self.index.as_ref().unwrap().search(&qrow, pool, allow_ids.as_deref());
+                self.index.as_ref().unwrap().search(&qrow, pool, allow_ids.as_deref())?;
             let cand_uids: Vec<i64> = cand_uids_u64.iter().map(|&x| x as i64).collect();
 
             // Exact-cosine re-rank of the candidate pool.
@@ -1487,7 +1503,7 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             let mut results = Vec::with_capacity(qs.len());
             for qrow in qs {
                 let (_, cand_uids_u64) =
-                    self.index.as_ref().unwrap().search(&qrow, pool, allow_ref);
+                    self.index.as_ref().unwrap().search(&qrow, pool, allow_ref)?;
                 let cand_uids: Vec<i64> = cand_uids_u64.iter().map(|&x| x as i64).collect();
 
                 let mut map: HashMap<i64, (String, String, String, Vec<u8>)> = HashMap::new();
@@ -1672,6 +1688,12 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             if dd <= 0 || dd % 8 != 0 {
                 return Err(CoreError::DimensionMismatch(format!(
                     "turbovec requires dim to be a positive multiple of 8, got {dd}"
+                )));
+            }
+            if dd > crate::index::MAX_DIM as i64 {
+                return Err(CoreError::DimensionMismatch(format!(
+                    "turbovec supports dim up to {}, got {dd}",
+                    crate::index::MAX_DIM
                 )));
             }
         }

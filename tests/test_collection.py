@@ -164,6 +164,53 @@ def test_rebuilds_when_tvim_missing(tmp_path):
     db2.close()
 
 
+def test_rebuilds_when_tvim_is_legacy_format(tmp_path):
+    """A `.tvim` written by turbovec 0.9 is on-disk format v3, which
+    turbovec 1.0 refuses to decode: v1-v4 predate the v5 rotation change
+    that "altered every encoded byte". Opening such a collection must fall
+    back to rebuilding from the SQLite vectors (the source of truth), not
+    fail. This is the path every collection created before the 1.0 upgrade
+    takes on its first open.
+    """
+    path = str(tmp_path / "db")
+    db = turbovecdb.connect(path)
+    _seed(db.collection("drawers", create=True))
+    db.close()  # flushes a current-format .tvim
+
+    tvim = os.path.join(path, "drawers", "index.tvim")
+    # Stamp a turbovec 0.9 header over it: TVIM magic + version byte 3.
+    # `tvim_gen` in SQLite still matches `store_gen`, so the staleness gate
+    # passes and the load itself is what has to reject this.
+    with open(tvim, "wb") as f:
+        f.write(b"TVIM" + bytes([3]) + b"\x00" * 64)
+
+    db2 = turbovecdb.connect(path)
+    c2 = db2.collection("drawers", create=False)
+    assert c2.count() == 4
+    assert c2.query(vector=VECS["a"], k=2).ids == ["a", "d"]  # rebuilt from SQLite
+    db2.close()
+
+    # The rebuild marks the collection dirty, so close() rewrites the cache
+    # in the current format — the legacy file does not survive. turbovec's
+    # v7 container carries its own magic (b"TV7\0"), not the b"TVIM" of the
+    # v3-era id-map files.
+    with open(tvim, "rb") as f:
+        head = f.read(4)
+    assert head == b"TV7\0", f"legacy v3 cache must have been replaced, got {head!r}"
+
+
+def test_rejects_dim_above_engine_maximum(tmp_path):
+    """turbovec 1.0 lowered MAX_DIM from 65536 to 16384. An oversized dim
+    must surface as a turbovecdb DimensionMismatchError rather than as a
+    raw construct error from inside the engine.
+    """
+    db = turbovecdb.connect(str(tmp_path / "db"))
+    col = db.collection("wide", create=True)
+    with pytest.raises(DimensionMismatchError):
+        col.add(ids=["x"], vectors=[[0.0] * 16392])  # multiple of 8, over the cap
+    db.close()
+
+
 # ── reembed tests ───────────────────────────────────────────────────────────
 
 

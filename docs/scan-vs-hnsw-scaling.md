@@ -15,6 +15,15 @@ out*.
 > `remove`, `search`, `write`. Anything inside the kernel is out of reach from
 > here. Where this document says "upstream", it means `turbovec`.
 
+> **Stale as of 2026-09-05.** turbovecdb has since upgraded to turbovec
+> **1.0**. Every `search.rs` / `id_map.rs` line number below refers to
+> **0.9.0** and no longer resolves; 1.0 also replaced the random orthogonal
+> rotation matrix with a block-Hadamard transform and made
+> `search_with_allowlist` fallible, so the rotation and error-path claims
+> need re-deriving before they are relied on again. The scaling *argument*
+> (single-core `nq=1` scan, full rebuild on write) was not re-checked
+> against 1.0. Treat the citations as historical.
+
 > **Epistemic status.** Three tiers, kept separate deliberately:
 > - **Verified against source** — the code citations below (turbovec 0.9.0,
 >   turbovecdb `main`). Reliable.
