@@ -22,8 +22,8 @@ license = { text = "MIT" }
 authors = [{ name = "Kostadis Rousoss", email = "kostadis@gmail.com" }]
 keywords = ["vector-database", "embeddings", "ann", "turbovec", "quantization"]
 # The turbovec ANN engine is a native Rust dependency of the extension module
-# (statically linked, OpenBLAS included) — the turbovec PyPI wheel is NOT a
-# runtime dependency anymore. Neither is filelock: the cross-process write
+# (statically linked; no BLAS since turbovec 1.0 dropped it) — the turbovec
+# PyPI wheel is NOT a runtime dependency anymore. Neither is filelock: the cross-process write
 # lock now lives in the Rust core (flock), so filelock is a test-only
 # dependency (the suite uses it as the opposing lock holder to prove
 # old-wheel/new-wheel interop — see the dev group below).

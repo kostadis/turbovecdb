@@ -8,6 +8,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **Upgraded the turbovec quantization engine from 0.9 to 1.0.**
+  - *On-disk format:* turbovec 1.0 reads and writes only format v7. A `.tvim`
+    written by 0.9 is v3, which predates the v5 rotation change and cannot be
+    decoded by any current build. Such a cache is now rejected on load and the
+    index is **rebuilt from the SQLite vectors**, which have always been the
+    source of truth — so no data is lost, but the first open of a
+    pre-upgrade collection pays a one-time rebuild and logs why.
+  - *No more BLAS.* turbovec 1.0 drops `faer` and `ndarray`; its
+    block-Hadamard rotation needs no matrix multiply. The `openblas-src`
+    dependency added in #121 is gone, removing the vendored static OpenBLAS
+    compile from a clean build. This also collapses the two `ndarray`
+    majors that used to coexist in the dependency graph.
+  - *Fallible search.* An empty allowlist or an allowlist id absent from the
+    index used to `panic!` out of turbovec 0.9; 1.0 reports them as errors,
+    and the internal `VectorIndex::search` is now fallible to match.
+  - *Dimension ceiling.* turbovec lowered `MAX_DIM` from 65536 to 16384; an
+    oversized dim now raises `DimensionMismatchError` naming the limit.
+  - Requires a Rust toolchain of 1.89 or newer to build.
+
 - **All locking moved from the Python wrapper into the Rust core.**
   `_core.Collection` now owns both the in-process lock (a `Mutex` around the
   core, acquired inside `allow_threads` so a thread never blocks on it while

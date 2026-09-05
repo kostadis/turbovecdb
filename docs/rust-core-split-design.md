@@ -84,6 +84,19 @@ also stayed green with `turbovec` now a real dependency. Cost: ~4 minutes
 added to a clean build (one-time; Cargo caches the compiled OpenBLAS in
 `target/` afterward) — acceptable for both local dev and CI.
 
+**Update (turbovec 1.0, 2026-09-05): this risk is dissolved and the
+resolution has been reverted.** turbovec 1.0 dropped `faer` and `ndarray`
+outright — its rotation is now a block-Hadamard transform, which is
+O(n log n) and needs no matrix multiply, so the crate has no BLAS provider
+requirement at all. Its whole dependency set is `ordered-float`, `rand`,
+`rand_chacha`, `rayon`, `statrs`. The `openblas-src` dependency described
+above has been removed from `turbovecdb-core`, taking the ~4-minute vendored
+OpenBLAS compile out of a clean build. Note `turbovecdb-core` still depends
+on `ndarray` directly (`vecmath.rs`, `embedder.rs`, `collection.rs`) — but
+without the `blas` feature, so nothing links BLAS. Removing turbovec's own
+`ndarray 0.17` also collapses the two `ndarray` majors that used to coexist
+in the graph.
+
 **Scope correction, found while implementing C2:** the original issue
 description assumed `rust/src/lib.rs`'s `new_index`/`build_index`/
 `load_index`/`write_index_atomic` functions were what drove the Python

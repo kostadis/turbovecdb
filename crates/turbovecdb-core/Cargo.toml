@@ -11,10 +11,9 @@ siphasher = "0.3"
 rand = "0.8"
 libc = "0.2"
 ndarray = "0.16"
-openblas-src = { version = "0.10.16", default-features = false, features = ["static", "cblas", "rustls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1.0.150"
-turbovec = "0.9"
+turbovec = "1.0"
 
 [dev-dependencies]
 # "hooks" (commit_hook) and "trace" (Connection::trace) are test-only:

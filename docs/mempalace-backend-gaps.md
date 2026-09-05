@@ -98,13 +98,17 @@ get+merge+upsert, which works but is non-atomic and dirties the index.
 **Requirement (B.9):** MemPalace expects a story for on-disk format evolution
 (ChromaDB needed pre-open BLOB→INTEGER migration etc.).
 
-**turbovecdb status: PARTIAL *(confirm in code)*.** Two sub-cases:
-- **`.tvim` format skew across turbovec versions** — largely DISSOLVED *if*
-  `load_index` failing on an incompatible serialized index falls through to
-  rebuild-from-SQLite rather than raising. **Confirm:** the doc says "load if
-  `tvim_gen == store_gen`, else rebuild" but does not state what happens when
-  `load_index` itself throws on a format-incompatible file. If it propagates, a
-  turbovec upgrade bricks every existing palace — a real gap.
+**turbovecdb status: PARTIAL.** Two sub-cases:
+- **`.tvim` format skew across turbovec versions** — **CLOSED (2026-09-05),
+  and exercised for real by the turbovec 0.9 → 1.0 upgrade.** `Collection::
+  reload_index` treats *any* load failure as a cache miss and falls through
+  to rebuild-from-SQLite; it never propagates. The 1.0 upgrade was exactly
+  the feared event — 1.0 reads only format v7 and refuses the v3 files 0.9
+  wrote — and no palace was bricked, because the SQLite vectors are the
+  source of truth and the rebuild is automatic. The load failure is now
+  logged rather than silently swallowed, so the one-time rebuild is
+  explained instead of looking like a stall. Regression test:
+  `tests/test_collection.py::test_rebuilds_when_tvim_is_legacy_format`.
 - **SQLite schema evolution** (`docs`/`meta` columns) — no migration framework
   is mentioned. v0.1.0 is early; a documented schema-version key in `meta` and a
   migration-on-open hook would match MemPalace's expectation.

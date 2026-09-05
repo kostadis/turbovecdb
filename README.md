@@ -38,13 +38,14 @@ pip install turbovecdb        # pulls numpy, filelock
 ```
 
 Requires Python ≥ 3.9. The vector dimension must be a positive multiple of 8
-(e.g. 384, 768) — a turbovec requirement.
+and at most 16384 (e.g. 384, 768) — a turbovec requirement.
 
-The wheel is self-contained: the turbovec ANN engine and OpenBLAS are compiled
-into the extension module (no `turbovec` PyPI wheel, no system BLAS). Building
-from source instead needs a Rust toolchain (`maturin` drives the build; the
-first compile vendors and statically links OpenBLAS, which takes a few
-minutes once, then is cached).
+The wheel is self-contained: the turbovec ANN engine is compiled into the
+extension module (no `turbovec` PyPI wheel). Since turbovec 1.0 there is no
+BLAS dependency at all — its block-Hadamard rotation needs no matrix
+multiply — so nothing vendors or links OpenBLAS any more. Building from
+source needs a Rust toolchain (1.89 or newer, which turbovec 1.0 requires);
+`maturin` drives the build.
 
 ## Integrate with Mempalace
 
