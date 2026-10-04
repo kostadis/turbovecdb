@@ -2,6 +2,8 @@
 name = "turbovecdb-cli"
 version = "0.1.0"
 edition = "2021"
+# turbovec 1.0 declares rust-version 1.89; fail early with a clear message.
+rust-version = "1.89"
 
 [dependencies]
 turbovecdb-core = { path = "../turbovecdb-core" }

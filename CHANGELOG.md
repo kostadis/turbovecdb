@@ -6,8 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `crates/turbovecdb-core/examples/scan_parallelism.rs`: times single-query
+  search, unfiltered and with a 10% allowlist, plus a full index rebuild, at
+  8k–262k vectors. Run it with and without `RAYON_NUM_THREADS=1` to see how
+  much turbovec 1.0's block-parallel kernel helps. Results are recorded in
+  `docs/partitioned-search-plan.md`.
+
 ### Changed
 
+- All three crates declare `rust-version = "1.89"`, matching turbovec 1.0,
+  so an older toolchain fails with a clear message.
 - **Upgraded the turbovec quantization engine from 0.9 to 1.0.**
   - *On-disk format:* turbovec 1.0 reads and writes only format v7. A `.tvim`
     written by 0.9 is v3, which predates the v5 rotation change and cannot be
