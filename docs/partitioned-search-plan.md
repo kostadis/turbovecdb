@@ -1,7 +1,8 @@
 # Partitioned Search Plan — Routed Per-Wing Shards
 
-Status: **proposed**, 2026-07-24. Spans two repos (`turbovecdb`, `mempalace`)
-plus one optional upstream PR to `turbovec`.
+Status: **proposed**, 2026-07-24. Spans two repos (`turbovecdb`, `mempalace`).
+**Revised 2026-10-04** for turbovec 1.0 (PR #124): the single-core premise is
+re-measured below, and the rotation-matrix work (old Phase 6) is obsolete.
 
 ## Decision
 
@@ -16,16 +17,53 @@ them) is not dead; see [Deferred: slot clustering](#deferred-slot-clustering).
 ## Why
 
 turbovec is a **flat quantized scan**, not a graph: query cost is O(N), not
-log N. Partitioning is the only scaling lever the design has. Two measured facts
-picked routing over clustering:
+log N. Partitioning is the only scaling lever the design has. Two facts
+picked routing over clustering. Fact 2 now carries the decision. Fact 1 was true
+under turbovec 0.9 and is only partly true under 1.0.
 
-1. **A single search uses a single core.** turbovec's rayon parallelism is over
-   *queries* — `(0..nq).into_par_iter()` for the LUT build (search.rs:1550) and
-   `(0..nq).step_by(QBS)` for the scoring kernels (search.rs:1567, 1705, 1811).
-   mempalace queries one text at a time, so `nq = 1`. Sharding plus a threaded
-   fan-out makes one search M-way parallel.
+1. **A single wing-filtered search does not get faster with more cores.**
 
-   Verified reachable: every `turbovecdb.Collection` method releases the GIL via
+   *Under 0.9* (original finding): rayon parallelism was over *queries* only, so
+   mempalace's `nq = 1` searches used one core, however large the index.
+
+   *Under 1.0* this changed. turbovec added a block-parallel single-query
+   kernel, taken when `n_blocks >= SINGLE_QUERY_PARALLEL_MIN_BLOCKS` (1024
+   blocks of 32 = **32,768 vectors**; turbovec search.rs:30, 84, 3938). On
+   x86 it also needs AVX2+FMA. The kernel accepts the allowlist mask and still
+   skips blocks the mask excludes, so filtered queries take it too.
+
+   Measured with `crates/turbovecdb-core/examples/scan_parallelism.rs` (16-thread
+   x86 with AVX2+FMA, dim 384, 4-bit, k 10, median of 200 queries, three runs,
+   representative run shown). "Wing" is an allowlist of 10% of the ids,
+   either contiguous (how `mempalace mine` lays a wing out) or scattered:
+
+   | n | unfiltered, 16 thr | unfiltered, 1 thr | contiguous wing, 16 thr | contiguous wing, 1 thr | scattered wing, 16 thr | scattered wing, 1 thr |
+   |---:|---:|---:|---:|---:|---:|---:|
+   | 16,384 | 386 µs | 361 µs | 113 µs | 112 µs | 412 µs | 378 µs |
+   | 32,768 | 461 µs | 785 µs | 427 µs | 197 µs | 607 µs | 795 µs |
+   | 65,536 | 684 µs | 1,493 µs | 496 µs | 318 µs | 762 µs | 1,602 µs |
+   | 131,072 | 1,027 µs | 3,225 µs | 746 µs | 663 µs | 1,134 µs | 3,664 µs |
+   | 262,144 | 1,984 µs | 5,720 µs | 1,196 µs | 935 µs | 2,809 µs | 6,712 µs |
+
+   What this says:
+   - **Unfiltered (unscoped) search is now parallel inside turbovec:** about
+     2–3.5× faster on 16 threads past 32k vectors. That is far below 16×, but
+     it means threaded fan-out across shards is no longer the only way to use
+     multiple cores for an unscoped query.
+   - **A contiguous-wing search is not helped, and is often hurt.** The
+     parallel kernel is *slower* than one thread from 32k up (2.2× at 32k), and
+     the gap narrows but never closes by 262k. Block skipping already makes
+     the serial scan cheap; splitting it into ranges adds overhead that only a
+     few ranges' worth of real work has to pay for. This was consistent across
+     all three runs. It may be worth an upstream issue.
+   - **A shard still wins for routed queries.** A wing shard of 0.1·N is an
+     unfiltered scan of 0.1·N: at N = 262k that is ~26k vectors, about
+     370–400 µs. The same wing as a filter in one big collection costs
+     935–1,196 µs. So routing is roughly 2.5–3× faster per query, not the
+     order of magnitude the 0.9 analysis implied.
+
+   Still true, and still what makes Phase 4's fan-out real: every
+   `turbovecdb.Collection` method releases the GIL via
    `py.allow_threads` and takes a **per-collection** `Mutex`
    (crates/turbovecdb-py/src/collection.rs:10-21, 90-171). Distinct shards are
    distinct objects with distinct mutexes, so a `ThreadPoolExecutor` fan-out gets
@@ -39,8 +77,14 @@ picked routing over clustering:
    `mempalace mine` writes wing by wing — this is the steady state. Sharding
    confines it to the written wing.
 
+   turbovec 1.0 does not change this; the rebuild is turbovecdb's, not the
+   engine's. Measured with the same example, the in-memory part alone
+   (`new` + `add_with_ids`, no SQLite read) costs ~380 ms at 262k vectors on
+   16 threads and ~770 ms on one. Every reader pays that after every write.
+   A 10% wing shard pays a tenth of it.
+
 Clustering also maintains a *decaying* invariant: `IdMapIndex::remove` is a
-**swap-remove** (id_map.rs:161) that moves the last slot into the hole, and
+**swap-remove** (turbovec 1.0 id_map.rs:520; was id_map.rs:161 in 0.9) that moves the last slot into the hole, and
 turbovecdb calls it on every delete and upsert-replace
 (`mirror_write_to_index`, collection.rs:610). One delete teleports a tail
 document into an arbitrary block, and nothing surfaces when the layout drifts.
@@ -53,7 +97,6 @@ Shards cannot decay.
 | Public single-collection handle eviction | `turbovecdb` | low |
 | Router + virtual sharded collection | `mempalace` (`backends/turbovec.py`) | medium — correctness surface |
 | Migration script | `mempalace` | low, reversible |
-| Per-dim rotation-matrix cache | upstream `turbovec` | optional, not blocking |
 | Intra-collection striping | `turbovecdb` | optional — *alternative* to Phase 4 threading |
 
 The mempalace side is confined to `mempalace/backends/turbovec.py`. No call site
@@ -85,7 +128,7 @@ queries carry a wing.
 
 `Database._collections` is an **unbounded dict** (database.py:37, 57-87) with no
 cap and no LRU. Sharding multiplies handles, each holding a SQLite connection, a
-resident `.tvim`, a rotation matrix (dim² f32), and a blocked-codes cache — so
+resident `.tvim` and a blocked-codes cache — so
 the cache needs a ceiling.
 
 `_evict_and_close(name)` (database.py:119) is already exactly the primitive: pop
@@ -151,7 +194,7 @@ baseline for Phase 4.
 - `query` — every shard, `n_results` each (not divided), concat, sort by
   distance, truncate. Merging is **exact**, not approximate: turbovecdb re-ranks
   with true cosine from stored float32, so distances are comparable across
-  shards. Raw quantized scores would not be (per-shard rotation and codebook).
+  shards. Raw quantized scores would not be (per-shard TQ+ calibration).
 - `add`/`upsert` — group the batch by `metadatas[i]["wing"]`, one call per shard.
   No wing → `__unwinged__`.
 - `delete(ids=...)` — fan out. Safe: it compiles to
@@ -176,11 +219,17 @@ ids and distances. Then the mempalace suite green with the sharded backend.
 - LRU over shard handles using Phase 1's `close_collection`, plus lazy open.
 - `__small__` folding at the Phase 0 threshold. A 12-drawer wing returns 12
   candidates (`effective_k = k.min(n_vectors).min(n_allowed)`) while paying a
-  full rotation matrix, SQLite file, lock, and block padding.
+  SQLite file, lock, and block padding.
+- **Do not nest parallelism.** Under turbovec 1.0, any shard of 32k+ vectors
+  already scans across the whole rayon pool for an unscoped query. A Python
+  thread pool over M such shards nests two levels of fan-out and
+  oversubscribes. Either cap the fan-out pool small or set
+  `RAYON_NUM_THREADS` per process, and measure both against the Phase 0
+  baseline.
 
 **Watch for the LRU cliff.** An unscoped search touches every shard, so nothing
 is evictable. If M exceeds the cap it does not degrade — it *thrashes*: evict,
-reload `.tvim`, re-QR, re-repack, per query. Assert `M <= cap` at open and fail
+reload `.tvim`, re-repack, per query. Assert `M <= cap` at open and fail
 loudly, or fold aggressively enough that it cannot happen.
 
 **Exit:** a routed query touches exactly one shard (assert via open-handle
@@ -207,27 +256,14 @@ the hierarchical prune reads to *produce* the wing list — which makes
 
 **Exit:** migrated palace matches or beats unsharded top-10 on the query corpus.
 
-## Phase 6 — optional, parallel: upstream rotation-matrix cache
+## Phase 6 — obsolete: upstream rotation-matrix cache
 
-`make_rotation_matrix(dim)` (turbovec rotation.rs:15) is a dim×dim Gaussian plus
-a QR, materializing dim² f32 — 590KB at 384-d, 2.36MB at 768-d, resident per
-index. The seed is fixed (`ROTATION_SEED`, ChaCha8), so **every shard computes a
-bit-identical matrix**: M redundant QRs on cold start and M copies in RAM.
-
-**Not reachable from turbovecdb.** `rotation` is a private `OnceLock`
-(turbovec lib.rs:146) and `from_parts` is `pub(crate)` (lib.rs:573). Options:
-
-1. PR to `RyanCodrai/turbovec` — a process-global per-dim cache. Strictly less
-   work, bit-identical results, benefits any multi-index user. Cleanest.
-2. Vendor turbovec via `[patch.crates-io]`. Feasible (the build already
-   statically links OpenBLAS) but adds maintenance.
-3. Do nothing. **Defensible for v1:** a routed query touches one shard and pays
-   one QR, exactly as today. Only unscoped fan-out pays M, and the first
-   unscoped query after a restart is already behind `_lazy_embedder()`'s model
-   load, which costs more.
-
-Start at (3), open (1) as a follow-up. This is explicitly **not** on the critical
-path.
+Dropped 2026-10-04. Under turbovec 0.9 every index built a dim×dim QR rotation
+matrix from a fixed seed, so M shards computed and held M identical copies, and
+this phase proposed caching it upstream. turbovec 1.0 replaced that rotation
+with a block-Hadamard transform: per-round sign flips and permutations, O(dim)
+state, no matrix and no QR (turbovec rotation.rs:103). There is nothing left
+worth caching.
 
 ---
 
@@ -236,6 +272,13 @@ path.
 **An alternative to Phase 4's Python thread pool, not an addition to it.** Both
 exist to make one query use many cores; running both nests two levels of fan-out
 and oversubscribes. Pick one.
+
+> **Mostly superseded by turbovec 1.0 (2026-10-04).** turbovec now
+> block-parallelizes a single unfiltered query by itself once an index reaches
+> 32k vectors (see [Why](#why), fact 1). That is the win striping was meant to
+> buy, delivered with no `.tvim` layout change. Striping would only add
+> something below 32k vectors, where the scan is already a few hundred
+> microseconds. Kept for the record; do not start it without new measurements.
 
 `Collection` holds a single `index: Option<I>` (`I: VectorIndex`). Striping holds
 **S** of them, splits the corpus across them, and fans out with rayon *inside

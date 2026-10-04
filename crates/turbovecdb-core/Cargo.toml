@@ -2,6 +2,8 @@
 name = "turbovecdb-core"
 version = "0.1.0"
 edition = "2021"
+# turbovec 1.0 declares rust-version 1.89; fail early with a clear message.
+rust-version = "1.89"
 description = "Pure Rust engine for turbovecdb (no PyO3/Python dependency)"
 license = "MIT"
 
@@ -23,3 +25,5 @@ turbovec = "1.0"
 # commit exactly between query()'s allowlist and re-rank SELECTs (C3
 # regression test).
 rusqlite = { version = "0.32", features = ["bundled", "hooks", "trace"] }
+# Only for examples/scan_parallelism.rs, to report the pool size turbovec uses.
+rayon = "1"

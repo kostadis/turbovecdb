@@ -20,9 +20,17 @@ out*.
 > **0.9.0** and no longer resolves; 1.0 also replaced the random orthogonal
 > rotation matrix with a block-Hadamard transform and made
 > `search_with_allowlist` fallible, so the rotation and error-path claims
-> need re-deriving before they are relied on again. The scaling *argument*
-> (single-core `nq=1` scan, full rebuild on write) was not re-checked
-> against 1.0. Treat the citations as historical.
+> need re-deriving before they are relied on again. Treat the citations as
+> historical.
+>
+> **Re-measured 2026-10-04** (see
+> [partitioned-search-plan.md](partitioned-search-plan.md#why), fact 1). The
+> single-core `nq=1` premise **no longer holds for unfiltered scans**: 1.0
+> block-parallelizes one query once an index reaches 32,768 vectors, and the
+> measured gain is about 2–3.5× on 16 threads. Wing-filtered scans with a
+> contiguous allowlist gain nothing and are often slower in parallel. The
+> full-rebuild-on-write argument is turbovecdb's own and still holds. Read
+> the "one core" reasoning below with that in mind.
 
 > **Epistemic status.** Three tiers, kept separate deliberately:
 > - **Verified against source** — the code citations below (turbovec 0.9.0,

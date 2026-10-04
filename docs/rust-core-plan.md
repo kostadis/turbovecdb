@@ -59,11 +59,12 @@ Rust deps added along the way: `rusqlite` (bundled SQLite), `numpy`/`ndarray`, a
 `turbovec` ships as a PyO3 Python extension, **and** (contrary to what was
 assumed here) is also published independently as a pure Rust crate on
 crates.io with no PyO3/numpy dependency. The Rust core depends on it
-directly (`turbovec = "0.9"` in `crates/turbovecdb-core/Cargo.toml`) rather
-than calling back through PyO3 — see `docs/rust-core-split-design.md`'s
-"The `turbovec` crate is real and pure" section for how this was confirmed
-and the BLAS-build-dependency risk it surfaced (resolved via a vendored
-static OpenBLAS build).
+directly (`turbovec = "1.0"` in `crates/turbovecdb-core/Cargo.toml`; it was
+`0.9` until PR #124) rather than calling back through PyO3 — see
+`docs/rust-core-split-design.md`'s "The `turbovec` crate is real and pure"
+section for how this was confirmed and the BLAS-build-dependency risk it
+surfaced. That risk was first handled with a vendored static OpenBLAS build,
+then disappeared with turbovec 1.0, which needs no BLAS at all.
 
 ## Update (post-slice-2): slices 3–8 build one Rust `Collection`/`Database` class
 

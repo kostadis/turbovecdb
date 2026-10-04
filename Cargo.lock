@@ -682,6 +682,7 @@ dependencies = [
  "log",
  "ndarray",
  "rand",
+ "rayon",
  "rusqlite",
  "serde_json",
  "siphasher",
