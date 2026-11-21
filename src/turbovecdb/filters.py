@@ -7,8 +7,10 @@ signatures and re-raises the core's ``FilterError`` as the public
 unchanged.
 
 Metadata is stored as a JSON column, so field predicates compile to
-``json_extract(metadata, '$.field')`` comparisons. The JSON *path* is bound as a
-SQL parameter (not interpolated) and every operand is a bound parameter too, so
+``json_extract(metadata, '$.field')`` comparisons. A field name that is a plain
+identifier (``[A-Za-z_][A-Za-z0-9_]*``) is inlined as a literal path, so the
+expression can match an expression index (``docs_source_file``); any other field
+name is bound as a SQL parameter. Every operand is a bound parameter, so
 arbitrary field names and values can't inject SQL.
 
 Supported operator set (compatible with the Chroma / Mongo subset MemPalace
