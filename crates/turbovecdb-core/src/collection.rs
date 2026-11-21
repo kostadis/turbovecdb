@@ -212,7 +212,8 @@ impl<E: Embedder, I: VectorIndex> Collection<E, I> {
             "PRAGMA journal_mode=WAL; \
              PRAGMA wal_autocheckpoint=100; \
              CREATE TABLE IF NOT EXISTS docs (uid INTEGER PRIMARY KEY, str_id TEXT UNIQUE NOT NULL, document TEXT, metadata TEXT, vector BLOB); \
-             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);",
+             CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT); \
+             CREATE INDEX IF NOT EXISTS docs_source_file ON docs(json_extract(metadata, '$.source_file'));",
         )?;
 
         let embedder: Option<Arc<E>> = embedder.map(Arc::new);
@@ -2093,6 +2094,29 @@ mod tests {
         let filter = serde_json::json!({"k": 1});
         c.delete(None, Some(&filter)).unwrap();
         assert_eq!(c.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn source_file_filter_uses_index() {
+        // Per-file re-mine filters by source_file several times per file; a
+        // full scan makes a large mine quadratic. The compiled filter must
+        // match the expression index exactly.
+        let dir = temp_dir("srcidx");
+        let c = new_collection(&dir, Some(8));
+        let filter = serde_json::json!({"source_file": "/x/a.md"});
+        let (wsql, params) = filters::compile_where(&filter, 0).unwrap();
+        let sql = format!("EXPLAIN QUERY PLAN SELECT uid FROM docs WHERE {wsql}");
+        let vals: Vec<rusqlite::types::Value> = params.iter().map(json_to_sql_value).collect();
+        let mut stmt = c.conn.prepare(&sql).unwrap();
+        let plan: Vec<String> = stmt
+            .query_map(rusqlite::params_from_iter(vals.iter()), |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            plan.iter().any(|d| d.contains("USING INDEX docs_source_file")),
+            "plan: {plan:?}"
+        );
     }
 
     #[test]
