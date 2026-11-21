@@ -60,6 +60,16 @@ fn like_escape(s: &str) -> String {
 /// first, then operands) onto `params` and returns the SQL fragment.
 fn field_clause(field: &str, value: &Value, params: &mut Vec<Value>) -> Result<String, FilterError> {
     let path = format!("$.{}", field);
+    // A plain identifier is inlined as a SQL literal so the expression matches
+    // an expression index such as `docs_source_file` byte for byte (SQLite does
+    // not match an index on `json_extract(metadata, '$.x')` against a bound
+    // `json_extract(metadata, ?)`). Anything else stays a bound parameter.
+    let inline = is_plain_identifier(field);
+    let lhs = if inline {
+        format!("json_extract(metadata, '{}')", path)
+    } else {
+        "json_extract(metadata, ?)".to_string()
+    };
 
     if let Some(obj) = value.as_object() {
         if obj.len() != 1 {
@@ -85,20 +95,21 @@ fn field_clause(field: &str, value: &Value, params: &mut Vec<Value>) -> Result<S
             }
             let placeholders = vec!["?"; items.len()].join(",");
             let negate = if op == "$nin" { "NOT " } else { "" };
-            params.push(Value::String(path));
+            if !inline {
+                params.push(Value::String(path));
+            }
             for item in items {
                 params.push(item.clone());
             }
-            return Ok(format!(
-                "json_extract(metadata, ?) {}IN ({})",
-                negate, placeholders
-            ));
+            return Ok(format!("{} {}IN ({})", lhs, negate, placeholders));
         }
 
         if let Some(sym) = cmp_symbol(op) {
-            params.push(Value::String(path));
+            if !inline {
+                params.push(Value::String(path));
+            }
             params.push(operand.clone());
-            return Ok(format!("json_extract(metadata, ?) {} ?", sym));
+            return Ok(format!("{} {} ?", lhs, sym));
         }
 
         return Err(err(format!(
@@ -108,9 +119,22 @@ fn field_clause(field: &str, value: &Value, params: &mut Vec<Value>) -> Result<S
     }
 
     // Bare scalar → equality.
-    params.push(Value::String(path));
+    if !inline {
+        params.push(Value::String(path));
+    }
     params.push(value.clone());
-    Ok("json_extract(metadata, ?) = ?".to_string())
+    Ok(format!("{} = ?", lhs))
+}
+
+/// True for `[A-Za-z_][A-Za-z0-9_]*`: safe to inline inside a single-quoted
+/// SQL literal and a valid JSON path member without quoting.
+pub(crate) fn is_plain_identifier(field: &str) -> bool {
+    let mut chars = field.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Core recursive compiler for a `where` mapping.
@@ -202,27 +226,27 @@ mod tests {
     #[test]
     fn bare_scalar_is_equality() {
         let (sql, params) = compile_where(&json!({"lang": "en"}), 0).unwrap();
-        assert_eq!(sql, "json_extract(metadata, ?) = ?");
-        assert_eq!(params, vec![json!("$.lang"), json!("en")]);
+        assert_eq!(sql, "json_extract(metadata, '$.lang') = ?");
+        assert_eq!(params, vec![json!("en")]);
     }
 
     #[test]
     fn comparison_operators() {
         for (op, sym) in [("$eq", "="), ("$ne", "!="), ("$gt", ">"), ("$gte", ">="), ("$lt", "<"), ("$lte", "<=")] {
             let (sql, params) = compile_where(&json!({"year": {op: 2020}}), 0).unwrap();
-            assert_eq!(sql, format!("json_extract(metadata, ?) {sym} ?"));
-            assert_eq!(params, vec![json!("$.year"), json!(2020)]);
+            assert_eq!(sql, format!("json_extract(metadata, '$.year') {sym} ?"));
+            assert_eq!(params, vec![json!(2020)]);
         }
     }
 
     #[test]
     fn in_and_nin() {
         let (sql, params) = compile_where(&json!({"lang": {"$in": ["fr", "la"]}}), 0).unwrap();
-        assert_eq!(sql, "json_extract(metadata, ?) IN (?,?)");
-        assert_eq!(params, vec![json!("$.lang"), json!("fr"), json!("la")]);
+        assert_eq!(sql, "json_extract(metadata, '$.lang') IN (?,?)");
+        assert_eq!(params, vec![json!("fr"), json!("la")]);
 
         let (sql, _) = compile_where(&json!({"lang": {"$nin": ["fr"]}}), 0).unwrap();
-        assert_eq!(sql, "json_extract(metadata, ?) NOT IN (?)");
+        assert_eq!(sql, "json_extract(metadata, '$.lang') NOT IN (?)");
     }
 
     #[test]
@@ -237,9 +261,9 @@ mod tests {
             compile_where(&json!({"$and": [{"lang": "en"}, {"year": {"$gte": 2020}}]}), 0).unwrap();
         assert_eq!(
             sql,
-            "(json_extract(metadata, ?) = ?) AND (json_extract(metadata, ?) >= ?)"
+            "(json_extract(metadata, '$.lang') = ?) AND (json_extract(metadata, '$.year') >= ?)"
         );
-        assert_eq!(params.len(), 4);
+        assert_eq!(params.len(), 2);
 
         let (sql, _) = compile_where(&json!({"$or": [{"a": 1}, {"b": 2}]}), 0).unwrap();
         assert!(sql.contains(" OR "));
@@ -315,6 +339,24 @@ mod tests {
     #[test]
     fn null_scalar_value_is_valid_equality_operand() {
         let (_, params) = compile_where(&json!({"a": null}), 0).unwrap();
-        assert_eq!(params, vec![json!("$.a"), Value::Null]);
+        assert_eq!(params, vec![Value::Null]);
+    }
+
+    #[test]
+    fn non_identifier_field_path_stays_bound() {
+        for field in ["a.b", "it's", "x y", "1st", ""] {
+            let (sql, params) = compile_where(&json!({field: 1}), 0).unwrap();
+            assert_eq!(sql, "json_extract(metadata, ?) = ?", "field {field:?}");
+            assert_eq!(params, vec![json!(format!("$.{field}")), json!(1)]);
+        }
+    }
+
+    #[test]
+    fn plain_identifier_rule() {
+        assert!(is_plain_identifier("source_file"));
+        assert!(is_plain_identifier("_x9"));
+        assert!(!is_plain_identifier("9x"));
+        assert!(!is_plain_identifier("a'b"));
+        assert!(!is_plain_identifier(""));
     }
 }
